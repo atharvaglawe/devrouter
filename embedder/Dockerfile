@@ -12,7 +12,10 @@
 #     the download.
 
 ARG GO_VERSION=1.24
+# Debian variant used by the libfetch + runtime stages. The Go image
+# family has no -slim variant, so the builder stage uses GO_DEBIAN.
 ARG DEBIAN_VERSION=bookworm-slim
+ARG GO_DEBIAN=bookworm
 ARG TOKENIZERS_VERSION=v1.27.0
 ARG ONNXRUNTIME_VERSION=1.25.0
 
@@ -32,16 +35,21 @@ RUN apt-get update \
 WORKDIR /libs
 
 # libtokenizers (static, gets linked into the Go binary).
-# The release archive's arch nomenclature: amd64 / arm64 — same as $TARGETARCH.
-RUN curl -fSL \
-    "https://github.com/daulet/tokenizers/releases/download/${TOKENIZERS_VERSION}/libtokenizers.linux-${TARGETARCH}.tar.gz" \
+# Resolve arch from $TARGETARCH (BuildKit auto-populates it) and fall
+# back to `dpkg --print-architecture` so the legacy `docker build`
+# without buildx also produces a non-empty URL. The release archive's
+# arch nomenclature matches Debian's: amd64 / arm64.
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+ && curl -fSL \
+      "https://github.com/daulet/tokenizers/releases/download/${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
     | tar -xz \
  && test -f libtokenizers.a
 
 # onnxruntime (dynamic, loaded at runtime). Microsoft's archive uses
 # "x64" / "aarch64" instead of "amd64" / "arm64", so we translate.
-RUN ARCH_ORT="x64"; \
-    if [ "${TARGETARCH}" = "arm64" ]; then ARCH_ORT="aarch64"; fi; \
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    ARCH_ORT="x64"; \
+    if [ "${ARCH}" = "arm64" ]; then ARCH_ORT="aarch64"; fi; \
     curl -fSL \
       "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH_ORT}-${ONNXRUNTIME_VERSION}.tgz" \
       -o /tmp/ort.tgz \
@@ -51,7 +59,7 @@ RUN ARCH_ORT="x64"; \
 
 
 # ─── Stage 2: builder (Go + CGo compile) ──────────────────────────────────
-FROM golang:${GO_VERSION}-${DEBIAN_VERSION} AS builder
+FROM golang:${GO_VERSION}-${GO_DEBIAN} AS builder
 
 # build-essential gives us gcc + libc headers needed by CGo. We don't
 # install Rust here because daulet/tokenizers ships a prebuilt static
