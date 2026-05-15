@@ -1,0 +1,9 @@
+results/
+__pycache__/
+*.pyc
+.venv/
+
+# Vendored agentmemory source — cloned + npm-installed by
+# bench/scripts/setup_agentmemory.sh. Don't commit the 200+ MB of
+# node_modules or the upstream source we don't own.
+adapters/agentmemory_src/

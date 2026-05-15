@@ -1,0 +1,54 @@
+# ── Build artifacts ──────────────────────────────────────────
+# Compiled Go binary lives at the repo root (built by `make build`)
+/devrouter
+
+# Codegraph compiled output + npm install
+codegraph/dist/
+codegraph/node_modules/
+
+# Embedder downloaded native libs and ONNX model
+# (re-fetched by `make embedder-deps` / `make embedder-fetch-model`)
+embedder/lib/libonnxruntime.dylib
+embedder/lib/libtokenizers.a
+embedder/lib/onnxruntime/
+embedder/testdata/nomic-embed-text-*/
+
+# ── Bench harness state ──────────────────────────────────────
+# Vendored competitor source (cloned for benchmark adapters)
+bench/adapters/agentmemory_src/
+
+# Local Python venv for the mem0 adapter (≈300 MB pinned deps)
+bench/.mem0-venv/
+
+# Zoekt index cache for the zoekt adapter
+bench/.zoekt-cache/
+
+# Per-run benchmark output (regenerable; cluttered to commit)
+bench/results/
+
+# ── Caches and runtime junk ──────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── Editor / IDE ─────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Local agent state ────────────────────────────────────────
+.claude/
+
+# ── OS noise ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs / scratch ───────────────────────────────────────────
+*.log
+/tmp/
+/_scratch/

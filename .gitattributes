@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+*.go        text eol=lf
+*.ts        text eol=lf
+*.py        text eol=lf
+*.md        text eol=lf
+Makefile    text eol=lf
+
+*.png       binary
+*.jpg       binary
+*.gif       binary
+*.zoekt     binary
+*.dylib     binary
+*.so        binary
+*.a         binary
+*.onnx      binary

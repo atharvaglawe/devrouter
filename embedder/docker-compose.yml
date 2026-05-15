@@ -1,0 +1,39 @@
+# Standalone bring-up for devrouter-embedder.
+#
+#   docker compose up -d         # build (first time only) + start
+#   docker compose logs -f       # follow the embedder
+#   docker compose down          # stop + remove (volume preserved)
+#   docker compose down -v       # also drop the model cache volume
+#
+# Host port 11435 = devrouter's default DEVROUTER_EMBEDDING_URL, so no
+# MCP-side config change is needed once this is up.
+#
+# First start of a fresh container downloads ~440MB of model into the
+# `embedder-models` volume. Subsequent starts skip the download and
+# come up in a couple of seconds.
+
+services:
+  embedder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: devrouter-embedder:latest
+    container_name: devrouter-embedder
+    restart: unless-stopped
+    ports:
+      - "11435:8080"
+    environment:
+      # 0 lets ORT pick (= number of physical cores). Tune down if
+      # co-locating with other CPU-heavy services.
+      INTRA_OP_THREADS: "0"
+    volumes:
+      - embedder-models:/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
+
+volumes:
+  embedder-models:

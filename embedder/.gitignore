@@ -1,0 +1,9 @@
+# Downloaded artifacts — fetched on demand by scripts/, not committed.
+# The Dockerfile reproduces these at image build time independently.
+lib/
+testdata/
+
+# Local-only build outputs.
+embedder
+*.test
+*.out

@@ -1,0 +1,15 @@
+# Stuff that lives in the working tree but should never be sent to the
+# Docker daemon as build context. The Dockerfile fetches native libs +
+# model itself; testdata/ is the local dev cache and would needlessly
+# blow up the build context to ~500MB.
+
+testdata/
+lib/
+*.log
+.DS_Store
+
+# Go build cache / output
+*.test
+*.out
+/embedder
+/coverage.out

@@ -1,0 +1,221 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+
+	"github.com/atharva-ag/devrouter/internal/codegraph"
+	"github.com/atharva-ag/devrouter/internal/mcp"
+	"github.com/atharva-ag/devrouter/internal/memory"
+	"github.com/atharva-ag/devrouter/internal/router"
+)
+
+func main() {
+	log.SetOutput(os.Stderr)
+	log.SetPrefix("[devrouter] ")
+	// Microsecond-resolution timestamps make latency profiling
+	// directly readable from stderr — the bench harness already
+	// captures stderr, so this is free signal during profiling
+	// runs and harmless in production.
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	// Subcommand passthrough to the in-tree codegraph Node CLI. Three forms:
+	//
+	//   devrouter analyze /path            — direct (any codegraph subcommand)
+	//   devrouter codegraph analyze /path  — explicit, useful if a future
+	//                                        devrouter-native subcommand ever
+	//                                        collides with a codegraph name.
+	//   devrouter gitnexus analyze /path   — legacy alias (the engine used to
+	//                                        be called gitnexus). Prints a
+	//                                        deprecation hint to stderr.
+	//
+	// With no args, fall through to the MCP server (default behaviour).
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "codegraph":
+			if err := runCodegraphPassthrough(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "gitnexus":
+			fmt.Fprintln(os.Stderr,
+				"[devrouter] note: `devrouter gitnexus ...` is deprecated; use `devrouter codegraph ...`")
+			if err := runCodegraphPassthrough(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "analyze", "index", "serve", "list", "status", "clean", "help":
+			if err := runCodegraphPassthrough(os.Args[1:]); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "-h", "--help":
+			printDevrouterHelp()
+			return
+		}
+	}
+
+	// Resolve codegraph URL. Prefer CODEGRAPH_URL; fall back to legacy
+	// GITNEXUS_URL with a one-line deprecation hint so existing env exports
+	// keep working until users migrate.
+	cgURL := os.Getenv("CODEGRAPH_URL")
+	if cgURL == "" {
+		if legacy := os.Getenv("GITNEXUS_URL"); legacy != "" {
+			fmt.Fprintln(os.Stderr,
+				"[devrouter] note: GITNEXUS_URL is deprecated; export CODEGRAPH_URL instead")
+			cgURL = legacy
+		} else {
+			cgURL = "http://localhost:4747"
+		}
+	}
+
+	redisAddr := os.Getenv("DEVROUTER_REDIS")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+
+	graph := codegraph.NewClient(cgURL)
+
+	mem, err := memory.NewStore(redisAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to connect to Redis at %s: %v\n", redisAddr, err)
+		os.Exit(1)
+	}
+
+	r := router.New(graph, mem)
+	if r.Heuristics != nil {
+		log.Printf("heuristics: picker initialized (frozen=%v)", r.Heuristics.Frozen())
+	}
+
+	// Query planning is the caller's responsibility: the MCP `dev_context`
+	// tool accepts a structured `plan` argument that the agent (Claude,
+	// Cursor, etc.) fills in. devrouter no longer runs any in-process
+	// planner LLM. Callers that don't supply a plan still get useful
+	// retrieval via deterministic auto-anchoring.
+
+	srv := mcp.NewServer(r)
+
+	log.Printf("MCP server starting on stdio (Redis: %s, codegraph: %s)", redisAddr, cgURL)
+	if err := srv.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func printDevrouterHelp() {
+	fmt.Println(`devrouter — MCP server + vendored codegraph CLI
+
+Usage:
+  devrouter                          Start the MCP server on stdio (default)
+  devrouter <codegraph-subcommand>   Run a codegraph CLI command
+  devrouter codegraph <args...>      Same, with explicit "codegraph" prefix
+  devrouter gitnexus <args...>       Legacy alias (deprecated)
+  devrouter --help                   Show this message
+
+Codegraph subcommands (forwarded to the in-tree Node CLI):
+  analyze   Index a repository
+  index     Register an existing .codegraph/ folder
+  serve     Start the codegraph HTTP server (port 4747)
+  list      List indexed repositories
+  status    Show index status for current repo
+  clean     Delete the codegraph index for current repo
+  help      Show codegraph CLI help
+
+Environment:
+  DEVROUTER_REDIS                Redis address (default localhost:6379)
+  DEVROUTER_EMBEDDING_URL        Embedding endpoint (default http://localhost:11435/api/embed — bundled ONNX embedder)
+  DEVROUTER_EMBEDDING_MODEL      Model name sent in /api/embed requests (default nomic-embed-text-v1.5; advisory only on the ONNX embedder)
+  CODEGRAPH_URL                  Codegraph HTTP base URL (default http://localhost:4747)
+  GITNEXUS_URL                   Legacy alias for CODEGRAPH_URL (deprecated)
+  DEVROUTER_CODEGRAPH_CLI        Override path to codegraph dist/cli/index.js
+  DEVROUTER_GITNEXUS_CLI         Legacy alias for DEVROUTER_CODEGRAPH_CLI (deprecated)`)
+}
+
+// runCodegraphPassthrough execs `node <cli> <args...>`, inheriting stdio and
+// propagating the child's exit code. The CLI path is resolved as:
+//
+//  1. $DEVROUTER_CODEGRAPH_CLI       — explicit override
+//  2. $DEVROUTER_GITNEXUS_CLI        — legacy override (deprecated)
+//  3. <dir of this binary>/codegraph/dist/cli/index.js
+//  4. <cwd>/codegraph/dist/cli/index.js
+//
+// If none exists, the user is pointed at `make codegraph-build`.
+func runCodegraphPassthrough(args []string) error {
+	cliPath, err := resolveCodegraphCLI()
+	if err != nil {
+		return err
+	}
+
+	// Prepend the CLI path so node receives `node <cli> <args...>`.
+	nodeArgs := append([]string{cliPath}, args...)
+	cmd := exec.Command("node", nodeArgs...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		// Surface the child's exit code so shell scripts can react to it.
+		if ee, ok := err.(*exec.ExitError); ok {
+			os.Exit(ee.ExitCode())
+		}
+		return fmt.Errorf("failed to invoke codegraph CLI (%s): %w", cliPath, err)
+	}
+	return nil
+}
+
+func resolveCodegraphCLI() (string, error) {
+	// Explicit overrides win: prefer the new env var, fall back to the old one.
+	for _, key := range []string{"DEVROUTER_CODEGRAPH_CLI", "DEVROUTER_GITNEXUS_CLI"} {
+		if p := os.Getenv(key); p != "" {
+			if _, err := os.Stat(p); err == nil {
+				if key == "DEVROUTER_GITNEXUS_CLI" {
+					fmt.Fprintln(os.Stderr,
+						"[devrouter] note: DEVROUTER_GITNEXUS_CLI is deprecated; use DEVROUTER_CODEGRAPH_CLI")
+				}
+				return p, nil
+			}
+			return "", fmt.Errorf("%s=%s does not exist", key, p)
+		}
+	}
+
+	candidates := []string{}
+
+	if exe, err := os.Executable(); err == nil {
+		// Resolve symlinks so a `devrouter` symlink in $PATH still finds the
+		// repo-relative dist next to the real binary.
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = real
+		}
+		base := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(base, "codegraph", "dist", "cli", "index.js"),
+			// Legacy path — useful while users still have unmigrated checkouts.
+			filepath.Join(base, "gitnexus", "dist", "cli", "index.js"),
+		)
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(cwd, "codegraph", "dist", "cli", "index.js"),
+			filepath.Join(cwd, "gitnexus", "dist", "cli", "index.js"),
+		)
+	}
+
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+
+	return "", fmt.Errorf(
+		"codegraph CLI not found (looked in: %v).\n"+
+			"Build it with: make codegraph-build\n"+
+			"Or override the path: DEVROUTER_CODEGRAPH_CLI=/abs/path/to/dist/cli/index.js",
+		candidates,
+	)
+}
