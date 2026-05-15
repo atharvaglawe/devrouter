@@ -37,6 +37,14 @@ and the four most common mistakes.
 
 ---
 
+## Copy this block (verbatim)
+
+GitHub renders the block below as a single fenced markdown unit — use the
+Copy button at its top-right and paste it (markers included) into your
+agent context file. The markers must remain intact so downstream sync
+tooling can update the block in-place across consumer repos.
+
+````markdown
 <!-- devrouter:start -->
 
 > **READ THIS FIRST: THREE MANDATORY RULES FOR EVERY QUESTION**
@@ -504,3 +512,4 @@ If not, STOP and complete these steps before proceeding.
 Without all three, the system degrades and future queries suffer.
 
 <!-- devrouter:end -->
+````
