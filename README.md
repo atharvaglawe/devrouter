@@ -5,7 +5,7 @@ Repository-aware retrieval and model routing for AI coding agents.
 DevRouter learns repository structure from agent workflows and injects the right context into the smallest capable model — improving trace, debug, and exploration tasks with fewer tokens and minimal operational overhead.
 
 <p align="center">
-  <img src="docs/assets/devrouter-overview.jpg" alt="devrouter — repository-aware retrieval and model routing" width="1024">
+  <img src="docs/assets/devrouter-overview.png" alt="DevRouter — repository-aware retrieval and model routing for AI coding agents">
 </p>
 
 MCP server that returns structured, memory-augmented repository context for
