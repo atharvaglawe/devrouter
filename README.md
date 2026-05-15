@@ -103,8 +103,8 @@ follow, see [`docs/agent-rules.md`](docs/agent-rules.md).
 
 DevRouter is benchmarked against `agentmemory` (BM25 + hybrid BM25+vector
 modes) and `ripgrep` on hand-authored ground-truth question sets across
-three real-world repos in three languages. Numbers below are the
-post-fix runs from 2026-05-14 (30 questions per repo, k=10).
+three real-world repos in three languages. Numbers below are from
+2026-05-14 (30 questions per repo, k=10).
 
 | Repo | Lang | Files | DevRouter R@5 | agentmemory-hybrid R@5 | DevRouter MRR | agentmemory-hybrid MRR | DevRouter p50 |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -145,11 +145,7 @@ systems, same 30 mall questions:
 with mem0 (0.901 vs 0.900) means DevRouter ranks the right answer
 just as high when it has it, *and* catches answers a flat memory
 layer alone misses by falling back to codegraph + graph traversal.
-
-The bench surfaced — and led to a fix for — a real DevRouter bug:
-the auto-anchored must-term was hard-gating cosine-passing memory
-hits whose file paths didn't contain that query keyword. Before fix
-0.453 R@5, after fix 0.731 R@5 on the same questions. Details:
+Details:
 [`docs/benchmarks.md#memory-augmented-retrieval--devrouter-vs-mem0`](docs/benchmarks.md#memory-augmented-retrieval--devrouter-vs-mem0).
 
 ## More
