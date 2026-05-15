@@ -1,4 +1,8 @@
-# devrouter
+# DevRouter
+
+Repository-aware retrieval and model routing for AI coding agents.
+
+DevRouter learns repository structure from agent workflows and injects the right context into the smallest capable model — improving trace, debug, and exploration tasks with fewer tokens and minimal operational overhead.
 
 ![devrouter — repository-aware retrieval and model routing](docs/assets/devrouter-overview.jpg)
 
