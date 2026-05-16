@@ -32,6 +32,22 @@ agent coding. What it gives you:
   in the response is computed from the actual match, not a hardcoded value
   per source type.
 
+## Dashboard
+
+A read-only observability dashboard ships on by default at
+[http://127.0.0.1:8088](http://127.0.0.1:8088) whenever devrouter is
+running — live queries with cascading repo / topic / intent filters,
+heuristic profile drift, decision lineage, and saved flows rendered
+as deep call-chain graphs (1–5 hops, configurable per flow) sourced
+from the codegraph snapshot. Tour on the `goserving` benchmark repo:
+
+<p align="center">
+  <video src="docs/assets/devrouter-goserving.mp4" width="900" autoplay loop muted playsinline></video>
+</p>
+
+Port and shutoff knobs in
+[`docs/configuration.md#dashboard`](docs/configuration.md#dashboard).
+
 ## Prerequisites
 
 Go ≥ 1.21, Node.js ≥ 20, Redis Stack (with the RediSearch module), Docker.
@@ -166,11 +182,7 @@ Details:
   parallel fan-out)
 - [`docs/configuration.md`](docs/configuration.md) — every environment
   variable, the full MCP-host config example, operational notes
-  (turning off self-tuning, hosted-service overrides), and the bundled
-  read-only [observability dashboard](docs/configuration.md#dashboard)
-  — on by default at [http://127.0.0.1:8088](http://127.0.0.1:8088)
-  whenever devrouter is running: live queries, heuristic profile drift,
-  decision lineage, flow graphs
+  (turning off self-tuning, hosted-service overrides, dashboard port)
 - [`docs/tools.md`](docs/tools.md) — every MCP tool with its input schema
   and usage notes
 - [`docs/agent-rules.md`](docs/agent-rules.md) — canonical agent ruleset

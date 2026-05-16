@@ -430,6 +430,355 @@ func (c *Client) Siblings(filePath string, repo string) ([]string, error) {
 	return paths, nil
 }
 
+// ---------------------------------------------------------------------------
+// Subgraph aggregator — snapshot of the codegraph neighbourhood around a
+// set of seed symbols. Used by Router.SaveFlowMemory to freeze the
+// codegraph view at the moment an agent commits a flow memory, so the
+// dashboard can render the call-chain graph long after the trace TTL
+// has expired.
+// ---------------------------------------------------------------------------
+
+// SubgraphNode is one function/symbol vertex in the captured neighbourhood.
+// Role separates seeds (the agent-supplied entry points) from the
+// callers/callees/related symbols that codegraph pulled in around them —
+// the dashboard uses Role to colour and column-place nodes.
+//
+// Depth is the BFS distance from the nearest seed along the CALLS
+// relation: 0 = seed itself, positive N = N hops downstream (callee
+// chain), negative N = N hops upstream (caller chain). Aux roles
+// (importer / extends / method) are always at Depth=1 since they're
+// structural neighbours rather than part of the call chain.
+type SubgraphNode struct {
+	Name     string `json:"name"`
+	FilePath string `json:"file,omitempty"`
+	Role     string `json:"role"`  // "seed" | "caller" | "callee" | "importer" | "extends" | "method"
+	Depth    int    `json:"depth"` // 0 for seed, +N for callees, -N for callers, 1 for aux
+}
+
+// SubgraphEdge is one directed relationship between two SubgraphNode names.
+// Type matches the codegraph CodeRelation.type the edge was derived from
+// (mostly "CALLS", with "IMPORTS" / "EXTENDS" / "HAS_METHOD" for the
+// supplementary structural relations).
+type SubgraphEdge struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Type string `json:"type"`
+}
+
+// Subgraph is the captured neighbourhood payload. Sized so it round-trips
+// through Redis comfortably (the dashboard caps cards at ~50 nodes anyway,
+// and Subgraph itself enforces a hard ceiling so a pathological seed like
+// "init" with thousands of callers doesn't blow up the FlowMemory hash).
+type Subgraph struct {
+	Seeds []string       `json:"seeds"`
+	Nodes []SubgraphNode `json:"nodes"`
+	Edges []SubgraphEdge `json:"edges"`
+	// Truncated is true when at least one seed had more callers/callees
+	// than the per-relation LIMIT in the underlying cypher (currently 15).
+	// Dashboard surfaces this as a "+N more" hint so users know they're
+	// looking at a clipped view, not the full graph.
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// SubgraphCaps bounds the aggregate output so a single flow can never
+// blow up the FlowMemory hash. With deep BFS the explosion can be
+// dramatic (each level is up-to ~15× larger than the previous), so we
+// rely on three independent backstops: node ceiling, edge ceiling,
+// and per-level frontier cap. Whichever trips first stops the walk
+// and sets Truncated=true so the dashboard can warn the user.
+const (
+	subgraphMaxSeeds    = 8    // first N entry_points used as seeds; rest ignored
+	subgraphMaxNodes    = 500  // hard ceiling on total distinct nodes
+	subgraphMaxEdges    = 1000 // hard ceiling on total distinct edges
+	subgraphMaxDepth    = 5    // BFS hops per direction (callers up / callees down)
+	subgraphMaxFrontier = 40   // per-level frontier cap — bounds BFS fan-out
+)
+
+// Subgraph snapshots the codegraph neighbourhood around the given seed
+// symbol names using a bounded BFS in both directions along the CALLS
+// relation. It returns *only* what codegraph already knows — no
+// inference, no LLM, no embeddings — so the dashboard can render the
+// exact set of relationships the agent saw at dev_context time.
+//
+// For each seed:
+//   - Walks upstream CALLS up to subgraphMaxDepth hops    → role="caller", Depth<0
+//   - Walks downstream CALLS up to subgraphMaxDepth hops  → role="callee", Depth>0
+//   - 1-hop IMPORTS importers                              → role="importer", Depth=1
+//   - 1-hop EXTENDS extends                                → role="extends",  Depth=1
+//   - 1-hop HAS_METHOD methods                             → role="method",   Depth=1
+//
+// IMPORTS/EXTENDS/HAS_METHOD stay at 1-hop because they're structural
+// relations rather than part of the call chain — walking them deeper
+// adds noise without illuminating execution flow.
+//
+// Qualified seed names ("TaskInstance.run", "health.ServeRequest") are
+// transparently handled by also querying the bare tail after the last
+// dot ("run", "ServeRequest"). Codegraph indexes symbols by their
+// declared identifier alone, so without this fallback agent-supplied
+// qualified names would silently return empty subgraphs.
+//
+// Empty seeds, missing repo, or codegraph errors all return (nil, err).
+// The caller (SaveFlowMemory) treats this as non-fatal: a flow without
+// a snapshotted subgraph still saves successfully, the dashboard just
+// falls back to the existing bipartite SVG.
+func (c *Client) Subgraph(repo string, seeds []string) (*Subgraph, error) {
+	if c == nil || c.BaseURL == "" {
+		return nil, fmt.Errorf("subgraph: codegraph client not configured")
+	}
+	cleaned := make([]string, 0, len(seeds))
+	seenSeed := make(map[string]struct{}, len(seeds))
+	for _, s := range seeds {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, dup := seenSeed[s]; dup {
+			continue
+		}
+		seenSeed[s] = struct{}{}
+		cleaned = append(cleaned, s)
+		if len(cleaned) >= subgraphMaxSeeds {
+			break
+		}
+	}
+	if len(cleaned) == 0 {
+		return nil, fmt.Errorf("subgraph: no usable seed symbols")
+	}
+
+	sg := &Subgraph{Seeds: cleaned}
+	nodes := make(map[string]SubgraphNode, 64)
+	edges := make(map[string]SubgraphEdge, 64)
+
+	// upsertNode keeps first-write semantics: the first depth/role we
+	// see for a name wins. BFS guarantees we visit closer nodes first,
+	// so "first" naturally means "closest to seed", which is what the
+	// UI's depth slider needs to filter on. Returns true when the node
+	// was added (used by BFS to decide whether to recurse).
+	upsertNode := func(name, file, role string, depth int) bool {
+		if name == "" {
+			return false
+		}
+		if _, ok := nodes[name]; ok {
+			return false
+		}
+		if len(nodes) >= subgraphMaxNodes {
+			sg.Truncated = true
+			return false
+		}
+		nodes[name] = SubgraphNode{Name: name, FilePath: file, Role: role, Depth: depth}
+		return true
+	}
+	addEdge := func(from, to, etype string) {
+		if from == "" || to == "" || from == to {
+			return
+		}
+		key := etype + "|" + from + "|" + to
+		if _, ok := edges[key]; ok {
+			return
+		}
+		if len(edges) >= subgraphMaxEdges {
+			sg.Truncated = true
+			return
+		}
+		edges[key] = SubgraphEdge{From: from, To: to, Type: etype}
+	}
+
+	// expandCalleesBFS walks downstream from the seed. Each level
+	// queries CalleesWithPath for every frontier node, records the
+	// new callees at depth d, and uses the *newly-added* set as the
+	// next frontier. Capping the frontier keeps the BFS bounded even
+	// on dense graphs (init/main-style functions).
+	expandCalleesBFS := func(seedName string) {
+		frontier := []string{seedName}
+		for d := 1; d <= subgraphMaxDepth && len(frontier) > 0; d++ {
+			next := make([]string, 0, len(frontier)*4)
+			for _, name := range frontier {
+				callees, err := c.CalleesWithPath(name, repo)
+				if err != nil {
+					continue
+				}
+				if len(callees) >= 15 {
+					sg.Truncated = true
+				}
+				for _, e := range callees {
+					if upsertNode(e.To, e.FilePath, "callee", d) {
+						next = append(next, e.To)
+					}
+					addEdge(e.From, e.To, "CALLS")
+				}
+				if len(nodes) >= subgraphMaxNodes {
+					return
+				}
+			}
+			if len(next) > subgraphMaxFrontier {
+				// Deterministic trim — sort and take the first N so
+				// re-snapshots produce identical subgraphs across
+				// runs. Without sort, map-iteration order would make
+				// the truncation non-deterministic.
+				sort.Strings(next)
+				next = next[:subgraphMaxFrontier]
+				sg.Truncated = true
+			}
+			frontier = next
+		}
+	}
+	// expandCallersBFS is the upstream mirror — same algorithm walking
+	// CallersWithPath. Negative depth so the UI can place callers in
+	// columns to the left of the seed.
+	expandCallersBFS := func(seedName string) {
+		frontier := []string{seedName}
+		for d := 1; d <= subgraphMaxDepth && len(frontier) > 0; d++ {
+			next := make([]string, 0, len(frontier)*4)
+			for _, name := range frontier {
+				callers, err := c.CallersWithPath(name, repo)
+				if err != nil {
+					continue
+				}
+				if len(callers) >= 15 {
+					sg.Truncated = true
+				}
+				for _, e := range callers {
+					if upsertNode(e.From, e.FilePath, "caller", -d) {
+						next = append(next, e.From)
+					}
+					addEdge(e.From, e.To, "CALLS")
+				}
+				if len(nodes) >= subgraphMaxNodes {
+					return
+				}
+			}
+			if len(next) > subgraphMaxFrontier {
+				sort.Strings(next)
+				next = next[:subgraphMaxFrontier]
+				sg.Truncated = true
+			}
+			frontier = next
+		}
+	}
+	// addAux pulls the 1-hop structural relations for a seed. These
+	// stay shallow because deeper IMPORTS/EXTENDS/HAS_METHOD walks
+	// drift into structural noise unrelated to the call chain.
+	addAux := func(seedName string) {
+		if importers, err := c.Importers(seedName, repo); err == nil {
+			for _, e := range importers {
+				upsertNode(e.From, e.FilePath, "importer", 1)
+				addEdge(e.From, seedName, "IMPORTS")
+			}
+		}
+		if extends, err := c.Extends(seedName, repo); err == nil {
+			for _, e := range extends {
+				upsertNode(e.From, e.FilePath, "extends", 1)
+				addEdge(e.From, seedName, "EXTENDS")
+			}
+		}
+		if methods, err := c.Methods(seedName, repo); err == nil {
+			for _, e := range methods {
+				upsertNode(e.To, e.FilePath, "method", 1)
+				addEdge(e.From, e.To, "HAS_METHOD")
+			}
+		}
+	}
+
+	// snapshotSeed runs the full per-seed pipeline (callers BFS +
+	// callees BFS + aux). Returns the number of nodes added so the
+	// qualified-name fallback below can detect "this seed name
+	// matched nothing in codegraph".
+	snapshotSeed := func(seedName string) int {
+		before := len(nodes)
+		expandCalleesBFS(seedName)
+		expandCallersBFS(seedName)
+		addAux(seedName)
+		return len(nodes) - before
+	}
+
+	for _, seed := range cleaned {
+		upsertNode(seed, "", "seed", 0)
+		added := snapshotSeed(seed)
+		if added > 0 {
+			continue
+		}
+		// Qualified-name fallback: try the bare tail after the last
+		// dot ("health.ServeRequest" → "ServeRequest"). The tail is
+		// also registered as a seed so it sits in the same band as
+		// the qualified form in the UI.
+		tail := bareTail(seed)
+		if tail == "" || tail == seed {
+			continue
+		}
+		upsertNode(tail, "", "seed", 0)
+		snapshotSeed(tail)
+	}
+
+	// Stable output order — sort nodes by (role rank, name) and edges
+	// by (type, from, to). Deterministic JSON output makes the round-trip
+	// through Redis byte-stable, which matters for idempotent re-saves
+	// (no spurious "subgraph changed" diffs on the same source data).
+	sg.Nodes = make([]SubgraphNode, 0, len(nodes))
+	for _, n := range nodes {
+		sg.Nodes = append(sg.Nodes, n)
+	}
+	sort.Slice(sg.Nodes, func(i, j int) bool {
+		ri, rj := roleRank(sg.Nodes[i].Role), roleRank(sg.Nodes[j].Role)
+		if ri != rj {
+			return ri < rj
+		}
+		return sg.Nodes[i].Name < sg.Nodes[j].Name
+	})
+	sg.Edges = make([]SubgraphEdge, 0, len(edges))
+	for _, e := range edges {
+		sg.Edges = append(sg.Edges, e)
+	}
+	sort.Slice(sg.Edges, func(i, j int) bool {
+		if sg.Edges[i].Type != sg.Edges[j].Type {
+			return sg.Edges[i].Type < sg.Edges[j].Type
+		}
+		if sg.Edges[i].From != sg.Edges[j].From {
+			return sg.Edges[i].From < sg.Edges[j].From
+		}
+		return sg.Edges[i].To < sg.Edges[j].To
+	})
+	return sg, nil
+}
+
+// bareTail returns the substring after the last "." in name, or "" if
+// name has no dot or the tail is too short to be a useful symbol name.
+// The 3-char minimum filters out trivial false positives like ".do",
+// ".go", ".js" that would otherwise match a huge fraction of symbols.
+func bareTail(name string) string {
+	i := strings.LastIndex(name, ".")
+	if i < 0 || i == len(name)-1 {
+		return ""
+	}
+	tail := name[i+1:]
+	if len(tail) < 3 {
+		return ""
+	}
+	return tail
+}
+
+// roleRank orders node roles so seeds always render first and ancillary
+// roles trail. The dashboard relies on this ordering to position columns
+// (callers on the left, seeds in the middle, callees on the right) by
+// walking the sorted Nodes slice once.
+func roleRank(role string) int {
+	switch role {
+	case "seed":
+		return 0
+	case "caller":
+		return 1
+	case "callee":
+		return 2
+	case "method":
+		return 3
+	case "extends":
+		return 4
+	case "importer":
+		return 5
+	default:
+		return 9
+	}
+}
+
 // RelatedFiles finds all files/directories whose path contains the keyword.
 // Returns deduplicated paths — both leaf files and their parent directories.
 func (c *Client) RelatedFiles(keyword string, repo string, limit int) ([]string, error) {

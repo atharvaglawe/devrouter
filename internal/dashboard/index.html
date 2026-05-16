@@ -227,10 +227,111 @@
     border-radius: 6px;
     margin-top: 8px;
   }
+  /* Preview vs full controls how the SVG sizes itself. Preview lets it
+     scale to panel width (already small enough after node-capping to
+     stay readable). Full renders at native pixel size inside a
+     horizontally scrollable container so labels stay sharp even when
+     the call graph is 1200px wide. */
+  .flow-svg.full {
+    width: auto;
+    max-width: none;
+  }
+  .flow-full-wrap {
+    overflow-x: auto;
+    margin-top: 8px;
+    border-radius: 6px;
+    background: var(--bg);
+    /* faint inner border helps users see the scroll boundary */
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+  /* Depth slider lives just above the SVG. The label/value pair
+     stays inline so the control reads as a single row. */
+  .flow-depth {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .flow-depth input[type=range] {
+    flex: 0 0 180px;
+    accent-color: var(--accent);
+  }
+  .flow-depth-value {
+    color: var(--text);
+    min-width: 50px;
+  }
+  .flow-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 6px;
+  }
+  .flow-actions button {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .flow-actions button:hover { color: var(--text); border-color: var(--accent); }
+  .flow-svg .col-more {
+    fill: var(--text-dim); font-size: 9.5px;
+    text-anchor: middle; font-style: italic;
+  }
   .flow-svg .node-entry { fill: #1f3a5f; stroke: var(--accent); }
   .flow-svg .node-file { fill: var(--bg-hi); stroke: var(--border); }
-  .flow-svg .node-text { fill: var(--text); font-size: 11px; }
   .flow-svg .edge { stroke: var(--border); stroke-width: 1; }
+  /* codegraph snapshot renderer — role-coloured nodes + typed edges */
+  .flow-svg .node-seed     { fill: #1f3a5f; stroke: var(--accent); stroke-width: 1.5; }
+  .flow-svg .node-caller   { fill: #2a2a3a; stroke: #6b8cff; }
+  .flow-svg .node-callee   { fill: #2a2a3a; stroke: #58c47a; }
+  .flow-svg .node-method   { fill: #1f1f2e; stroke: #b07cff; }
+  .flow-svg .node-extends  { fill: #1f1f2e; stroke: #d4a14b; }
+  .flow-svg .node-importer { fill: #1f1f2e; stroke: #5a8c8c; }
+  .flow-svg .edge-CALLS      { stroke: #6b8cff; stroke-width: 1; }
+  .flow-svg .edge-IMPORTS    { stroke: #5a8c8c; stroke-width: 1; stroke-dasharray: 3 3; }
+  .flow-svg .edge-EXTENDS    { stroke: #d4a14b; stroke-width: 1; stroke-dasharray: 4 2; }
+  .flow-svg .edge-HAS_METHOD { stroke: #b07cff; stroke-width: 1; stroke-dasharray: 2 2; }
+  .flow-svg .col-label {
+    fill: var(--text-dim); font-size: 10px;
+    text-anchor: middle; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  /* Per-seed band divider — drawn between bands so the hierarchy
+     (which callers/callees belong to which seed) reads at a glance. */
+  .flow-svg .band-divider {
+    stroke: var(--border);
+    stroke-width: 1;
+    stroke-dasharray: 4 4;
+    opacity: 0.5;
+  }
+  /* Two-line node text: symbol name on top, file basename below.
+     Dim + smaller for the file so the symbol stays the primary read. */
+  .flow-svg .node-text { fill: var(--text); font-size: 11.5px; font-weight: 500; }
+  .flow-svg .node-file-text {
+    fill: var(--text-dim); font-size: 10px; font-style: italic;
+  }
+  .flow-svg-legend {
+    display: flex; gap: 14px; flex-wrap: wrap;
+    margin-top: 6px;
+    font-size: 11px; color: var(--text-dim);
+  }
+  .flow-svg-legend .swatch {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    margin-right: 4px;
+    vertical-align: middle;
+    border: 1px solid currentColor;
+  }
+  .flow-svg-legend .truncated {
+    margin-left: auto;
+    font-style: italic;
+    color: var(--warn, #d4a14b);
+  }
   .empty {
     padding: 30px;
     text-align: center;
@@ -252,7 +353,45 @@
     border-radius: 4px;
     padding: 4px 8px;
   }
+  .controls button.ghost {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .controls button.ghost:hover {
+    color: var(--text);
+    border-color: var(--text-dim);
+  }
   .last-refresh { color: var(--text-dim); font-size: 11.5px; }
+  .bucket-hot { box-shadow: 0 0 0 1px var(--good) inset; }
+  .bucket-row {
+    display: grid;
+    grid-template-columns: 100px 80px 70px 1fr;
+    gap: 10px;
+    align-items: center;
+    padding: 6px 0;
+    border-top: 1px solid var(--border);
+    font-size: 12.5px;
+  }
+  .bucket-row:first-of-type { border-top: none; }
+  .bucket-row .label { color: var(--text-dim); font-size: 11px; text-transform: uppercase; }
+  .bucket-list { margin-top: 10px; }
+  .bucket-deltas { display: flex; flex-wrap: wrap; gap: 6px; }
+  .bucket-deltas .pill {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  .bucket-deltas .pill.up { color: var(--good); border-color: var(--good); }
+  .bucket-deltas .pill.down { color: var(--warn); border-color: var(--warn); }
 </style>
 </head>
 <body>
@@ -272,6 +411,7 @@
   <nav class="tabs">
     <button data-tab="queries" class="active">Live Queries</button>
     <button data-tab="heuristics">Heuristics</button>
+    <button data-tab="topics">Topics</button>
     <button data-tab="decisions">Decisions</button>
     <button data-tab="flows">Flows</button>
   </nav>
@@ -280,6 +420,26 @@
     <section class="summary" id="summary"></section>
 
     <section data-pane="queries">
+      <div class="controls">
+        <label>Repo:</label>
+        <select id="queries-repo">
+          <option value="">all</option>
+        </select>
+        <label>Topic:</label>
+        <select id="queries-topic">
+          <option value="">all</option>
+        </select>
+        <label>Intent:</label>
+        <select id="queries-intent">
+          <option value="">all</option>
+          <option value="debug">debug</option>
+          <option value="explore">explore</option>
+          <option value="trace">trace</option>
+          <option value="refactor">refactor</option>
+          <option value="general">general</option>
+        </select>
+        <button id="queries-clear-filters" type="button" class="ghost">clear</button>
+      </div>
       <div class="panel">
         <div class="panel-header">
           <h2>Recent Queries</h2>
@@ -290,13 +450,49 @@
     </section>
 
     <section data-pane="heuristics" hidden>
+      <div class="controls">
+        <label>Repo:</label>
+        <select id="heuristics-repo">
+          <option value="">all</option>
+        </select>
+        <label>Intent:</label>
+        <select id="heuristics-intent">
+          <option value="">all</option>
+        </select>
+        <button id="heuristics-clear-filters" type="button" class="ghost">clear</button>
+      </div>
       <div class="heuristics-grid" id="heuristics-grid"></div>
+    </section>
+
+    <section data-pane="topics" hidden>
+      <div class="controls">
+        <label>Repo:</label>
+        <select id="topics-repo">
+          <option value="">all</option>
+        </select>
+        <label>Intent:</label>
+        <select id="topics-intent">
+          <option value="">all</option>
+        </select>
+        <button id="topics-clear-filters" type="button" class="ghost">clear</button>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><h2>Topic Centroids</h2><div class="sub" id="topics-sub">—</div></div>
+        <div id="topics-body"></div>
+      </div>
     </section>
 
     <section data-pane="decisions" hidden>
       <div class="controls">
         <label>Repo:</label>
-        <select id="decisions-repo"></select>
+        <select id="decisions-repo">
+          <option value="">all</option>
+        </select>
+        <label>Type:</label>
+        <select id="decisions-type">
+          <option value="">all</option>
+        </select>
+        <button id="decisions-clear-filters" type="button" class="ghost">clear</button>
       </div>
       <div class="panel">
         <div class="panel-header"><h2>Decision Tree</h2><div class="sub" id="decisions-sub">—</div></div>
@@ -307,7 +503,10 @@
     <section data-pane="flows" hidden>
       <div class="controls">
         <label>Repo:</label>
-        <select id="flows-repo"></select>
+        <select id="flows-repo">
+          <option value="">all</option>
+        </select>
+        <button id="flows-clear-filters" type="button" class="ghost">clear</button>
       </div>
       <div id="flows-body"></div>
     </section>
@@ -319,7 +518,27 @@
     tab: 'queries',
     repos: [],
     decisionsRepo: '',
+    decisionsType: '',
     flowsRepo: '',
+    // Set of "<repo>::<name>" keys for flow cards currently rendered
+    // in their expanded (full) form. Persists across auto-refresh so
+    // users don't get collapsed every 3s.
+    expandedFlows: new Set(),
+    // Map of "<repo>::<name>" → depth (1..MAX_DEPTH) for the per-flow
+    // chain-depth slider. Persists across auto-refresh. Missing keys
+    // default to DEFAULT_EXPANDED_DEPTH when expanded, PREVIEW_DEPTH
+    // when collapsed.
+    flowDepth: new Map(),
+    topicsIntent: '',
+    topicsRepo: '',
+    heuristicsRepo: '',
+    heuristicsIntent: '',
+    // Queries-tab filters. queriesTopic holds the topic_label when
+    // there is one and falls back to topic_id otherwise — matches the
+    // value rendered in the dropdown (topicBadge handles both forms).
+    queriesRepo: '',
+    queriesTopic: '',
+    queriesIntent: '',
     expanded: new Set(),
     autoRefresh: true,
     intervalSec: 3,
@@ -385,6 +604,24 @@
     return `<span class="badge ${cls}">${r.toFixed(2)}</span>`;
   }
 
+  // topicBadge renders the per-query topic bucket pill. Empty or "*"
+  // means the query landed on the intent-global fallback (topics off,
+  // or bucket below the bandit sample floor) — shown as a muted dash.
+  // A real topic gets the accent style; "bucket-hot" style when the
+  // heuristic was actually sourced from the bucket profile. The label
+  // (e.g. "redis-session-cache") is preferred for display when present;
+  // the raw id (e.g. "t-3") is kept in the tooltip so power users can
+  // still correlate against Redis keys.
+  function topicBadge(row) {
+    const id = row.topic_id || '';
+    if (!id || id === '*') return `<span class="badge">global</span>`;
+    const label = row.topic_label || id;
+    const cls = row.heuristic_from_topic ? 'bucket-hot' : '';
+    const hotNote = row.heuristic_from_topic ? 'served from bucket profile' : 'served from intent-global (bucket cold)';
+    const title = label === id ? hotNote : `${id} \u2014 ${hotNote}`;
+    return `<span class="badge intent ${cls}" title="${title}">${fmt.escape(label)}</span>`;
+  }
+
   function queryDetail(row) {
     const mk = (row.memory_keys || []).map(k => `<code>${fmt.escape(k)}</code>`).join('<br/>') || '<i>none returned</i>';
     return `
@@ -395,6 +632,7 @@
           <b>Repo</b><div>${fmt.escape(row.repo) || '<i>—</i>'}</div>
           <b>Intent</b><div>${fmt.escape(row.intent)}</div>
           <b>Profile ID</b><div class="mono">${fmt.escape(row.heuristic_profile_id)}</div>
+          <b>Topic</b><div class="mono">${row.topic_id && row.topic_id !== '*' ? (fmt.escape(row.topic_label || row.topic_id) + (row.topic_label ? ` <span style="color:var(--text-dim);">(${fmt.escape(row.topic_id)})</span>` : '') + (row.heuristic_from_topic ? ' <span style="color:var(--good);">(hot — bucket profile)</span>' : ' <span style="color:var(--text-dim);">(cold — global profile)</span>')) : '<i>global</i>'}</div>
           <b>Latency</b><div>${row.latency_ms} ms</div>
           <b>Tokens returned</b><div>${row.prompt_tokens}</div>
           <b>Counts</b><div>${row.files_returned} files · ${row.symbols_returned} symbols · ${row.snippets_returned} snippets · ${row.trimmed_files} trimmed</div>
@@ -412,17 +650,98 @@
       </div>`;
   }
 
+  // Canonical topic-key for filter dropdowns + matching: prefer the
+  // human-readable label, fall back to the raw t-N id, "—" for the
+  // intent-global sentinel (topic_id === "*"). Mirrors topicBadge so
+  // the dropdown shows exactly what the column shows.
+  function queryTopicKey(row) {
+    if (row.topic_label) return row.topic_label;
+    if (row.topic_id && row.topic_id !== '*') return row.topic_id;
+    return '—';
+  }
+
+  // Rebuild a <select>'s options from the values present in `all`,
+  // keeping the currently-selected value if it's still valid.
+  // Returns the *effective* value (may have been reset to '' when the
+  // previous selection disappeared because filters narrowed the data).
+  function refillFilter(selId, all, current) {
+    const values = Array.from(new Set(all.filter(v => v != null && v !== ''))).sort();
+    const sel = $(selId);
+    const want = values.includes(current) ? current : '';
+    sel.innerHTML = `<option value="">all</option>` +
+      values.map(v => `<option value="${fmt.escape(v)}" ${v === want ? 'selected' : ''}>${fmt.escape(v)}</option>`).join('');
+    sel.value = want;
+    return want;
+  }
+
   async function renderQueries() {
     try {
-      const rows = await fetchJSON('/api/queries?limit=100');
-      $('#queries-sub').textContent = `${rows.length} most recent`;
+      const all = await fetchJSON('/api/queries?limit=500');
+
+      // Cascading facets: each dropdown's options come from the data
+      // filtered by the *other* two filters. So picking repo=mall
+      // narrows the Topic dropdown to only topics that exist in mall,
+      // picking topic=block-types-ttls narrows the Intent dropdown
+      // to only intents that ever hit that topic, etc. The dropdown
+      // for filter X is always built from rows that satisfy filters
+      // ¬X, so the user can always switch X's value without first
+      // clearing it. Mirrors how product-list facets behave in most
+      // ecommerce UIs.
+      const matches = (r, {repo, topic, intent}) =>
+        (repo   === '' || r.repo === repo) &&
+        (topic  === '' || queryTopicKey(r) === topic) &&
+        (intent === '' || (r.intent || 'general') === intent);
+
+      const f = {
+        repo:   state.queriesRepo,
+        topic:  state.queriesTopic,
+        intent: state.queriesIntent,
+      };
+
+      state.queriesRepo = refillFilter('#queries-repo',
+        all.filter(r => matches(r, {...f, repo: ''})).map(r => r.repo),
+        f.repo);
+      state.queriesTopic = refillFilter('#queries-topic',
+        all.filter(r => matches(r, {...f, topic: ''})).map(r => queryTopicKey(r)),
+        f.topic);
+      state.queriesIntent = refillFilter('#queries-intent',
+        all.filter(r => matches(r, {...f, intent: ''})).map(r => r.intent || 'general'),
+        f.intent);
+
+      // Re-read selections in case refillFilter dropped one whose
+      // value disappeared (e.g. you had topic=X under repo=A, then
+      // switched to repo=B where X doesn't exist → topic resets to '').
+      const repo   = state.queriesRepo;
+      const topic  = state.queriesTopic;
+      const intent = state.queriesIntent;
+      const rows = all.filter(r => matches(r, {repo, topic, intent}));
+
+      const filterParts = [];
+      if (repo)   filterParts.push(`repo=${repo}`);
+      if (topic)  filterParts.push(`topic=${topic}`);
+      if (intent) filterParts.push(`intent=${intent}`);
+      const filterSummary = filterParts.length ? ` · ${filterParts.join(', ')}` : '';
+      $('#queries-sub').textContent =
+        rows.length === all.length
+          ? `${rows.length} most recent${filterSummary}`
+          : `${rows.length} of ${all.length}${filterSummary}`;
+
       if (!rows.length) {
-        $('#queries-body').innerHTML = `<div class="empty">No queries yet. Issue a dev_context call to see traffic.</div>`;
+        const msg = all.length
+          ? `No queries match the current filters. <a href="#" id="queries-reset-inline">clear filters</a>`
+          : `No queries yet. Issue a dev_context call to see traffic.`;
+        $('#queries-body').innerHTML = `<div class="empty">${msg}</div>`;
+        const reset = $('#queries-reset-inline');
+        if (reset) reset.addEventListener('click', e => {
+          e.preventDefault();
+          state.queriesRepo = state.queriesTopic = state.queriesIntent = '';
+          renderQueries();
+        });
         return;
       }
       const html = ['<table>',
         '<thead><tr>',
-        '<th>Time</th><th>Intent</th><th>Repo</th><th>Query</th><th>Latency</th><th>Tokens</th><th>Reward</th>',
+        '<th>Time</th><th>Intent</th><th>Repo</th><th>Topic</th><th>Query</th><th>Latency</th><th>Tokens</th><th>Reward</th>',
         '</tr></thead><tbody>'];
       for (const row of rows) {
         const open = state.expanded.has(row.query_id);
@@ -430,13 +749,14 @@
           <td class="mono">${fmt.time(row.timestamp)}</td>
           <td><span class="badge intent">${fmt.escape(row.intent || 'general')}</span></td>
           <td>${fmt.escape(row.repo) || '<span class="badge">—</span>'}</td>
+          <td>${topicBadge(row)}</td>
           <td class="query-text">${fmt.escape(row.query)}</td>
           <td>${row.latency_ms} ms</td>
           <td>${row.prompt_tokens}</td>
           <td>${rewardBadge(row)}</td>
         </tr>`);
         if (open) {
-          html.push(`<tr><td colspan="7" style="padding:0;">${queryDetail(row)}</td></tr>`);
+          html.push(`<tr><td colspan="8" style="padding:0;">${queryDetail(row)}</td></tr>`);
         }
       }
       html.push('</tbody></table>');
@@ -461,6 +781,47 @@
     return `<span class="delta ${cls}">${sign}${d.delta}</span>`;
   }
 
+  function bucketDeltasHtml(deltas) {
+    const interesting = (deltas || []).filter(d => d.delta !== 0);
+    if (!interesting.length) return '<span class="pill">no drift from default</span>';
+    return interesting.map(d => {
+      const cls = d.delta > 0 ? 'up' : 'down';
+      const sign = d.delta > 0 ? '+' : '';
+      return `<span class="pill ${cls}">${fmt.escape(d.knob)} ${d.current} (${sign}${d.delta})</span>`;
+    }).join('');
+  }
+
+  function bucketRow(b, floor) {
+    const hotBadge = b.hot_enough
+      ? `<span class="badge good">hot</span>`
+      : `<span class="badge">cold ${b.centroid_samples}/${floor}</span>`;
+    const topicCell = b.topic_label
+      ? `${fmt.escape(b.topic_label)} <span style="color:var(--text-dim);">(${fmt.escape(b.topic_id)})</span>`
+      : fmt.escape(b.topic_id);
+    return `
+      <div class="bucket-row">
+        <div>
+          <div class="label">repo / topic</div>
+          <div class="mono">${fmt.escape(b.repo)} · ${topicCell}</div>
+        </div>
+        <div>
+          <div class="label">samples</div>
+          <div>${b.centroid_samples}</div>
+        </div>
+        <div>
+          <div class="label">7d μ</div>
+          <div>${(b.mean_raw_reward_7d || 0).toFixed(2)}</div>
+        </div>
+        <div>
+          <div style="display:flex; gap:8px; align-items:center; margin-bottom:4px;">
+            ${hotBadge}
+            <span class="mono" style="color:var(--text-dim);">${fmt.escape(b.current_profile_id)}</span>
+          </div>
+          <div class="bucket-deltas">${bucketDeltasHtml(b.deltas)}</div>
+        </div>
+      </div>`;
+  }
+
   async function renderHeuristics() {
     try {
       const v = await fetchJSON('/api/heuristics');
@@ -469,7 +830,64 @@
         $('#heuristics-grid').innerHTML = `<div class="empty">No heuristic profiles initialised yet.</div>`;
         return;
       }
-      $('#heuristics-grid').innerHTML = intents.map(it => `
+      const floor = v.topic_sample_floor || 20;
+
+      // Build the full (intent, repo) cross-product from the bucket
+      // list so the cascading filters reflect what actually exists.
+      // Intents that have no buckets yet still appear (sourced from
+      // the intent row itself) — useful when topics are off.
+      const allPairs = [];
+      for (const it of intents) {
+        if ((it.buckets || []).length) {
+          for (const b of it.buckets) allPairs.push({intent: it.intent, repo: b.repo || ''});
+        } else {
+          allPairs.push({intent: it.intent, repo: ''});
+        }
+      }
+
+      const matches = (p, {repo, intent}) =>
+        (repo   === '' || p.repo === repo) &&
+        (intent === '' || p.intent === intent);
+
+      const f = {repo: state.heuristicsRepo, intent: state.heuristicsIntent};
+      state.heuristicsRepo = refillFilter('#heuristics-repo',
+        allPairs.filter(p => matches(p, {...f, repo: ''})).map(p => p.repo).filter(Boolean),
+        f.repo);
+      state.heuristicsIntent = refillFilter('#heuristics-intent',
+        allPairs.filter(p => matches(p, {...f, intent: ''})).map(p => p.intent),
+        f.intent);
+
+      const repo   = state.heuristicsRepo;
+      const intent = state.heuristicsIntent;
+
+      // Apply filters at two levels:
+      //   - intent dropdown narrows the panel set
+      //   - repo dropdown narrows the bucket rows *inside* each panel,
+      //     and also hides panels that end up with zero matching
+      //     buckets when a repo is selected (so the view stays focused).
+      const visible = intents
+        .filter(it => intent === '' || it.intent === intent)
+        .map(it => {
+          if (!repo) return it;
+          const filteredBuckets = (it.buckets || []).filter(b => b.repo === repo);
+          return {...it, buckets: filteredBuckets};
+        })
+        .filter(it => !repo || (it.buckets && it.buckets.length));
+
+      if (!visible.length) {
+        const filterDesc = [repo && `repo=${repo}`, intent && `intent=${intent}`].filter(Boolean).join(', ');
+        $('#heuristics-grid').innerHTML =
+          `<div class="empty">No heuristic profiles match ${fmt.escape(filterDesc || 'current filters')}. ` +
+          `<a href="#" id="heuristics-clear-inline">clear filters</a></div>`;
+        $('#heuristics-clear-inline')?.addEventListener('click', e => {
+          e.preventDefault();
+          state.heuristicsRepo = state.heuristicsIntent = '';
+          renderHeuristics();
+        });
+        return;
+      }
+
+      $('#heuristics-grid').innerHTML = visible.map(it => `
         <div class="panel">
           <div class="panel-header">
             <h2>${fmt.escape(it.intent)} <span class="badge intent" style="margin-left:6px;">${fmt.escape(it.current_profile_id)}</span></h2>
@@ -497,11 +915,19 @@
             <div class="sub" style="margin-top:8px;color:var(--text-dim);font-size:11.5px;">
               today: ${it.samples_today} · explicit ${fmt.pct(it.explicit_fraction_7d || 0)} · implicit ${fmt.pct(it.implicit_fraction_7d || 0)}
             </div>
+            ${(it.buckets && it.buckets.length) ? `
+              <div class="bucket-list">
+                <div class="sub" style="margin: 4px 0 6px 0; font-size:11.5px;">Per-(repo, topic) buckets · floor ${floor} samples${repo ? ` · repo=${fmt.escape(repo)}` : ''}</div>
+                ${it.buckets.map(b => bucketRow(b, floor)).join('')}
+              </div>` : ''}
           </div>
         </div>
       `).join('');
 
-      const status = v.frozen ? 'frozen (read-only)' : (v.tunable_knobs.length ? `bandit tuning: ${v.tunable_knobs.join(', ')}` : 'bandit idle');
+      let status;
+      if (v.frozen) status = 'frozen (read-only)';
+      else status = (v.tunable_knobs.length ? `bandit tuning: ${v.tunable_knobs.join(', ')}` : 'bandit idle')
+        + (v.topics_enabled ? ` · topics ON (floor ${floor})` : ' · topics OFF');
       const headerCard = `<div class="card"><div class="label">Bandit</div><div class="value">${v.frozen ? '❄' : '●'}</div><div class="sub">${fmt.escape(status)}</div></div>`;
       const summaryEl = $('#summary');
       if (state.tab === 'heuristics' && !summaryEl.dataset.banditAppended) {
@@ -513,19 +939,91 @@
     }
   }
 
+  // ---------- Topics ----------
+  async function renderTopics() {
+    try {
+      const all = await fetchJSON('/api/topics');
+
+      // Cascading repo+intent facets — same shape as renderQueries.
+      // Each dropdown's options come from the data filtered by the
+      // *other* facet, so picking repo=mall shrinks the Intent
+      // dropdown to only intents that mall topics actually used.
+      const matches = (t, {repo, intent}) =>
+        (repo   === '' || t.repo === repo) &&
+        (intent === '' || t.intent === intent);
+
+      const f = {repo: state.topicsRepo, intent: state.topicsIntent};
+
+      state.topicsRepo = refillFilter('#topics-repo',
+        all.filter(t => matches(t, {...f, repo: ''})).map(t => t.repo),
+        f.repo);
+      state.topicsIntent = refillFilter('#topics-intent',
+        all.filter(t => matches(t, {...f, intent: ''})).map(t => t.intent),
+        f.intent);
+
+      const repo   = state.topicsRepo;
+      const intent = state.topicsIntent;
+      const rows = all.filter(t => matches(t, {repo, intent}));
+
+      const filterParts = [];
+      if (repo)   filterParts.push(`repo=${repo}`);
+      if (intent) filterParts.push(`intent=${intent}`);
+      const filterSummary = filterParts.length ? ` · ${filterParts.join(', ')}` : '';
+      $('#topics-sub').textContent =
+        rows.length === all.length
+          ? `${rows.length} centroids${filterSummary}`
+          : `${rows.length} of ${all.length}${filterSummary}`;
+      if (!rows.length) {
+        $('#topics-body').innerHTML = `<div class="empty">No topic centroids yet. Issue a few dev_context calls with embeddings to populate.</div>`;
+        return;
+      }
+      const html = ['<table>',
+        '<thead><tr><th>Intent</th><th>Repo</th><th>Topic</th><th>ID</th><th>Samples</th><th>Status</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>'];
+      for (const t of rows) {
+        const hot = t.hot_enough
+          ? `<span class="badge good">hot</span>`
+          : `<span class="badge">cold</span>`;
+        const labelCell = t.topic_label
+          ? fmt.escape(t.topic_label)
+          : `<span style="color:var(--text-dim);"><i>unlabeled</i></span>`;
+        html.push(`<tr>
+          <td><span class="badge intent">${fmt.escape(t.intent)}</span></td>
+          <td>${fmt.escape(t.repo)}</td>
+          <td>${labelCell}</td>
+          <td class="mono" style="color:var(--text-dim);">${fmt.escape(t.topic_id)}</td>
+          <td>${t.centroid_samples}</td>
+          <td>${hot}</td>
+          <td class="mono">${fmt.time(t.created_at_ms)}</td>
+          <td class="mono">${fmt.time(t.last_seen_ms)}</td>
+        </tr>`);
+      }
+      html.push('</tbody></table>');
+      $('#topics-body').innerHTML = html.join('');
+    } catch (e) {
+      $('#topics-body').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
+    }
+  }
+
   // ---------- Decisions ----------
-  function renderDecisionNode(node, children) {
+  // `opts.showRepo` adds a repo badge on each node — only useful in
+  // the all-repos view where decisions from different repos sit
+  // side-by-side and would otherwise be ambiguous.
+  function renderDecisionNode(node, children, opts = {}) {
     const cls = ['decision-node'];
     if (!node.supersedes) cls.push('root');
     if (node.status === 'superseded') cls.push('superseded');
     const badge = `<span class="badge ${node.status === 'active' ? 'active' : 'superseded'}">${fmt.escape(node.status || 'active')}</span>`;
+    const repoBadge = (opts.showRepo && node.repo)
+      ? `<span class="badge" style="background:#1f2937;color:#9ca3af;">${fmt.escape(node.repo)}</span>`
+      : '';
     const files = (node.files || []).map(f => `<code>${fmt.escape(f)}</code>`).join(' ');
-    const childHtml = (children || []).map(c => renderDecisionNode(c.node, c.children)).join('');
+    const childHtml = (children || []).map(c => renderDecisionNode(c.node, c.children, opts)).join('');
     return `
       <div class="${cls.join(' ')}">
         <div><span class="name">${fmt.escape(node.name)}</span>
           <span class="badge">${fmt.escape(node.decision_type)}</span>
-          ${badge}</div>
+          ${badge}
+          ${repoBadge}</div>
         <div class="body">${fmt.escape(node.decision)}</div>
         <div class="body" style="margin-top:4px;"><b style="color:var(--text-dim);">why:</b> ${fmt.escape(node.rationale)}</div>
         ${node.alternatives ? `<div class="body"><b style="color:var(--text-dim);">rejected:</b> ${fmt.escape(node.alternatives)}</div>` : ''}
@@ -536,14 +1034,19 @@
       </div>`;
   }
 
+  // In the all-repos view the same decision name can legitimately
+  // appear in multiple repos, so we key the lookup table by repo+name
+  // to keep supersession chains scoped to their own repo.
   function buildDecisionTree(decisions) {
-    const byName = new Map(decisions.map(d => [d.name, { node: d, children: [] }]));
+    const key = d => `${d.repo || ''}\u0000${d.name}`;
+    const byKey = new Map(decisions.map(d => [key(d), { node: d, children: [] }]));
     const roots = [];
     for (const d of decisions) {
-      const entry = byName.get(d.name);
-      if (d.supersedes && byName.has(d.supersedes)) {
+      const entry = byKey.get(key(d));
+      const parentKey = d.supersedes ? `${d.repo || ''}\u0000${d.supersedes}` : '';
+      if (d.supersedes && byKey.has(parentKey)) {
         // Older decision was superseded by this one — older sits under newer.
-        byName.get(d.supersedes).children.push(entry);
+        byKey.get(parentKey).children.push(entry);
       } else {
         roots.push(entry);
       }
@@ -552,46 +1055,527 @@
   }
 
   async function renderDecisions() {
-    const repo = state.decisionsRepo;
-    if (!repo) {
-      $('#decisions-body').innerHTML = `<div class="empty">Pick a repo to inspect saved decisions.</div>`;
-      $('#decisions-sub').textContent = '';
-      return;
-    }
     try {
+      // The backend honours repo="" as the "all repos" view, so we
+      // always issue one call regardless of filter state and let the
+      // server do the heavy lifting. The type filter is applied
+      // client-side after the fetch so the dropdown can be derived
+      // from the same response (keeps cascading cheap & coherent).
+      const repo = state.decisionsRepo || '';
       const ds = await fetchJSON(`/api/decisions?repo=${encodeURIComponent(repo)}`);
-      $('#decisions-sub').textContent = `${ds.length} decisions for ${repo}`;
-      if (!ds.length) {
-        $('#decisions-body').innerHTML = `<div class="empty">No decisions saved for ${fmt.escape(repo)} yet.</div>`;
+
+      // Cascading repo+type facets. Repo is sourced from row data so
+      // the dropdown reflects what's actually in Redis (vs. the
+      // generic /api/repos union of every memory type).
+      const matches = (d, {repo, type}) =>
+        (repo === '' || d.repo === repo) &&
+        (type === '' || d.decision_type === type);
+
+      const f = {repo, type: state.decisionsType};
+      // Repo dropdown options: when we already filtered server-side
+      // by repo (repo !== '') the response only has that repo, so we
+      // pad the list with the global repo set so users can switch
+      // away without an empty dropdown.
+      const repoOptions = repo
+        ? state.repos
+        : Array.from(new Set(ds.map(d => d.repo).filter(Boolean)));
+      state.decisionsRepo = refillFilter('#decisions-repo', repoOptions, f.repo);
+      state.decisionsType = refillFilter('#decisions-type',
+        ds.filter(d => matches(d, {...f, type: ''})).map(d => d.decision_type).filter(Boolean),
+        f.type);
+
+      const type = state.decisionsType;
+      const filtered = ds.filter(d => matches(d, {repo: state.decisionsRepo, type}));
+
+      const filterParts = [];
+      if (state.decisionsRepo) filterParts.push(`repo=${state.decisionsRepo}`); else filterParts.push('all repos');
+      if (type) filterParts.push(`type=${type}`);
+      $('#decisions-sub').textContent =
+        filtered.length === ds.length
+          ? `${filtered.length} decisions · ${filterParts.join(', ')}`
+          : `${filtered.length} of ${ds.length} · ${filterParts.join(', ')}`;
+
+      if (!filtered.length) {
+        $('#decisions-body').innerHTML =
+          `<div class="empty">No decisions match the current filters. ` +
+          `<a href="#" id="decisions-clear-inline">clear filters</a></div>`;
+        $('#decisions-clear-inline')?.addEventListener('click', e => {
+          e.preventDefault();
+          state.decisionsRepo = state.decisionsType = '';
+          renderDecisions();
+        });
         return;
       }
-      const tree = buildDecisionTree(ds);
-      $('#decisions-body').innerHTML = tree.map(t => renderDecisionNode(t.node, t.children)).join('');
+
+      const showRepo = !state.decisionsRepo;
+      const tree = buildDecisionTree(filtered);
+      $('#decisions-body').innerHTML = tree.map(t => renderDecisionNode(t.node, t.children, {showRepo})).join('');
     } catch (e) {
       $('#decisions-body').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
     }
   }
 
   // ---------- Flows ----------
-  function renderFlowSVG(flow) {
-    const entries = flow.entry_points || [];
-    const files = flow.files || [];
-    if (!entries.length && !files.length) return '';
+
+  // Preview caps. With the multi-depth band layout, preview always
+  // pins maxDepth=1 (just the immediate neighbours) so the card
+  // stays a glanceable summary, and per-column caps are tight to
+  // keep the card height reasonable when there are many seeds.
+  const PREVIEW_CAPS  = { perColumn: 3, seeds: 4 };
+  const PREVIEW_DEPTH = 1; // hops to show in preview mode (always 1)
+
+  // Maximum stored chain depth — must match subgraphMaxDepth in
+  // internal/codegraph/client.go (any flow re-saved by a newer
+  // backend may have nodes up to this depth). UI slider caps here.
+  const MAX_DEPTH = 5;
+  const DEFAULT_EXPANDED_DEPTH = 2;
+
+  const PREVIEW_BIPARTITE_CAP = 6;
+
+  // Dispatcher: prefer the captured codegraph subgraph (real callers/
+  // callees from kuzu) when present; fall back to the legacy bipartite
+  // files↔entries SVG so flows saved before the snapshot feature
+  // (or flows where codegraph wasn't reachable) still render *something*.
+  //
+  // maxDepth controls how many hops out from each seed we render:
+  //   - Preview: pinned to PREVIEW_DEPTH (=1) regardless of caller input
+  //   - Expanded: whatever value the per-flow depth slider holds
+  //     (1 .. MAX_DEPTH), defaulting to DEFAULT_EXPANDED_DEPTH.
+  function renderFlowSVG(flow, {preview, maxDepth} = {preview: true, maxDepth: 1}) {
+    if (flow.subgraph && (flow.subgraph.nodes || []).length > 0) {
+      const depth = preview ? PREVIEW_DEPTH : Math.max(1, Math.min(MAX_DEPTH, maxDepth || 1));
+      return renderCallGraph(flow.subgraph, {preview, maxDepth: depth});
+    }
+    return renderBipartiteSVG(flow, {preview});
+  }
+
+  // Returns {total, shown, maxStoredDepth, snapshotTruncated} so
+  // renderFlows can label the expand button and decide whether to
+  // offer a depth slider. "Shown" approximates what a preview
+  // (depth=1) actually renders so the counter is meaningful.
+  function flowCounts(flow) {
+    if (flow.subgraph && (flow.subgraph.nodes || []).length > 0) {
+      const sg = flow.subgraph;
+      const maxStoredDepth = (sg.nodes || []).reduce(
+        (m, n) => Math.max(m, Math.abs(n.depth || 0)), 0);
+      // Preview keeps only seeds + nodes with |depth| <= 1
+      const previewable = (sg.nodes || []).filter(n =>
+        n.role === 'seed' || Math.abs(n.depth || 0) <= PREVIEW_DEPTH);
+      // Cap by seed count + per-column cap (rough estimate — the
+      // exact band-level cap is computed inside renderCallGraph).
+      const shown = Math.min(previewable.length, PREVIEW_CAPS.seeds * (1 + 3 * PREVIEW_CAPS.perColumn));
+      return {total: sg.nodes.length, shown, maxStoredDepth, snapshotTruncated: !!sg.truncated};
+    }
+    const total = (flow.entry_points || []).length + (flow.files || []).length;
+    const shown = Math.min((flow.entry_points || []).length, PREVIEW_BIPARTITE_CAP)
+                + Math.min((flow.files || []).length, PREVIEW_BIPARTITE_CAP);
+    return {total, shown, maxStoredDepth: 0, snapshotTruncated: false};
+  }
+
+  // bandGroups routes every non-seed node under its primary seed by
+  // walking the CALLS chain back to the nearest seed.
+  //
+  // For callees: walk *upstream* via the CALLS edge that ends at this
+  // node (its predecessor closer to the seed). For callers: walk
+  // *downstream* via the CALLS edge that starts at this node (its
+  // successor closer to the seed). The walk uses single-best parent
+  // links (first edge wins) and is bounded by MAX_DEPTH + 1 hops so
+  // a cycle can't loop.
+  //
+  // Aux nodes (importer/extends/method) live at depth=1 and have a
+  // direct structural edge (IMPORTS / EXTENDS / HAS_METHOD) to the
+  // seed, so they're routed via the matching edge type.
+  //
+  // Returns an array of {seed, callersByDepth, calleesByDepth, aux}
+  // where callersByDepth/calleesByDepth are Maps keyed by depth.
+  // A trailing band with seed=null collects anything that couldn't be
+  // routed — defensive, shouldn't happen on well-formed snapshots.
+  function bandGroups(sg) {
+    const nodesByName = new Map();
+    const seeds = [];
+    (sg.nodes || []).forEach(n => {
+      nodesByName.set(n.name, n);
+      if (n.role === 'seed') seeds.push(n);
+    });
+    const seedNames = new Set(seeds.map(s => s.name));
+
+    // Build parent links for callees (upstream) and callers (downstream).
+    // Each node remembers the *first* edge that connects it to
+    // a closer-to-seed neighbour. That gives deterministic routing.
+    const calleeUp = new Map();   // callee name -> predecessor name
+    const callerDown = new Map(); // caller name -> successor name
+    const auxToSeed = new Map();  // aux name -> seed name (direct edge)
+    (sg.edges || []).forEach(e => {
+      const fromNode = nodesByName.get(e.from);
+      const toNode = nodesByName.get(e.to);
+      if (!fromNode || !toNode) return;
+      if (e.type === 'CALLS') {
+        // For the callee side: predecessor is anyone closer to seed.
+        // We accept any predecessor with strictly smaller |depth|.
+        if (toNode.role === 'callee' && !calleeUp.has(toNode.name)) {
+          if (fromNode.role === 'seed' || (fromNode.role === 'callee' &&
+              Math.abs(fromNode.depth || 0) < Math.abs(toNode.depth || 0))) {
+            calleeUp.set(toNode.name, fromNode.name);
+          }
+        }
+        // For the caller side: successor is anyone closer to seed.
+        if (fromNode.role === 'caller' && !callerDown.has(fromNode.name)) {
+          if (toNode.role === 'seed' || (toNode.role === 'caller' &&
+              Math.abs(toNode.depth || 0) < Math.abs(fromNode.depth || 0))) {
+            callerDown.set(fromNode.name, toNode.name);
+          }
+        }
+      } else if (e.type === 'IMPORTS' || e.type === 'EXTENDS') {
+        // Synthesized in the backend to point at the seed symbol.
+        if (seedNames.has(e.to) && !auxToSeed.has(e.from)) {
+          auxToSeed.set(e.from, e.to);
+        }
+      } else if (e.type === 'HAS_METHOD') {
+        if (seedNames.has(e.from) && !auxToSeed.has(e.to)) {
+          auxToSeed.set(e.to, e.from);
+        }
+      }
+    });
+
+    function walkTo(start, chainMap) {
+      let cur = start;
+      for (let i = 0; i <= MAX_DEPTH + 1; i++) {
+        if (seedNames.has(cur)) return cur;
+        const next = chainMap.get(cur);
+        if (!next || next === cur) return null;
+        cur = next;
+      }
+      return null;
+    }
+
+    const groups = seeds.map(s => ({
+      seed: s,
+      callersByDepth: new Map(),
+      calleesByDepth: new Map(),
+      aux: [],
+    }));
+    const groupByName = new Map(groups.map(g => [g.seed.name, g]));
+    const orphans = {seed: null, callersByDepth: new Map(), calleesByDepth: new Map(), aux: []};
+
+    (sg.nodes || []).forEach(n => {
+      if (n.role === 'seed') return;
+      let parent;
+      if (n.role === 'caller')      parent = walkTo(n.name, callerDown);
+      else if (n.role === 'callee') parent = walkTo(n.name, calleeUp);
+      else                          parent = auxToSeed.get(n.name);
+      const g = (parent && groupByName.get(parent)) || orphans;
+      if (n.role === 'caller') {
+        const d = n.depth || -1;
+        if (!g.callersByDepth.has(d)) g.callersByDepth.set(d, []);
+        g.callersByDepth.get(d).push(n);
+      } else if (n.role === 'callee') {
+        const d = n.depth || 1;
+        if (!g.calleesByDepth.has(d)) g.calleesByDepth.set(d, []);
+        g.calleesByDepth.get(d).push(n);
+      } else {
+        g.aux.push(n);
+      }
+    });
+
+    // Sort within each depth bucket so reloads paint identically.
+    const sortBuckets = bm => bm.forEach(arr => arr.sort((a, b) => a.name.localeCompare(b.name)));
+    groups.forEach(g => {
+      sortBuckets(g.callersByDepth);
+      sortBuckets(g.calleesByDepth);
+      g.aux.sort((a, b) => a.name.localeCompare(b.name));
+    });
+    const hasOrphans = orphans.callersByDepth.size || orphans.calleesByDepth.size || orphans.aux.length;
+    if (hasOrphans) {
+      sortBuckets(orphans.callersByDepth);
+      sortBuckets(orphans.calleesByDepth);
+      orphans.aux.sort((a, b) => a.name.localeCompare(b.name));
+      groups.push(orphans);
+    }
+    return groups;
+  }
+
+  // renderCallGraph draws the codegraph subgraph as a *banded multi-depth*
+  // column layout. Each seed gets its own vertical band; within a band
+  // there's one column per BFS depth on each side of the seed:
+  //
+  //   callers d=-N ... d=-2  d=-1   SEEDS   d=+1  d=+2 ... d=+N   aux
+  //
+  // So at maxDepth=1 the layout collapses to the familiar
+  // callers / seeds / callees / aux quad; at maxDepth=5 there are up
+  // to 11 columns (5 caller depths + seed + 5 callee depths + aux).
+  // CALLS edges between adjacent depth columns make the chain visible
+  // — readers can trace "Add → Get → AddToCommands → composeKey → ..."
+  // by following edges across depth columns within the same band.
+  //
+  // The layout is fully deterministic so the same flow renders
+  // identically on every reload (no force simulation, alphabetical
+  // sort within each depth bucket).
+  function renderCallGraph(sg, {preview, maxDepth} = {preview: true, maxDepth: 1}) {
+    const depth = Math.max(1, Math.min(MAX_DEPTH, maxDepth));
+    const groupsAll = bandGroups(sg);
+    if (!groupsAll.length) return '';
+
+    const seedCap = preview ? PREVIEW_CAPS.seeds : Infinity;
+    const perColCap = preview ? PREVIEW_CAPS.perColumn : Infinity;
+
+    // Trim by seed count (preview only) and then by depth + per-column
+    // caps. Per-band totals get tracked so we can emit "+N more" tags.
+    const visibleGroups = groupsAll.slice(0, seedCap).map(g => {
+      const callerCols = []; // [{depth, nodes, hidden}], depth=-1, -2, ...
+      for (let d = -1; d >= -depth; d--) {
+        const arr = g.callersByDepth.get(d) || [];
+        const visible = arr.slice(0, perColCap);
+        const hidden = arr.length - visible.length;
+        if (visible.length || hidden) callerCols.push({depth: d, nodes: visible, hidden});
+      }
+      const calleeCols = []; // depth=+1, +2, ...
+      for (let d = 1; d <= depth; d++) {
+        const arr = g.calleesByDepth.get(d) || [];
+        const visible = arr.slice(0, perColCap);
+        const hidden = arr.length - visible.length;
+        if (visible.length || hidden) calleeCols.push({depth: d, nodes: visible, hidden});
+      }
+      const aux = g.aux.slice(0, perColCap);
+      const auxHidden = g.aux.length - aux.length;
+      return {seed: g.seed, callerCols, calleeCols, aux, auxHidden};
+    });
+    const hiddenSeeds = Math.max(0, groupsAll.length - visibleGroups.length);
+
+    // Figure out which depth columns actually have content across any
+    // band — drop empty ones to keep the layout tight. Caller columns
+    // sort left-to-right by depth ascending (i.e. -5, -4, ..., -1 next
+    // to seed). Callee columns sort right-to-left by depth descending
+    // (1, 2, ..., 5 with 5 being furthest right before aux).
+    const activeCallerDepths = new Set();
+    const activeCalleeDepths = new Set();
+    let hasAnyAux = false;
+    visibleGroups.forEach(b => {
+      b.callerCols.forEach(c => activeCallerDepths.add(c.depth));
+      b.calleeCols.forEach(c => activeCalleeDepths.add(c.depth));
+      if (b.aux.length || b.auxHidden) hasAnyAux = true;
+    });
+    const callerDepthList = Array.from(activeCallerDepths).sort((a, b) => a - b); // -5..-1
+    const calleeDepthList = Array.from(activeCalleeDepths).sort((a, b) => a - b); //  1..5
+
+    // Column descriptors. `key` is the lookup key for x-position and
+    // the "is this column visible?" check.
+    const columns = [];
+    callerDepthList.forEach(d => columns.push({
+      key: `c${d}`,
+      label: d === -1 ? 'callers' : `callers d=${-d}`,
+      kind: 'caller',
+      depth: d,
+    }));
+    columns.push({key: 's', label: 'seeds', kind: 'seed'});
+    calleeDepthList.forEach(d => columns.push({
+      key: `e${d}`,
+      label: d === 1 ? 'callees' : `callees d=${d}`,
+      kind: 'callee',
+      depth: d,
+    }));
+    if (hasAnyAux) columns.push({key: 'aux', label: 'related', kind: 'aux'});
+
+    const nodeW = 230, nodeH = 38, rowH = 44;
+    const padX = 14, padY = 30, colGap = 70, bandGap = 18;
+    const colX = {};
+    columns.forEach((c, i) => { colX[c.key] = padX + i * (nodeW + colGap); });
+    const width = padX * 2 + columns.length * nodeW + (columns.length - 1) * colGap;
+
+    // Per-band layout. Each band's height is the tallest column for
+    // that band (counting +N marker rows). The seed sits at the band's
+    // vertical centre so connecting edges fan symmetrically.
+    const visiblePos = new Map();
+    let cursorY = padY + 14;
+    const bandRecords = [];
+    visibleGroups.forEach(b => {
+      // Helper: rows needed in a given depth column (visible + marker).
+      const callerRows = d => {
+        const col = b.callerCols.find(c => c.depth === d);
+        return col ? col.nodes.length + (col.hidden ? 1 : 0) : 0;
+      };
+      const calleeRows = d => {
+        const col = b.calleeCols.find(c => c.depth === d);
+        return col ? col.nodes.length + (col.hidden ? 1 : 0) : 0;
+      };
+      let maxRows = 1; // seed alone
+      callerDepthList.forEach(d => { maxRows = Math.max(maxRows, callerRows(d)); });
+      calleeDepthList.forEach(d => { maxRows = Math.max(maxRows, calleeRows(d)); });
+      if (b.aux.length || b.auxHidden) maxRows = Math.max(maxRows, b.aux.length + (b.auxHidden ? 1 : 0));
+
+      const height = maxRows * rowH;
+      const seedY = cursorY + (height - nodeH) / 2;
+      bandRecords.push({startY: cursorY, height, seedY, b});
+
+      // Place every node in its column at its band-relative slot.
+      b.callerCols.forEach(col => {
+        col.nodes.forEach((n, i) => visiblePos.set(n.name,
+          {x: colX[`c${col.depth}`], y: cursorY + i * rowH, col: `c${col.depth}`}));
+      });
+      visiblePos.set(b.seed.name, {x: colX.s, y: seedY, col: 's'});
+      b.calleeCols.forEach(col => {
+        col.nodes.forEach((n, i) => visiblePos.set(n.name,
+          {x: colX[`e${col.depth}`], y: cursorY + i * rowH, col: `e${col.depth}`}));
+      });
+      b.aux.forEach((n, i) => visiblePos.set(n.name,
+        {x: colX.aux, y: cursorY + i * rowH, col: 'aux'}));
+
+      cursorY += height + bandGap;
+    });
+    const contentBottom = cursorY - bandGap;
+    const moreSeedsY = hiddenSeeds > 0 ? contentBottom + 20 : contentBottom;
+    const height = moreSeedsY + padY;
+
+    const svgClass = preview ? 'flow-svg' : 'flow-svg full';
+    // Cap preview SVGs at their native pixel width so a sparse flow
+    // (one or two columns of content) doesn't get scaled up to panel
+    // width, blowing up text to absurd sizes. The viewBox keeps the
+    // shrink-to-fit behaviour for normal-width graphs.
+    const sizeAttrs = preview
+      ? `viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet" style="max-width:${width}px"`
+      : `width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"`;
+    let svg = `<svg class="${svgClass}" ${sizeAttrs}>`;
+
+    columns.forEach(c => {
+      svg += `<text class="col-label" x="${colX[c.key] + nodeW / 2}" y="${padY + 4}">${fmt.escape(c.label)}</text>`;
+    });
+
+    for (let i = 1; i < bandRecords.length; i++) {
+      const y = bandRecords[i].startY - bandGap / 2;
+      svg += `<line class="band-divider" x1="${padX}" y1="${y}" x2="${width - padX}" y2="${y}"/>`;
+    }
+
+    // Edges. Both endpoints have to be in visiblePos or we'd dangle.
+    // Same-column edges get a tiny bypass loop (rare; happens when
+    // two seeds reference each other).
+    (sg.edges || []).forEach(e => {
+      const a = visiblePos.get(e.from);
+      const b = visiblePos.get(e.to);
+      if (!a || !b) return;
+      const x1 = a.x + nodeW, y1 = a.y + nodeH / 2;
+      const x2 = b.x,         y2 = b.y + nodeH / 2;
+      let d;
+      if (a.col === b.col) {
+        const loopX = a.x + nodeW + 18;
+        d = `M${x1} ${y1} C ${loopX} ${y1}, ${loopX} ${y2}, ${x2 + nodeW} ${y2}`;
+      } else {
+        const mx = (x1 + x2) / 2;
+        d = `M${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
+      }
+      svg += `<path class="edge-${e.type || 'CALLS'}" d="${d}" fill="none"/>`;
+    });
+
+    // Nodes are two-line: symbol on top, file basename below.
+    const labelCap = preview ? 32 : 60;
+    const fileCap  = preview ? 28 : 50;
+    const renderNode = (n, p) => {
+      const glyph = n.role === 'seed'   ? '▸'
+                  : n.role === 'caller' ? '↑'
+                  : n.role === 'callee' ? '↓'
+                  : '·';
+      const cls = 'node-' + (n.role || 'callee');
+      const fileFull = n.file || '';
+      const fileBase = fileFull ? (fileFull.split('/').pop() || fileFull) : '';
+      const title = fileFull ? `${n.name} — ${fileFull}` : n.name;
+      const symbolY = fileBase ? p.y + 16 : p.y + 23;
+      let out = `<g><title>${fmt.escape(title)}</title>`;
+      out += `<rect class="${cls}" x="${p.x}" y="${p.y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
+      out += `<text class="node-text" x="${p.x + 8}" y="${symbolY}">${glyph} ${fmt.escape(fmt.truncate(n.name, labelCap))}</text>`;
+      if (fileBase) {
+        out += `<text class="node-file-text" x="${p.x + 16}" y="${p.y + 30}">${fmt.escape(fmt.truncate(fileBase, fileCap))}</text>`;
+      }
+      out += `</g>`;
+      return out;
+    };
+
+    bandRecords.forEach(({b}) => {
+      if (b.seed) svg += renderNode(b.seed, visiblePos.get(b.seed.name));
+      b.callerCols.forEach(col => col.nodes.forEach(n => svg += renderNode(n, visiblePos.get(n.name))));
+      b.calleeCols.forEach(col => col.nodes.forEach(n => svg += renderNode(n, visiblePos.get(n.name))));
+      b.aux.forEach(n => svg += renderNode(n, visiblePos.get(n.name)));
+    });
+
+    // Per-band +N more indicators.
+    bandRecords.forEach(({startY, b}) => {
+      b.callerCols.forEach(col => {
+        if (!col.hidden) return;
+        const y = startY + col.nodes.length * rowH + 12;
+        svg += `<text class="col-more" x="${colX[`c${col.depth}`] + nodeW / 2}" y="${y}">+${col.hidden} more</text>`;
+      });
+      b.calleeCols.forEach(col => {
+        if (!col.hidden) return;
+        const y = startY + col.nodes.length * rowH + 12;
+        svg += `<text class="col-more" x="${colX[`e${col.depth}`] + nodeW / 2}" y="${y}">+${col.hidden} more</text>`;
+      });
+      if (b.auxHidden) {
+        const y = startY + b.aux.length * rowH + 12;
+        svg += `<text class="col-more" x="${colX.aux + nodeW / 2}" y="${y}">+${b.auxHidden} more</text>`;
+      }
+    });
+
+    if (hiddenSeeds > 0) {
+      svg += `<text class="col-more" x="${width / 2}" y="${moreSeedsY}">+${hiddenSeeds} more seed${hiddenSeeds === 1 ? '' : 's'} (expand to view)</text>`;
+    }
+
+    svg += '</svg>';
+
+    const allRoles = new Set((sg.nodes || []).map(n => n.role));
+    const legendItems = [
+      { role: 'seed',     label: 'entry point' },
+      { role: 'caller',   label: 'caller' },
+      { role: 'callee',   label: 'callee' },
+      { role: 'method',   label: 'method' },
+      { role: 'extends',  label: 'extends' },
+      { role: 'importer', label: 'imports' },
+    ].filter(it => allRoles.has(it.role));
+    let legend = `<div class="flow-svg-legend">`;
+    legendItems.forEach(it => {
+      legend += `<span><span class="swatch node-${it.role}"></span>${it.label}</span>`;
+    });
+    if (sg.truncated && !preview) {
+      legend += `<span class="truncated">codegraph snapshot was capped at save time — some neighbours weren't recorded</span>`;
+    }
+    legend += `</div>`;
+
+    return preview
+      ? svg + legend
+      : `<div class="flow-full-wrap">${svg}</div>${legend}`;
+  }
+
+  // renderBipartiteSVG is the legacy renderer kept around for flows
+  // saved without a codegraph snapshot (entry_points empty, codegraph
+  // offline at save time, or pre-snapshot-feature flows still in
+  // Redis). Same shape as before the codegraph integration, with the
+  // same preview/full split as renderCallGraph.
+  function renderBipartiteSVG(flow, {preview} = {preview: true}) {
+    const allEntries = flow.entry_points || [];
+    const allFiles   = flow.files || [];
+    if (!allEntries.length && !allFiles.length) return '';
+    const entries = preview ? allEntries.slice(0, PREVIEW_BIPARTITE_CAP) : allEntries;
+    const files   = preview ? allFiles.slice(0,   PREVIEW_BIPARTITE_CAP) : allFiles;
+    const hiddenE = allEntries.length - entries.length;
+    const hiddenF = allFiles.length   - files.length;
+
     const rowH = 28, colGap = 220, padX = 14, padY = 18;
     const nodeW = 190, nodeH = 22;
-    const maxRows = Math.max(entries.length, files.length, 1);
+    const maxRows = Math.max(entries.length, files.length, 1) + ((hiddenE || hiddenF) ? 1 : 0);
     const height = padY * 2 + maxRows * rowH;
     const width  = padX * 2 + nodeW + colGap;
-    let svg = `<svg class="flow-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet">`;
+
+    const svgClass = preview ? 'flow-svg' : 'flow-svg full';
+    const sizeAttrs = preview
+      ? `viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet" style="max-width:${width}px"`
+      : `width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"`;
+    let svg = `<svg class="${svgClass}" ${sizeAttrs}>`;
+
     entries.forEach((e, i) => {
       const x = padX, y = padY + i * rowH;
       svg += `<rect class="node-entry" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
-      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">▸ ${fmt.escape(fmt.truncate(e, 30))}</text>`;
+      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">▸ ${fmt.escape(fmt.truncate(e, preview ? 30 : 60))}</text>`;
     });
     files.forEach((f, i) => {
       const x = padX + nodeW + colGap - nodeW, y = padY + i * rowH;
       svg += `<rect class="node-file" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
-      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">${fmt.escape(fmt.truncate(f, 30))}</text>`;
+      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">${fmt.escape(fmt.truncate(f, preview ? 30 : 60))}</text>`;
     });
     const ex = padX + nodeW, fx = padX + colGap;
     for (let i = 0; i < entries.length; i++) {
@@ -602,34 +1586,87 @@
         svg += `<path class="edge" d="M${ex} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${fx} ${y2}" fill="none"/>`;
       }
     }
+    if (hiddenE) {
+      svg += `<text class="col-more" x="${padX + nodeW/2}" y="${padY + entries.length * rowH + 14}">+${hiddenE} more</text>`;
+    }
+    if (hiddenF) {
+      svg += `<text class="col-more" x="${padX + colGap + nodeW/2}" y="${padY + files.length * rowH + 14}">+${hiddenF} more</text>`;
+    }
     svg += '</svg>';
-    return svg;
+    return preview ? svg : `<div class="flow-full-wrap">${svg}</div>`;
   }
 
   async function renderFlows() {
-    const repo = state.flowsRepo;
-    if (!repo) {
-      $('#flows-body').innerHTML = `<div class="empty">Pick a repo to inspect saved flows.</div>`;
-      return;
-    }
     try {
+      // Empty repo → server returns flows across every indexed repo.
+      // We rely on the per-row `repo` field (populated by LoadFlows
+      // from the FT.SEARCH hit) to render a repo badge per card when
+      // in the all-repos view.
+      const repo = state.flowsRepo || '';
       const flows = await fetchJSON(`/api/flows?repo=${encodeURIComponent(repo)}`);
+
+      // Repo dropdown sourced from the global list, not the response,
+      // so the user can still navigate to a repo that has zero flows
+      // (which would otherwise vanish from the dropdown the moment
+      // the response went empty).
+      state.flowsRepo = refillFilter('#flows-repo', state.repos, repo);
+
       if (!flows.length) {
-        $('#flows-body').innerHTML = `<div class="empty">No flows saved for ${fmt.escape(repo)} yet.</div>`;
+        const target = state.flowsRepo || 'any repo';
+        $('#flows-body').innerHTML = `<div class="empty">No flows saved for ${fmt.escape(target)} yet.</div>`;
         return;
       }
-      $('#flows-body').innerHTML = flows.map(f => `
+      const showRepo = !state.flowsRepo;
+      $('#flows-body').innerHTML = flows.map(f => {
+        const repoBadge = showRepo && f.repo
+          ? `<span class="badge" style="background:#1f2937;color:#9ca3af;margin-left:6px;">${fmt.escape(f.repo)}</span>`
+          : '';
+        const key = `${f.repo || ''}::${f.name}`;
+        const expanded = state.expandedFlows.has(key);
+        const counts = flowCounts(f);
+        const hasMore = counts.total > counts.shown || counts.snapshotTruncated;
+
+        // Depth slider: only meaningful when expanded AND the snapshot
+        // actually has nodes beyond 1-hop. Slider max is clamped to
+        // what's actually stored so users can't ask for depth they
+        // don't have — saves a confusing "I set 5 but nothing changes"
+        // experience for flows snapshotted before deep BFS shipped.
+        const sliderMax = Math.max(1, Math.min(MAX_DEPTH, counts.maxStoredDepth || 1));
+        const currentDepth = expanded
+          ? Math.max(1, Math.min(sliderMax, state.flowDepth.get(key) ?? DEFAULT_EXPANDED_DEPTH))
+          : PREVIEW_DEPTH;
+        const depthSlider = (expanded && sliderMax > 1)
+          ? `<div class="flow-depth">
+               <label for="depth-${fmt.escape(key)}">chain depth:</label>
+               <input id="depth-${fmt.escape(key)}" type="range"
+                      min="1" max="${sliderMax}" step="1" value="${currentDepth}"
+                      data-flow-depth="${fmt.escape(key)}"
+                      title="walk this many hops upstream/downstream from each entry point">
+               <span class="flow-depth-value mono">${currentDepth} / ${sliderMax}</span>
+             </div>`
+          : '';
+
+        const toggleBtn = hasMore
+          ? `<div class="flow-actions">
+               <button type="button" data-flow-toggle="${fmt.escape(key)}">
+                 ${expanded ? `collapse` : `expand · showing ${counts.shown}/${counts.total}`}
+               </button>
+             </div>`
+          : '';
+        return `
         <div class="panel">
           <div class="panel-header">
-            <h2>${fmt.escape(f.name)}</h2>
+            <h2>${fmt.escape(f.name)}${repoBadge}</h2>
             <div class="sub">${fmt.escape(f.source || 'agent')} · updated ${fmt.time(f.updated_at)}</div>
           </div>
           <div style="padding: 12px 16px;">
             <div style="color:var(--text); white-space: pre-wrap;">${fmt.escape(f.purpose || '')}</div>
-            ${renderFlowSVG(f)}
+            ${depthSlider}
+            ${renderFlowSVG(f, {preview: !expanded, maxDepth: currentDepth})}
+            ${toggleBtn}
           </div>
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
     } catch (e) {
       $('#flows-body').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
     }
@@ -640,14 +1677,18 @@
     try {
       const repos = await fetchJSON('/api/repos');
       state.repos = repos;
+      // Both selects now support an "all" option (empty value). We
+      // default to "all" instead of preselecting the first repo —
+      // matches the convention on the Queries / Topics / Heuristics
+      // tabs and lets users immediately see cross-repo activity.
       for (const id of ['decisions-repo', 'flows-repo']) {
         const sel = document.getElementById(id);
         if (!sel) continue;
         const current = sel.value;
-        sel.innerHTML = repos.length
-          ? repos.map(r => `<option value="${fmt.escape(r)}">${fmt.escape(r)}</option>`).join('')
-          : `<option value="">(no repos indexed)</option>`;
-        const want = current && repos.includes(current) ? current : (repos[0] || '');
+        const opts = [`<option value="">all</option>`].concat(
+          repos.map(r => `<option value="${fmt.escape(r)}">${fmt.escape(r)}</option>`));
+        sel.innerHTML = opts.join('');
+        const want = current && repos.includes(current) ? current : '';
         sel.value = want;
         if (id === 'decisions-repo') state.decisionsRepo = want;
         if (id === 'flows-repo') state.flowsRepo = want;
@@ -662,12 +1703,38 @@
     refreshActive();
   }
 
+  // checkServerVersion polls /api/version each refresh tick. If the
+  // server's start_ms differs from the value we captured at page
+  // load, the binary was rebuilt+restarted underneath us and the JS
+  // in this tab is stale — reload so the user sees the new UI
+  // without having to remember to hard-refresh. Failures are
+  // swallowed silently so a single transient 5xx doesn't trigger
+  // a spurious reload loop.
+  let serverStartMs = null;
+  async function checkServerVersion() {
+    try {
+      const v = await fetchJSON('/api/version');
+      if (!v || typeof v.start_ms !== 'number') return;
+      if (serverStartMs === null) {
+        serverStartMs = v.start_ms;
+        return;
+      }
+      if (v.start_ms !== serverStartMs) {
+        console.log('[dashboard] server restarted — reloading for new UI');
+        // Use replace() to avoid polluting browser history.
+        location.replace(location.href);
+      }
+    } catch (_) { /* silent */ }
+  }
+
   function refreshActive() {
     renderSummary();
     if (state.tab === 'queries')    renderQueries();
     if (state.tab === 'heuristics') renderHeuristics();
+    if (state.tab === 'topics')     renderTopics();
     if (state.tab === 'decisions')  renderDecisions();
     if (state.tab === 'flows')      renderFlows();
+    checkServerVersion();
     $('#last-refresh').textContent = 'refreshed ' + fmt.time(Date.now());
   }
 
@@ -682,7 +1749,56 @@
   $('#auto-refresh').addEventListener('change', e => { state.autoRefresh = e.target.checked; reschedule(); });
   $('#refresh-interval').addEventListener('change', e => { state.intervalSec = Number(e.target.value) || 3; reschedule(); });
   $('#decisions-repo').addEventListener('change', e => { state.decisionsRepo = e.target.value; renderDecisions(); });
+  $('#decisions-type').addEventListener('change', e => { state.decisionsType = e.target.value; renderDecisions(); });
+  $('#decisions-clear-filters').addEventListener('click', () => {
+    state.decisionsRepo = state.decisionsType = '';
+    renderDecisions();
+  });
   $('#flows-repo').addEventListener('change', e => { state.flowsRepo = e.target.value; renderFlows(); });
+  $('#flows-clear-filters').addEventListener('click', () => {
+    state.flowsRepo = '';
+    renderFlows();
+  });
+  // Delegate the expand/collapse toggle off the flows pane root so we
+  // don't have to rebind on every render. data-flow-toggle holds the
+  // "<repo>::<name>" key that selects which card to flip.
+  $('#flows-body').addEventListener('click', e => {
+    const btn = e.target.closest('[data-flow-toggle]');
+    if (!btn) return;
+    const key = btn.dataset.flowToggle;
+    if (state.expandedFlows.has(key)) state.expandedFlows.delete(key);
+    else state.expandedFlows.add(key);
+    renderFlows();
+  });
+  // Per-flow depth slider — listens on the pane root for the same
+  // reason. We use the 'input' event (fires on every tick) so the
+  // graph updates live as the user drags; renderFlows is cheap.
+  $('#flows-body').addEventListener('input', e => {
+    const slider = e.target.closest('[data-flow-depth]');
+    if (!slider) return;
+    const key = slider.dataset.flowDepth;
+    state.flowDepth.set(key, Number(slider.value));
+    renderFlows();
+  });
+  $('#topics-intent').addEventListener('change', e => { state.topicsIntent = e.target.value; renderTopics(); });
+  $('#topics-repo').addEventListener('change', e => { state.topicsRepo = e.target.value; renderTopics(); });
+  $('#topics-clear-filters').addEventListener('click', () => {
+    state.topicsRepo = state.topicsIntent = '';
+    renderTopics();
+  });
+  $('#heuristics-repo').addEventListener('change',   e => { state.heuristicsRepo   = e.target.value; renderHeuristics(); });
+  $('#heuristics-intent').addEventListener('change', e => { state.heuristicsIntent = e.target.value; renderHeuristics(); });
+  $('#heuristics-clear-filters').addEventListener('click', () => {
+    state.heuristicsRepo = state.heuristicsIntent = '';
+    renderHeuristics();
+  });
+  $('#queries-repo').addEventListener('change',   e => { state.queriesRepo   = e.target.value; renderQueries(); });
+  $('#queries-topic').addEventListener('change',  e => { state.queriesTopic  = e.target.value; renderQueries(); });
+  $('#queries-intent').addEventListener('change', e => { state.queriesIntent = e.target.value; renderQueries(); });
+  $('#queries-clear-filters').addEventListener('click', () => {
+    state.queriesRepo = state.queriesTopic = state.queriesIntent = '';
+    renderQueries();
+  });
 
   // Initial paint.
   refreshRepos().then(() => { refreshActive(); reschedule(); });

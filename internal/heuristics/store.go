@@ -330,3 +330,198 @@ func (s *Store) rewardKey(intent string, t time.Time) string {
 func (s *Store) traceKey(queryID string) string {
 	return fmt.Sprintf("%s:%s", keyTrace, queryID)
 }
+
+// ---------------------------------------------------------------------------
+// Per-bucket variants (keyed by intent + repo + topic_id)
+//
+// Per-bucket data lives under a brand-new `heuristics:bucket:*`
+// namespace so the legacy `heuristics:current:{intent}:*` /
+// `heuristics:reward:{intent}:{day}` / `heuristics:history:{intent}`
+// keys keep working unchanged as the cold-start fallback. The
+// picker's sample-floor logic decides which surface to read/write
+// on a per-query basis — see picker.PickWithTopic.
+// ---------------------------------------------------------------------------
+
+// keyBucket is the common Redis prefix for everything per-(intent,
+// repo, topic). Subkeys are ":current", ":history", and
+// ":reward:{day}". Kept distinct from the legacy keys to avoid
+// migration headaches.
+const keyBucket = "heuristics:bucket"
+
+// isGlobalBucket reports whether (repo, topic) addresses the legacy
+// intent-global surface — i.e. no real bucket. Callers use this to
+// short-circuit to the existing (intent)-only methods.
+func isGlobalBucket(repo, topic string) bool {
+	if topic == "" || topic == IntentGlobalTopic {
+		return true
+	}
+	if repo == "" || repo == globalRepo {
+		return true
+	}
+	return false
+}
+
+func (s *Store) bucketCurrentKey(intent, repo, topic string) string {
+	return fmt.Sprintf("%s:%s:%s:%s:current", keyBucket, intent, repo, topic)
+}
+
+func (s *Store) bucketHistoryKey(intent, repo, topic string) string {
+	return fmt.Sprintf("%s:%s:%s:%s:history", keyBucket, intent, repo, topic)
+}
+
+func (s *Store) bucketRewardKey(intent, repo, topic string, t time.Time) string {
+	return fmt.Sprintf("%s:%s:%s:%s:reward:%s",
+		keyBucket, intent, repo, topic, t.UTC().Format("2006-01-02"))
+}
+
+// CurrentProfileFor returns the live profile for a (intent, repo,
+// topic) bucket. On first access it self-seeds from CurrentProfile
+// (the intent-global), which itself self-seeds from Default(intent).
+// So a brand-new bucket always starts at the known-good intent-global
+// snapshot rather than wherever today's bandit happened to land it.
+//
+// Global-bucket callers (no real topic) are routed straight to
+// CurrentProfile so we don't fragment the existing data surface.
+func (s *Store) CurrentProfileFor(ctx context.Context, intent, repo, topic string) (Profile, error) {
+	if isGlobalBucket(repo, topic) {
+		return s.CurrentProfile(ctx, intent)
+	}
+	key := s.bucketCurrentKey(intent, repo, topic)
+	val, err := s.rdb.Get(ctx, key).Result()
+	if err == redis.Nil {
+		seed, err := s.CurrentProfile(ctx, intent)
+		if err != nil {
+			return seed, err
+		}
+		if e := s.SetCurrentFor(ctx, intent, repo, topic, seed); e != nil {
+			return seed, e
+		}
+		return seed, nil
+	}
+	if err != nil {
+		return Default(intent), err
+	}
+	var p Profile
+	if err := json.Unmarshal([]byte(val), &p); err != nil {
+		return Default(intent), nil
+	}
+	return p.Clip(), nil
+}
+
+// SetCurrentFor overwrites the live profile for a bucket. Routes
+// global-bucket writes through SetCurrent so legacy data stays in one
+// place.
+func (s *Store) SetCurrentFor(ctx context.Context, intent, repo, topic string, p Profile) error {
+	if isGlobalBucket(repo, topic) {
+		return s.SetCurrent(ctx, intent, p)
+	}
+	data, _ := json.Marshal(p.Clip())
+	return s.rdb.Set(ctx, s.bucketCurrentKey(intent, repo, topic), data, 0).Err()
+}
+
+// AppendHistoryFor records a profile change for a bucket.
+func (s *Store) AppendHistoryFor(ctx context.Context, intent, repo, topic string, entry HistoryEntry) error {
+	if isGlobalBucket(repo, topic) {
+		return s.AppendHistory(ctx, intent, entry)
+	}
+	data, _ := json.Marshal(entry)
+	pipe := s.rdb.Pipeline()
+	pipe.LPush(ctx, s.bucketHistoryKey(intent, repo, topic), data)
+	pipe.LTrim(ctx, s.bucketHistoryKey(intent, repo, topic), 0, 199)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// HistoryFor returns the most recent N profile-change entries for a
+// bucket, newest first.
+func (s *Store) HistoryFor(ctx context.Context, intent, repo, topic string, n int) []HistoryEntry {
+	if isGlobalBucket(repo, topic) {
+		return s.History(ctx, intent, n)
+	}
+	if n <= 0 {
+		n = 10
+	}
+	items, err := s.rdb.LRange(ctx, s.bucketHistoryKey(intent, repo, topic), 0, int64(n-1)).Result()
+	if err != nil {
+		return nil
+	}
+	out := make([]HistoryEntry, 0, len(items))
+	for _, raw := range items {
+		var h HistoryEntry
+		if err := json.Unmarshal([]byte(raw), &h); err == nil {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// AppendRewardFor persists a reward row for a bucket. Daily keys
+// mirror the legacy reward layout so existing analytics queries
+// translate verbatim.
+func (s *Store) AppendRewardFor(ctx context.Context, intent, repo, topic string, row RewardRow) error {
+	if isGlobalBucket(repo, topic) {
+		return s.AppendReward(ctx, intent, row)
+	}
+	if row.Timestamp == 0 {
+		row.Timestamp = time.Now().UnixMilli()
+	}
+	data, _ := json.Marshal(row)
+	key := s.bucketRewardKey(intent, repo, topic, time.UnixMilli(row.Timestamp))
+	pipe := s.rdb.Pipeline()
+	pipe.RPush(ctx, key, data)
+	pipe.Expire(ctx, key, rewardTTL)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// RecentRewardsFor returns up to 'limit' most recent reward rows for
+// a bucket across the last 'days' days.
+func (s *Store) RecentRewardsFor(ctx context.Context, intent, repo, topic string, days, limit int) []RewardRow {
+	if isGlobalBucket(repo, topic) {
+		return s.RecentRewards(ctx, intent, days, limit)
+	}
+	if days <= 0 {
+		days = 1
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	var out []RewardRow
+	for i := 0; i < days; i++ {
+		key := s.bucketRewardKey(intent, repo, topic,
+			time.Now().Add(-time.Duration(i)*24*time.Hour))
+		items, err := s.rdb.LRange(ctx, key, 0, -1).Result()
+		if err != nil || len(items) == 0 {
+			continue
+		}
+		for j := len(items) - 1; j >= 0; j-- {
+			var r RewardRow
+			if err := json.Unmarshal([]byte(items[j]), &r); err == nil {
+				out = append(out, r)
+				if len(out) >= limit {
+					return out
+				}
+			}
+		}
+	}
+	return out
+}
+
+// RollingMeanFor returns the unweighted mean raw_reward across recent
+// samples for a bucket. Same baseline-normalisation use as
+// RollingMean — but scoped so a bucket's adjusted reward is centred
+// on its own history, not the intent's.
+func (s *Store) RollingMeanFor(ctx context.Context, intent, repo, topic string, samples int) float64 {
+	if isGlobalBucket(repo, topic) {
+		return s.RollingMean(ctx, intent, samples)
+	}
+	rows := s.RecentRewardsFor(ctx, intent, repo, topic, 2, samples)
+	if len(rows) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, r := range rows {
+		sum += r.RawReward
+	}
+	return sum / float64(len(rows))
+}

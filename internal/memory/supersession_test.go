@@ -2,6 +2,9 @@ package memory
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -10,7 +13,6 @@ import (
 func TestSupersessionPreservesLineage(t *testing.T) {
 	ctx := context.Background()
 	store := setupTestRedis(t)
-	defer store.rdb.Close()
 
 	// Save two decisions
 	d1 := DecisionMemory{
@@ -43,7 +45,7 @@ func TestSupersessionPreservesLineage(t *testing.T) {
 	}
 
 	// Verify d1 is marked as superseded
-	d1Key := memPrefix + "test-repo" + ":decision:" + sanitizeKey("use-redis")
+	d1Key := store.keyPrefix() + "test-repo" + ":decision:" + sanitizeKey("use-redis")
 	status, err := store.rdb.HGet(ctx, d1Key, "status").Result()
 	if err != nil {
 		t.Fatalf("Get d1 status: %v", err)
@@ -62,7 +64,7 @@ func TestSupersessionPreservesLineage(t *testing.T) {
 	}
 
 	// Verify d2 has supersedes pointing to d1
-	d2Key := memPrefix + "test-repo" + ":decision:" + sanitizeKey("use-postgres")
+	d2Key := store.keyPrefix() + "test-repo" + ":decision:" + sanitizeKey("use-postgres")
 	supersedes, err := store.rdb.HGet(ctx, d2Key, "supersedes").Result()
 	if err != nil {
 		t.Fatalf("Get d2 supersedes: %v", err)
@@ -84,7 +86,6 @@ func TestSupersessionPreservesLineage(t *testing.T) {
 // TestSupersessionRejectsNonExistent verifies that SupersedeDecision rejects non-existent decisions.
 func TestSupersessionRejectsNonExistent(t *testing.T) {
 	store := setupTestRedis(t)
-	defer store.rdb.Close()
 
 	// Try to supersede a non-existent decision
 	err := store.SupersedeDecision("test-repo", "nonexistent", "also-nonexistent")
@@ -116,7 +117,6 @@ func TestSupersessionRejectsNonExistent(t *testing.T) {
 // only returns active decisions.
 func TestListDecisionsFiltersSuperseded(t *testing.T) {
 	store := setupTestRedis(t)
-	defer store.rdb.Close()
 
 	// Save and supersede a chain: d1 -> d2 -> d3
 	decisions := []struct {
@@ -197,7 +197,6 @@ func TestListDecisionsFiltersSuperseded(t *testing.T) {
 func TestSupersessionBidirectionalLinks(t *testing.T) {
 	ctx := context.Background()
 	store := setupTestRedis(t)
-	defer store.rdb.Close()
 
 	// Save two decisions
 	d1 := DecisionMemory{
@@ -230,8 +229,8 @@ func TestSupersessionBidirectionalLinks(t *testing.T) {
 	}
 
 	// Verify both links exist
-	oldKey := memPrefix + "test-repo" + ":decision:" + sanitizeKey("old-approach")
-	newKey := memPrefix + "test-repo" + ":decision:" + sanitizeKey("new-approach")
+	oldKey := store.keyPrefix() + "test-repo" + ":decision:" + sanitizeKey("old-approach")
+	newKey := store.keyPrefix() + "test-repo" + ":decision:" + sanitizeKey("new-approach")
 
 	oldSupersededBy, _ := store.rdb.HGet(ctx, oldKey, "superseded_by").Result()
 	newSupersedes, _ := store.rdb.HGet(ctx, newKey, "supersedes").Result()
@@ -255,24 +254,72 @@ func TestSupersessionBidirectionalLinks(t *testing.T) {
 	}
 }
 
-// setupTestRedis creates a test Store with initialized indexes.
-// Note: This requires Redis to be running. For unit tests, consider using miniredis.
+// setupTestRedis creates a test Store pinned to a per-test keyspace
+// (e.g. "testmem-Tabc1234") so the tests can never touch the
+// production "mem:*" namespace the devrouter binary and bench seeders
+// write to. RediSearch limits FT indexes to db=0, so logical-DB
+// isolation isn't viable — keyspace prefixing is the next best thing.
+//
+// Historic note: the original helper called NewStore("localhost:6379")
+// (db=0, "mem:" namespace) and then FlushDB'd it on every test entry.
+// Running `go test ./internal/memory/...` would silently wipe every
+// seeded flow / decision / topic / heuristic bucket / retrieval trace
+// the dev shell had built up. That was found the hard way after a
+// benchmark seed cycle disappeared mid-test. The new helper:
+//
+//   - Uses a unique keyspace per test via NewStoreWithKeyspace, so
+//     parallel tests don't collide either.
+//   - Calls Store.WipeKeyspace on cleanup, which refuses to touch
+//     the production "mem" keyspace as a belt-and-braces safety net.
+//   - Never calls FlushDB.
+//
+// We still don't use miniredis because the tests exercise RediSearch
+// (FT.CREATE / FT.SEARCH / FT.DROPINDEX), which miniredis doesn't
+// implement.
 func setupTestRedis(t *testing.T) *Store {
 	t.Helper()
 
-	store, err := NewStore("localhost:6379")
+	keyspace := uniqueTestKeyspace(t)
+
+	store, err := NewStoreWithKeyspace("localhost:6379", keyspace)
 	if err != nil {
-		t.Skipf("Redis not available or NewStore failed: %v", err)
+		t.Skipf("Redis not available at localhost:6379 (keyspace %q): %v", keyspace, err)
 	}
 
-	// Clean up test data
-	ctx := context.Background()
-	store.rdb.FlushDB(ctx)
-
-	// Re-initialize indexes after flush
-	if err := store.ensureIndexes(ctx); err != nil {
-		t.Fatalf("ensureIndexes after flush: %v", err)
-	}
+	// Per-test isolation + leave no artefacts for whoever runs next.
+	// Cleanup runs even when the test itself fails.
+	t.Cleanup(func() {
+		_ = store.WipeKeyspace(context.Background())
+		_ = store.rdb.Close()
+	})
 
 	return store
+}
+
+// uniqueTestKeyspace returns a per-test keyspace that's safe to FT-index
+// alongside the production "mem" keyspace on the same Redis DB. Format:
+// "testmem-<sanitised-test-name>-<8 hex>". The hex suffix guards
+// against the (rare) case where two tests with identical names run
+// against the same Redis (e.g. test re-runs that race the cleanup).
+func uniqueTestKeyspace(t *testing.T) string {
+	t.Helper()
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	clean := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		}
+		return '-'
+	}, t.Name())
+	if len(clean) > 32 {
+		clean = clean[:32]
+	}
+	return "testmem-" + clean + "-" + hex.EncodeToString(rnd[:])
 }
