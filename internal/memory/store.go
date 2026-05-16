@@ -16,14 +16,12 @@ const (
 	legacyIndex  = "idx:devmemory"
 	legacyPrefix = "devmem:"
 
-	// Key format: mem:{repo}:{type}:{identifier}
-	// This groups by repo in Redis Insight: mem > goserving > file/func/flow
-	memPrefix = "mem:"
-
-	fileIndex      = "idx:mem:file"
-	funcIndex      = "idx:mem:func"
-	flowIndex      = "idx:mem:flow"
-	decisionIndex  = "idx:mem:decision"
+	// DefaultKeyspace is the namespace used by the production binary.
+	// Keys live under "mem:{repo}:{type}:{identifier}" and the RediSearch
+	// indexes scan the "mem:" prefix. Tests override this with
+	// NewStoreWithKeyspace so they can't accidentally wipe production
+	// data when they FlushDB or scan-and-delete their own keys.
+	DefaultKeyspace = "mem"
 )
 
 // FileMemory describes what a source file does.
@@ -52,14 +50,23 @@ type FuncMemory struct {
 }
 
 // FlowMemory describes an end-to-end execution flow or process.
+//
+// SubgraphJSON is an opaque JSON-encoded codegraph.Subgraph snapshot
+// captured at memory_save_flow time from the flow's EntryPoints. It's
+// stored as a raw string (not a typed Go struct) so this package
+// doesn't have to depend on internal/codegraph — the router does the
+// serialisation, the dashboard does the deserialisation. Empty when
+// the flow has no entry points, codegraph is unreachable, or the agent
+// opted out via capture_callgraph=false.
 type FlowMemory struct {
-	Repo        string `json:"repo"`
-	Name        string `json:"name"`
-	Purpose     string `json:"purpose"`
-	Files       string `json:"files,omitempty"`
-	EntryPoints string `json:"entry_points,omitempty"`
-	Source      string `json:"source"`
-	Scope       string `json:"scope,omitempty"` // "global" or branch name
+	Repo         string `json:"repo"`
+	Name         string `json:"name"`
+	Purpose      string `json:"purpose"`
+	Files        string `json:"files,omitempty"`
+	EntryPoints  string `json:"entry_points,omitempty"`
+	Source       string `json:"source"`
+	Scope        string `json:"scope,omitempty"` // "global" or branch name
+	SubgraphJSON string `json:"subgraph_json,omitempty"`
 }
 
 // DecisionMemory describes a developer decision made during a Claude session.
@@ -103,13 +110,73 @@ type MemoryHit struct {
 }
 
 // Store is backed by Redis Stack with vector search.
+// Store wraps the Redis client and the namespace under which every
+// memory hash and RediSearch index lives. The keyspace is fixed at
+// construction time so a single process can't accidentally mix
+// production and test data in one *Store — each test that needs Redis
+// builds its own *Store via NewStoreWithKeyspace with a unique prefix.
 type Store struct {
 	rdb *redis.Client
+
+	// keyspace is the namespace prefix without the trailing colon
+	// (e.g. "mem", "testmem-Tabc1234"). All hash keys are
+	// "<keyspace>:<repo>:<type>:<identifier>" and the four FT indexes
+	// scan that prefix.
+	keyspace string
+
+	// Per-index names. These are derived from keyspace once at
+	// construction so the hot path (SaveX / SearchX) is a plain field
+	// read rather than a fmt.Sprintf per call.
+	fileIndex     string
+	funcIndex     string
+	flowIndex     string
+	decisionIndex string
 }
 
+// keyPrefix returns the keyspace plus its trailing colon —
+// "<keyspace>:" — for use when concatenating hash keys.
+func (s *Store) keyPrefix() string { return s.keyspace + ":" }
+
+// indexNameFor returns the RediSearch index name for a given memory
+// type. Mirrors the per-Store fields so callers that already know the
+// type string ("file"/"func"/"flow"/"decision") don't need a switch.
+func (s *Store) indexNameFor(memType string) string {
+	switch memType {
+	case "func":
+		return s.funcIndex
+	case "flow":
+		return s.flowIndex
+	case "decision":
+		return s.decisionIndex
+	default:
+		return s.fileIndex
+	}
+}
+
+// NewStore builds a production Store that reads/writes the default
+// "mem:" keyspace. The Cursor-facing devrouter binary uses this.
 func NewStore(redisAddr string) (*Store, error) {
+	return NewStoreWithKeyspace(redisAddr, DefaultKeyspace)
+}
+
+// NewStoreWithKeyspace builds a Store whose hashes and FT indexes are
+// scoped to a custom keyspace. Tests pass a per-test unique keyspace
+// (e.g. "testmem-Tabc1234") so they can FlushDB-style cleanup their
+// own keys without touching the production "mem:" namespace that the
+// dev shell's seeded data lives in.
+//
+// keyspace must be non-empty and must not contain a colon — both would
+// produce malformed keys/indexes downstream. Pass DefaultKeyspace
+// ("mem") to get production behaviour.
+func NewStoreWithKeyspace(redisAddr, keyspace string) (*Store, error) {
 	if redisAddr == "" {
 		redisAddr = "localhost:6379"
+	}
+	if keyspace == "" {
+		return nil, fmt.Errorf("memory: keyspace must be non-empty")
+	}
+	if strings.ContainsAny(keyspace, ":*?[]") {
+		return nil, fmt.Errorf("memory: keyspace %q contains forbidden chars (no \":*?[]\")", keyspace)
 	}
 
 	rdb := redis.NewClient(&redis.Options{
@@ -122,7 +189,14 @@ func NewStore(redisAddr string) (*Store, error) {
 		return nil, fmt.Errorf("redis connect: %w", err)
 	}
 
-	s := &Store{rdb: rdb}
+	s := &Store{
+		rdb:           rdb,
+		keyspace:      keyspace,
+		fileIndex:     "idx:" + keyspace + ":file",
+		funcIndex:     "idx:" + keyspace + ":func",
+		flowIndex:     "idx:" + keyspace + ":flow",
+		decisionIndex: "idx:" + keyspace + ":decision",
+	}
 	if err := s.ensureIndexes(ctx); err != nil {
 		return nil, fmt.Errorf("redis indexes: %w", err)
 	}
@@ -136,21 +210,44 @@ func (s *Store) RDB() *redis.Client {
 	return s.rdb
 }
 
+// Keyspace returns the namespace this Store reads/writes
+// (e.g. "mem" in production, "testmem-Tabc1234" in tests).
+func (s *Store) Keyspace() string { return s.keyspace }
+
+// WipeKeyspace deletes every hash and drops every RediSearch index
+// inside this Store's keyspace. Intended for test cleanup — callers
+// must hold a Store built with a non-default keyspace.
+//
+// Refuses to operate on the production "mem" keyspace, so a mis-wired
+// test can't accidentally nuke the dev shell's seeded data the way
+// the old FlushDB-based helper did.
+func (s *Store) WipeKeyspace(ctx context.Context) error {
+	if s.keyspace == DefaultKeyspace {
+		return fmt.Errorf("memory: WipeKeyspace refused: cannot wipe production keyspace %q", DefaultKeyspace)
+	}
+	s.deleteKeysByPattern(ctx, s.keyPrefix()+"*")
+	for _, name := range []string{s.fileIndex, s.funcIndex, s.flowIndex, s.decisionIndex} {
+		s.rdb.Do(ctx, "FT.DROPINDEX", name)
+	}
+	return nil
+}
+
 // schemaVersion is bumped when the index schema changes, triggering a drop+recreate.
 const schemaVersion = "v6" // v6: added status, supersedes, superseded_by for decision supersession tracking
 
 func (s *Store) ensureIndexes(ctx context.Context) error {
 	dim := strconv.Itoa(EmbedDim)
 
-	// All indexes share prefix "mem:" but filter by mem_type TAG
-	commonPrefix := memPrefix
+	// All indexes share this Store's prefix (e.g. "mem:" in prod,
+	// "testmem-XYZ:" in tests) and filter by mem_type TAG within it.
+	commonPrefix := s.keyPrefix()
 
 	indexes := []struct {
 		name   string
 		fields []string
 	}{
 		{
-			name: fileIndex,
+			name: s.fileIndex,
 			fields: []string{
 				"mem_type", "TAG",
 				"repo", "TAG",
@@ -164,7 +261,7 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 			},
 		},
 		{
-			name: funcIndex,
+			name: s.funcIndex,
 			fields: []string{
 				"mem_type", "TAG",
 				"repo", "TAG",
@@ -181,7 +278,7 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 			},
 		},
 		{
-			name: flowIndex,
+			name: s.flowIndex,
 			fields: []string{
 				"mem_type", "TAG",
 				"repo", "TAG",
@@ -196,7 +293,7 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 			},
 		},
 		{
-			name: decisionIndex,
+			name: s.decisionIndex,
 			fields: []string{
 				"mem_type", "TAG",
 				"repo", "TAG",
@@ -224,11 +321,20 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 	needsRecreate := currentVersion != schemaVersion
 
 	if needsRecreate {
-		// Clean up old keys from previous schema
-		s.deleteKeysByPattern(ctx, "mem:file:*")
-		s.deleteKeysByPattern(ctx, "mem:func:*")
-		s.deleteKeysByPattern(ctx, "mem:flow:*")
-		s.deleteKeysByPattern(ctx, "mem:decision:*")
+		// Clean up old keys from previous schema. The patterns are
+		// scoped to *this* Store's keyspace so a test Store with a
+		// per-test keyspace can never accidentally wipe production
+		// "mem:*" keys when its schema fingerprint mismatches.
+		// (Historic note: the previous version of this block scanned
+		// "mem:flow:*" — which never even matched the real
+		// "mem:{repo}:flow:*" layout, so the migration's "drop and
+		// recreate" was effectively a no-op for keys. The new
+		// pattern actually matches and respects the keyspace.)
+		prefix := s.keyPrefix()
+		s.deleteKeysByPattern(ctx, prefix+"*:file:*")
+		s.deleteKeysByPattern(ctx, prefix+"*:func:*")
+		s.deleteKeysByPattern(ctx, prefix+"*:flow:*")
+		s.deleteKeysByPattern(ctx, prefix+"*:decision:*")
 	}
 
 	for _, idx := range indexes {
@@ -287,7 +393,7 @@ func (s *Store) SaveFile(m FileMemory) error {
 	if m.Source == "" {
 		m.Source = "agent"
 	}
-	key := memPrefix + m.Repo + ":file:" + sanitizeKey(m.Path)
+	key := s.keyPrefix() + m.Repo + ":file:" + sanitizeKey(m.Path)
 
 	if m.Source == "auto" {
 		existing := s.getField(key, "source")
@@ -331,7 +437,7 @@ func (s *Store) SaveFunc(m FuncMemory) error {
 	} else if qn == "" {
 		qn = m.Name
 	}
-	key := memPrefix + m.Repo + ":func:" + sanitizeKey(qn)
+	key := s.keyPrefix() + m.Repo + ":func:" + sanitizeKey(qn)
 
 	if m.Source == "auto" {
 		existing := s.getField(key, "source")
@@ -372,7 +478,7 @@ func (s *Store) SaveFlow(m FlowMemory) error {
 	if m.Source == "" {
 		m.Source = "agent"
 	}
-	key := memPrefix + m.Repo + ":flow:" + sanitizeKey(m.Name)
+	key := s.keyPrefix() + m.Repo + ":flow:" + sanitizeKey(m.Name)
 
 	if m.Source == "auto" {
 		existing := s.getField(key, "source")
@@ -387,7 +493,7 @@ func (s *Store) SaveFlow(m FlowMemory) error {
 		return fmt.Errorf("embed: %w", err)
 	}
 
-	return s.rdb.HSet(context.Background(), key, map[string]interface{}{
+	fields := map[string]interface{}{
 		"mem_type":     "flow",
 		"repo":         m.Repo,
 		"name":         m.Name,
@@ -398,7 +504,15 @@ func (s *Store) SaveFlow(m FlowMemory) error {
 		"scope":        m.Scope,
 		"updated_at":   time.Now().UnixMilli(),
 		"embedding":    Float32ToBytes(vec),
-	}).Err()
+	}
+	// SubgraphJSON is only written when non-empty so flows that were
+	// saved without an entry-point seed (or before this field existed)
+	// keep their hash compact and the dashboard transparently falls
+	// back to the legacy bipartite SVG.
+	if m.SubgraphJSON != "" {
+		fields["subgraph_json"] = m.SubgraphJSON
+	}
+	return s.rdb.HSet(context.Background(), key, fields).Err()
 }
 
 // SaveDecision persists a developer decision with conflict detection.
@@ -408,7 +522,7 @@ func (s *Store) SaveDecision(m DecisionMemory) ([]string, error) {
 	if m.Status == "" {
 		m.Status = "active"
 	}
-	key := memPrefix + m.Repo + ":decision:" + sanitizeKey(m.Name)
+	key := s.keyPrefix() + m.Repo + ":decision:" + sanitizeKey(m.Name)
 
 	text := m.Name + " " + m.Decision + " " + m.Rationale + " " + m.Constraint
 	vec, err := Embed(text)
@@ -446,8 +560,8 @@ func (s *Store) SaveDecision(m DecisionMemory) ([]string, error) {
 // It updates both decisions to record the relationship and status.
 func (s *Store) SupersedeDecision(repo, oldName, newName string) error {
 	ctx := context.Background()
-	oldKey := memPrefix + repo + ":decision:" + sanitizeKey(oldName)
-	newKey := memPrefix + repo + ":decision:" + sanitizeKey(newName)
+	oldKey := s.keyPrefix() + repo + ":decision:" + sanitizeKey(oldName)
+	newKey := s.keyPrefix() + repo + ":decision:" + sanitizeKey(newName)
 
 	// Verify both exist
 	if n, _ := s.rdb.Exists(ctx, oldKey).Result(); n == 0 {
@@ -564,6 +678,18 @@ func (s *Store) SearchAll(query string, repo string, branch string) []MemoryHit 
 	if err != nil {
 		return nil
 	}
+	return s.SearchAllWithEmbed(vec, repo, branch)
+}
+
+// SearchAllWithEmbed is the same as SearchAll but skips the embed
+// step — callers that already have the query vector (e.g. the
+// router, which also feeds the same vector into topic resolution
+// and repeat detection) avoid a redundant nomic-embed round-trip,
+// keeping latency under the per-query budget.
+func (s *Store) SearchAllWithEmbed(vec []float32, repo string, branch string) []MemoryHit {
+	if len(vec) == 0 {
+		return nil
+	}
 	vecBytes := Float32ToBytes(vec)
 
 	var hits []MemoryHit
@@ -615,16 +741,10 @@ func (s *Store) vectorSearch(vecBytes []byte, k int, repo string, memType string
 	}
 	query := fmt.Sprintf("(%s)=>[KNN %d @embedding $vec AS score]", filter, k)
 
-	// Pick the index that matches this mem_type
-	indexName := fileIndex
-	switch memType {
-	case "func":
-		indexName = funcIndex
-	case "flow":
-		indexName = flowIndex
-	case "decision":
-		indexName = decisionIndex
-	}
+	// Pick the index that matches this mem_type, scoped to this
+	// Store's keyspace (production uses "idx:mem:<type>", tests use
+	// "idx:testmem-XYZ:<type>").
+	indexName := s.indexNameFor(memType)
 
 	res, err := s.rdb.Do(ctx,
 		"FT.SEARCH", indexName,
@@ -706,8 +826,14 @@ func sanitizeKey(s string) string {
 func (s *Store) ListDecisions(repo, decisionType, scope, files string, includeSuperseded bool) []MemoryHit {
 	ctx := context.Background()
 
-	// Build filter: always filter by mem_type + repo
-	filter := fmt.Sprintf("@mem_type:{decision} @repo:{%s}", escapeTag(repo))
+	// Build filter: mem_type is always pinned; repo is optional so the
+	// dashboard can ask for "all repos" with repo="". Same convention
+	// as decisionType/scope/files below — empty string means "don't
+	// filter on this dimension".
+	filter := "@mem_type:{decision}"
+	if repo != "" {
+		filter += fmt.Sprintf(" @repo:{%s}", escapeTag(repo))
+	}
 	if decisionType != "" {
 		filter += fmt.Sprintf(" @decision_type:{%s}", escapeTag(decisionType))
 	}
@@ -715,10 +841,13 @@ func (s *Store) ListDecisions(repo, decisionType, scope, files string, includeSu
 		filter += " @status:{active}"
 	}
 
+	// LIMIT 0 500 — bumped from 100 to comfortably hold the
+	// cross-repo "all" view at current corpus sizes (15 × N repos).
+	// Hard cap below the FT default of 1000 to keep payloads bounded.
 	res, err := s.rdb.Do(ctx,
-		"FT.SEARCH", decisionIndex,
+		"FT.SEARCH", s.decisionIndex,
 		filter,
-		"LIMIT", "0", "100",
+		"LIMIT", "0", "500",
 		"DIALECT", "2",
 	).Result()
 	if err != nil {

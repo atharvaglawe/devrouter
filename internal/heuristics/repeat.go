@@ -26,10 +26,16 @@ const RepeatMaxEntriesPerRepo = 30
 // RecentQueryEntry is one member in recent_queries:{repo}. The embedding
 // is denormalised on the entry so detection is a single ZRANGEBYSCORE
 // followed by in-memory cosine — no per-member round trip to Redis.
+//
+// Repo and TopicID are carried so the implicit-repeat reward routes
+// back to the same (intent, repo, topic) bucket whose profile served
+// the prior query.
 type RecentQueryEntry struct {
 	QueryID   string    `json:"query_id"`
 	Intent    string    `json:"intent"`
 	ProfileID string    `json:"profile_id"`
+	Repo      string    `json:"repo,omitempty"`
+	TopicID   string    `json:"topic_id,omitempty"`
 	Embedding []float32 `json:"embedding"`
 }
 
@@ -38,6 +44,8 @@ type RepeatHit struct {
 	PrevQueryID   string
 	PrevIntent    string
 	PrevProfileID string
+	PrevRepo      string
+	PrevTopicID   string
 	Sim           float64
 }
 
@@ -76,6 +84,8 @@ func (s *Store) DetectRepeat(ctx context.Context, repo string, embed []float32) 
 			best.PrevQueryID = e.QueryID
 			best.PrevIntent = e.Intent
 			best.PrevProfileID = e.ProfileID
+			best.PrevRepo = e.Repo
+			best.PrevTopicID = e.TopicID
 		}
 	}
 	return best, nil
