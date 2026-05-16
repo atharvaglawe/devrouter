@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/atharva-ag/devrouter/internal/codegraph"
+	"github.com/atharva-ag/devrouter/internal/dashboard"
 	"github.com/atharva-ag/devrouter/internal/mcp"
 	"github.com/atharva-ag/devrouter/internal/memory"
 	"github.com/atharva-ag/devrouter/internal/router"
@@ -93,6 +95,26 @@ func main() {
 		log.Printf("heuristics: picker initialized (frozen=%v)", r.Heuristics.Frozen())
 	}
 
+	// Read-only observability dashboard. Enabled by default on
+	// 127.0.0.1:8088 (localhost-only, no auth required). Surfaces live
+	// queries, heuristic profile evolution, decision lineage, and
+	// saved flows. Failures are logged but never block the MCP server.
+	//
+	// Opt-out: DEVROUTER_DASHBOARD_ADDR=off (or "none" / "disabled").
+	// Bind elsewhere: DEVROUTER_DASHBOARD_ADDR=:9090 (or any host:port).
+	//
+	// Port conflicts (common when an MCP host spawns multiple devrouter
+	// processes — Cursor does this per project) are non-fatal: only
+	// the first instance binds, the rest log a one-line warning and
+	// keep serving MCP traffic.
+	if addr := dashboardAddr(); addr != "" {
+		dashboard.Start(dashboard.Config{
+			Addr:       addr,
+			Memory:     mem,
+			Heuristics: r.Heuristics,
+		})
+	}
+
 	// Query planning is the caller's responsibility: the MCP `dev_context`
 	// tool accepts a structured `plan` argument that the agent (Claude,
 	// Cursor, etc.) fills in. devrouter no longer runs any in-process
@@ -106,6 +128,22 @@ func main() {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// dashboardAddr resolves the bind address for the bundled observability
+// dashboard, honouring the opt-out sentinels documented in
+// docs/configuration.md. Default (unset env var) returns the
+// localhost-only address so a fresh install gets the UI for free.
+func dashboardAddr() string {
+	v := strings.TrimSpace(os.Getenv("DEVROUTER_DASHBOARD_ADDR"))
+	if v == "" {
+		return "127.0.0.1:8088"
+	}
+	switch strings.ToLower(v) {
+	case "off", "none", "disabled", "false", "0":
+		return ""
+	}
+	return v
 }
 
 func printDevrouterHelp() {

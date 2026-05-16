@@ -4,6 +4,11 @@ CODEGRAPH_URL ?= http://localhost:4747
 CODEGRAPH_DIR := codegraph
 CODEGRAPH_PORT?= 4747
 
+# Lightweight read-only observability UI bundled into the binary.
+# On by default (127.0.0.1:8088) — `make run` and `make dashboard` both
+# start it. Override to bind elsewhere, or set to "off" to disable.
+DASHBOARD_ADDR ?= 127.0.0.1:8088
+
 # Bundled Dockerized Go-native ONNX embedder. See embedder/README.md.
 EMBEDDER_DIR    := embedder
 EMBEDDER_IMAGE  := devrouter-embedder:latest
@@ -41,7 +46,8 @@ require-node:
 .PHONY: all build deps up down status redis codegraph clean require-node \
         codegraph-install codegraph-build codegraph-serve codegraph-analyze codegraph-migrate \
         embedder-deps embedder-fetch-model embedder-build-local embedder-test \
-        embedder-build embedder-up embedder-down embedder-status embedder-logs
+        embedder-build embedder-up embedder-down embedder-status embedder-logs \
+        run dashboard
 
 all: build codegraph-build
 
@@ -150,10 +156,15 @@ codegraph: require-node
 	fi
 
 # ── Run devrouter ───────────────────────────────────────────
-run: build
+# Both targets start the same daemon (MCP server on stdio + HTTP
+# dashboard on DASHBOARD_ADDR). `make dashboard` is a discoverable alias.
+# Disable the dashboard by overriding: make run DASHBOARD_ADDR=off
+run dashboard: build
+	@echo "Dashboard: http://$(DASHBOARD_ADDR)"
 	DEVROUTER_REDIS=$(REDIS_ADDR) \
 	CODEGRAPH_URL=$(CODEGRAPH_URL) \
 	DEVROUTER_EMBEDDING_URL=$(EMBEDDER_URL)/api/embed \
+	DEVROUTER_DASHBOARD_ADDR=$(DASHBOARD_ADDR) \
 	./$(BINARY)
 
 # ── Embedder ────────────────────────────────────────────────

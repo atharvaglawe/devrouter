@@ -165,8 +165,12 @@ Details:
   (intent-aware modes, snippet dedup, graph filtering, anchor injection,
   parallel fan-out)
 - [`docs/configuration.md`](docs/configuration.md) — every environment
-  variable, the full MCP-host config example, and operational notes
-  (turning off self-tuning, hosted-service overrides)
+  variable, the full MCP-host config example, operational notes
+  (turning off self-tuning, hosted-service overrides), and the bundled
+  read-only [observability dashboard](docs/configuration.md#dashboard)
+  — on by default at [http://127.0.0.1:8088](http://127.0.0.1:8088)
+  whenever devrouter is running: live queries, heuristic profile drift,
+  decision lineage, flow graphs
 - [`docs/tools.md`](docs/tools.md) — every MCP tool with its input schema
   and usage notes
 - [`docs/agent-rules.md`](docs/agent-rules.md) — canonical agent ruleset

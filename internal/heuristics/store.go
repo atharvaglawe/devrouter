@@ -4,18 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	keyCurrent = "heuristics:current"
-	keyDefault = "heuristics:default"
-	keyHistory = "heuristics:history"
-	keyReward  = "heuristics:reward"
-	keyTrace   = "feedback:trace"
-	keyRecent  = "recent_queries"
+	keyCurrent    = "heuristics:current"
+	keyDefault    = "heuristics:default"
+	keyHistory    = "heuristics:history"
+	keyReward     = "heuristics:reward"
+	keyTrace      = "feedback:trace"
+	keyTraceIndex = "feedback:trace:index"
+	keyRecent     = "recent_queries"
 
 	// Shape segment is reserved for v2 (intent, query_shape) keying.
 	// v1 always uses "*" so adding a real shape later doesn't require
@@ -24,6 +26,13 @@ const (
 
 	traceTTL  = 30 * 24 * time.Hour
 	rewardTTL = 90 * 24 * time.Hour
+
+	// TraceIndexCap bounds the feedback:trace:index ZSET so the
+	// observability surface (dashboard, debug tooling) can enumerate
+	// recent queries in O(log N) without paying Redis SCAN cost. Older
+	// entries are trimmed by score on every PutTrace; the underlying
+	// feedback:trace:{id} HASH still ages out via traceTTL.
+	TraceIndexCap = 500
 )
 
 // Store wraps a redis.Client with helpers for the heuristics package.
@@ -213,16 +222,68 @@ func (s *Store) RollingMean(ctx context.Context, intent string, samples int) flo
 
 // PutTrace HSETs the decision-side fields onto feedback:trace:{queryID}
 // with TTL. Called at end of HandleQuery before the response is written.
+//
+// Also indexes the trace ID in feedback:trace:index (ZSET scored by
+// timestamp, capped at TraceIndexCap) so the dashboard / debug tooling
+// can list recent queries in O(log N) without a Redis SCAN.
 func (s *Store) PutTrace(ctx context.Context, queryID string, fields map[string]interface{}) error {
 	if queryID == "" || len(fields) == 0 {
 		return nil
 	}
 	key := s.traceKey(queryID)
+	score := traceScore(fields)
 	pipe := s.rdb.Pipeline()
 	pipe.HSet(ctx, key, fields)
 	pipe.Expire(ctx, key, traceTTL)
+	pipe.ZAdd(ctx, keyTraceIndex, redis.Z{Score: score, Member: queryID})
+	// Trim to last TraceIndexCap entries (keep the newest by score).
+	pipe.ZRemRangeByRank(ctx, keyTraceIndex, 0, int64(-TraceIndexCap-1))
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// RecentTraceIDs returns the most recent query IDs from the trace index,
+// newest first. Bounded by TraceIndexCap regardless of the requested limit.
+func (s *Store) RecentTraceIDs(ctx context.Context, limit int) []string {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > TraceIndexCap {
+		limit = TraceIndexCap
+	}
+	ids, err := s.rdb.ZRevRange(ctx, keyTraceIndex, 0, int64(limit-1)).Result()
+	if err != nil {
+		return nil
+	}
+	return ids
+}
+
+// traceScore extracts a millisecond timestamp from the trace fields if
+// present, falling back to time.Now() so an entry without a timestamp
+// still lands at the top of the index (rather than at the bottom where
+// it'd be invisible).
+func traceScore(fields map[string]interface{}) float64 {
+	if v, ok := fields["timestamp"]; ok {
+		switch t := v.(type) {
+		case int64:
+			return float64(t)
+		case int:
+			return float64(t)
+		case float64:
+			return t
+		case string:
+			// traceHashFields stores timestamp as a stringified unix-ms
+			// (fmt.Sprintf("%d", t.Timestamp)); fall back to RFC3339 for
+			// any other caller that decides to be ISO-friendly.
+			if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+				return float64(n)
+			}
+			if n, err := time.Parse(time.RFC3339, t); err == nil {
+				return float64(n.UnixMilli())
+			}
+		}
+	}
+	return float64(time.Now().UnixMilli())
 }
 
 // PatchTrace HSETs additional fields without rewriting the whole record.

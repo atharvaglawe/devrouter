@@ -14,6 +14,7 @@ override only what differs.
 | `DEVROUTER_MEMORY_MAX_DISTANCE` | `0.60` | Cosine-distance ceiling for vector recall. Lower = stricter relevance. Distance bands for `nomic-embed-text-v1.5`: `<0.2` paraphrase, `0.2–0.4` same topic, `0.4–0.6` weak topical, `>0.6` incidental. See [`retrieval-rules.md`](retrieval-rules.md) Section 6.1. |
 | `DEVROUTER_HEURISTICS_FROZEN` | `false` | When `true`, disables all bandit profile mutations (telemetry still collected). Used during incident recovery and isolated experiments. |
 | `DEVROUTER_HEURISTICS_BANDIT` | _(unset)_ | Comma-separated knob names to perturb (`max_trace`, `caller_hops`, …) or `all`. Empty = no perturbation. |
+| `DEVROUTER_DASHBOARD_ADDR` | `127.0.0.1:8088` | Bind address for the bundled read-only HTTP dashboard. Localhost-only by default. Override with any `host:port` (e.g. `:9090`). Opt-out values: `off`, `none`, `disabled`, `false`, `0`. See the [Dashboard](#dashboard) section below. |
 | `CODEGRAPH_URL` | `http://localhost:4747` | Override only if devrouter's per-repo indexer is running on a non-default port or remote host. (`GITNEXUS_URL` is an accepted legacy alias.) |
 
 > **There is no in-process query planner.** Query planning is the MCP
@@ -79,3 +80,63 @@ bandit doesn't mutate trim/budget knobs underneath you.
   whatever you want devrouter to call. Switching embedding models
   requires re-indexing Redis (`make flush-memories` + repopulate) —
   vectors from different model spaces are not comparable.
+
+## Dashboard
+
+DevRouter ships with a read-only HTTP dashboard for inspecting what the
+MCP server is doing in real time. It is **on by default**, bound to
+`127.0.0.1:8088` (localhost only). Just open
+[http://127.0.0.1:8088](http://127.0.0.1:8088) in any browser once a
+devrouter process is running.
+
+To bind elsewhere, set `DEVROUTER_DASHBOARD_ADDR` to any `host:port`:
+
+```bash
+DEVROUTER_DASHBOARD_ADDR=:9090 ./devrouter           # all interfaces, port 9090
+DEVROUTER_DASHBOARD_ADDR=127.0.0.1:0 ./devrouter     # auto-pick a free port
+```
+
+To disable it entirely, set any of these sentinel values:
+
+```bash
+DEVROUTER_DASHBOARD_ADDR=off ./devrouter             # also: none, disabled, false, 0
+```
+
+Port already in use (common when your MCP host spawns multiple
+devrouter processes — Cursor does this per project) is **non-fatal**:
+the first instance binds the port, the rest log one line and keep
+serving MCP traffic without the dashboard. So you only ever see the UI
+for one devrouter per port, never a startup crash.
+
+Four tabs:
+
+- **Live Queries** — every `dev_context` call as it lands. Click a row
+  to expand the full retrieval trace (intent, profile, latency, tokens,
+  returned memory keys). Reward badge fills in once `dev_feedback`
+  joins the trace.
+- **Heuristics** — per-intent current vs frozen-default profile, every
+  knob's delta (so you can see exactly what the bandit has shifted),
+  reward distribution over the last 7 days, and the recent
+  promote / discard / rollback history.
+- **Decisions** — `decision_save` records grouped per repo, rendered as
+  a supersession tree (older decisions appear under the newer decisions
+  that replaced them).
+- **Flows** — saved flow memories per repo, with the entry-point →
+  files mapping rendered as a small SVG graph.
+
+The page auto-refreshes every 3 seconds (toggle in the header).
+
+Implementation notes:
+
+- Strictly read-only — the dashboard never writes to Redis, never
+  participates in the MCP request path, and never touches the bandit.
+- Data source is Redis itself, so the dashboard reflects whatever your
+  agents have actually done. The `feedback:trace:index` ZSET is bounded
+  (last 500 traces) so dashboard polls are O(log N) regardless of repo
+  activity.
+- The HTML / CSS / JS are embedded directly into the `devrouter`
+  binary via `go:embed` — no separate static-asset deploy, no Node
+  build step for the UI.
+- **Bind to `127.0.0.1` in production** unless you front it with auth.
+  There is no built-in authentication; the dashboard exposes query
+  text and saved-memory contents, which can contain proprietary code.

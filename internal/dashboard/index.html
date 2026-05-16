@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>DevRouter · Live Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-hi: #1f2733;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --accent-2: #d2a8ff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+  }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+      "Liberation Mono", monospace;
+    font-size: 12.5px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 22px;
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  header h1 .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--good);
+    box-shadow: 0 0 8px var(--good);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  header .meta {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    color: var(--text-dim);
+    font-size: 12.5px;
+  }
+  header .meta label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  header .meta select, header .meta input[type="number"] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font: inherit;
+  }
+  nav.tabs {
+    display: flex;
+    gap: 2px;
+    padding: 0 22px;
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--border);
+  }
+  nav.tabs button {
+    background: transparent;
+    color: var(--text-dim);
+    border: none;
+    padding: 10px 16px;
+    cursor: pointer;
+    font: inherit;
+    border-bottom: 2px solid transparent;
+    transition: color 80ms;
+  }
+  nav.tabs button:hover { color: var(--text); }
+  nav.tabs button.active {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+  }
+  main { padding: 22px; max-width: 1400px; margin: 0 auto; }
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .card .label { color: var(--text-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .card .sub { color: var(--text-dim); font-size: 12px; margin-top: 4px; }
+  .panel {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .panel-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .panel-header h2 { margin: 0; font-size: 14px; font-weight: 600; }
+  .panel-header .sub { color: var(--text-dim); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    vertical-align: top;
+  }
+  th { color: var(--text-dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+  tr:last-child td { border-bottom: none; }
+  tr.row-clickable { cursor: pointer; }
+  tr.row-clickable:hover { background: var(--bg-hi); }
+  .badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 11px;
+    background: var(--bg-hi);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  .badge.intent { color: var(--accent); border-color: var(--accent); }
+  .badge.good { color: var(--good); border-color: var(--good); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .badge.bad { color: var(--bad); border-color: var(--bad); }
+  .badge.active { color: var(--good); border-color: var(--good); }
+  .badge.superseded { color: var(--text-dim); border-color: var(--border); text-decoration: line-through; }
+  .query-text {
+    max-width: 460px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .row-detail {
+    background: var(--bg);
+    padding: 14px 18px;
+    font-size: 13px;
+  }
+  .row-detail .grid {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 4px 16px;
+    margin-bottom: 8px;
+  }
+  .row-detail .grid b { color: var(--text-dim); font-weight: normal; }
+  .heuristics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: 14px;
+  }
+  .knobs {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 4px 14px;
+    margin-top: 10px;
+    font-size: 12.5px;
+  }
+  .knobs .k { color: var(--text-dim); }
+  .knobs .v { text-align: right; }
+  .knobs .delta { text-align: right; font-weight: 600; }
+  .delta-up { color: var(--good); }
+  .delta-down { color: var(--bad); }
+  .delta-zero { color: var(--text-dim); }
+  .history {
+    margin-top: 12px;
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+  }
+  .history li { list-style: none; padding: 4px 0; color: var(--text-dim); font-size: 12px; }
+  .history li b { color: var(--text); margin-right: 6px; }
+  .history li.kind-promote b { color: var(--good); }
+  .history li.kind-rollback b { color: var(--bad); }
+  .history li.kind-discard b { color: var(--warn); }
+  .decision-tree { padding: 10px 18px; }
+  .decision-node {
+    border-left: 2px solid var(--border);
+    padding: 6px 14px;
+    margin-left: 12px;
+    margin-top: 6px;
+  }
+  .decision-node.root { border-left-color: var(--accent); margin-left: 0; }
+  .decision-node.superseded { opacity: 0.6; }
+  .decision-node .name {
+    font-weight: 600;
+    margin-right: 8px;
+  }
+  .decision-node .body {
+    color: var(--text-dim);
+    font-size: 12.5px;
+    margin-top: 2px;
+  }
+  .flow-svg {
+    width: 100%;
+    background: var(--bg);
+    border-radius: 6px;
+    margin-top: 8px;
+  }
+  .flow-svg .node-entry { fill: #1f3a5f; stroke: var(--accent); }
+  .flow-svg .node-file { fill: var(--bg-hi); stroke: var(--border); }
+  .flow-svg .node-text { fill: var(--text); font-size: 11px; }
+  .flow-svg .edge { stroke: var(--border); stroke-width: 1; }
+  .empty {
+    padding: 30px;
+    text-align: center;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+  .controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+  .controls label { color: var(--text-dim); font-size: 13px; }
+  .controls select {
+    background: var(--bg-elev);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+  }
+  .last-refresh { color: var(--text-dim); font-size: 11.5px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1><span class="dot" id="status-dot"></span>DevRouter · Live</h1>
+    <div class="meta">
+      <span class="last-refresh" id="last-refresh">—</span>
+      <label>
+        <input type="checkbox" id="auto-refresh" checked /> auto
+      </label>
+      <label>
+        every
+        <input type="number" id="refresh-interval" value="3" min="1" max="60" style="width:48px;" /> s
+      </label>
+    </div>
+  </header>
+  <nav class="tabs">
+    <button data-tab="queries" class="active">Live Queries</button>
+    <button data-tab="heuristics">Heuristics</button>
+    <button data-tab="decisions">Decisions</button>
+    <button data-tab="flows">Flows</button>
+  </nav>
+
+  <main>
+    <section class="summary" id="summary"></section>
+
+    <section data-pane="queries">
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Recent Queries</h2>
+          <div class="sub" id="queries-sub">—</div>
+        </div>
+        <div id="queries-body"></div>
+      </div>
+    </section>
+
+    <section data-pane="heuristics" hidden>
+      <div class="heuristics-grid" id="heuristics-grid"></div>
+    </section>
+
+    <section data-pane="decisions" hidden>
+      <div class="controls">
+        <label>Repo:</label>
+        <select id="decisions-repo"></select>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><h2>Decision Tree</h2><div class="sub" id="decisions-sub">—</div></div>
+        <div id="decisions-body" class="decision-tree"></div>
+      </div>
+    </section>
+
+    <section data-pane="flows" hidden>
+      <div class="controls">
+        <label>Repo:</label>
+        <select id="flows-repo"></select>
+      </div>
+      <div id="flows-body"></div>
+    </section>
+  </main>
+
+<script>
+(() => {
+  const state = {
+    tab: 'queries',
+    repos: [],
+    decisionsRepo: '',
+    flowsRepo: '',
+    expanded: new Set(),
+    autoRefresh: true,
+    intervalSec: 3,
+    timer: null,
+  };
+
+  const $ = (s, root=document) => root.querySelector(s);
+  const $$ = (s, root=document) => Array.from(root.querySelectorAll(s));
+
+  const fmt = {
+    time(ms) {
+      if (!ms) return '—';
+      const d = new Date(ms);
+      const today = new Date();
+      const sameDay = d.toDateString() === today.toDateString();
+      const hh = String(d.getHours()).padStart(2,'0');
+      const mm = String(d.getMinutes()).padStart(2,'0');
+      const ss = String(d.getSeconds()).padStart(2,'0');
+      return sameDay ? `${hh}:${mm}:${ss}` : `${d.toLocaleDateString()} ${hh}:${mm}`;
+    },
+    pct(x) { return (x * 100).toFixed(0) + '%'; },
+    num(x) { return new Intl.NumberFormat().format(x); },
+    truncate(s, n) { if (!s) return ''; return s.length > n ? s.slice(0, n-1) + '…' : s; },
+    escape(s) {
+      if (s == null) return '';
+      return String(s)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;');
+    },
+  };
+
+  async function fetchJSON(url) {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`${url}: ${r.status}`);
+    return r.json();
+  }
+
+  // ---------- Summary cards ----------
+  async function renderSummary() {
+    try {
+      const s = await fetchJSON('/api/summary');
+      const cards = [
+        { label: 'Queries · 24h', value: fmt.num(s.recent_queries_24h), sub: `${fmt.num(s.feedback_joined_24h)} with feedback` },
+        { label: 'Indexed Traces', value: fmt.num(s.trace_index_count), sub: `cap ${fmt.num(s.trace_index_cap)}` },
+        { label: 'Repos', value: fmt.num(s.repos), sub: 'with stored memories' },
+      ];
+      $('#summary').innerHTML = cards.map(c => `
+        <div class="card">
+          <div class="label">${fmt.escape(c.label)}</div>
+          <div class="value">${fmt.escape(c.value)}</div>
+          <div class="sub">${fmt.escape(c.sub)}</div>
+        </div>`).join('');
+    } catch (e) {
+      $('#summary').innerHTML = `<div class="card"><div class="label">summary error</div><div class="sub">${fmt.escape(e.message)}</div></div>`;
+    }
+  }
+
+  // ---------- Live Queries ----------
+  function rewardBadge(row) {
+    if (!row.has_feedback) return `<span class="badge">pending</span>`;
+    const r = row.adjusted_reward ?? row.raw_reward ?? 0;
+    const cls = r >= 0.7 ? 'good' : r >= 0.4 ? 'warn' : 'bad';
+    return `<span class="badge ${cls}">${r.toFixed(2)}</span>`;
+  }
+
+  function queryDetail(row) {
+    const mk = (row.memory_keys || []).map(k => `<code>${fmt.escape(k)}</code>`).join('<br/>') || '<i>none returned</i>';
+    return `
+      <div class="row-detail">
+        <div class="grid">
+          <b>Query</b><div>${fmt.escape(row.query)}</div>
+          <b>Query ID</b><div class="mono">${fmt.escape(row.query_id)}</div>
+          <b>Repo</b><div>${fmt.escape(row.repo) || '<i>—</i>'}</div>
+          <b>Intent</b><div>${fmt.escape(row.intent)}</div>
+          <b>Profile ID</b><div class="mono">${fmt.escape(row.heuristic_profile_id)}</div>
+          <b>Latency</b><div>${row.latency_ms} ms</div>
+          <b>Tokens returned</b><div>${row.prompt_tokens}</div>
+          <b>Counts</b><div>${row.files_returned} files · ${row.symbols_returned} symbols · ${row.snippets_returned} snippets · ${row.trimmed_files} trimmed</div>
+          <b>Budget used</b><div>${fmt.pct(row.budget_used_fraction)}</div>
+          ${row.repeated_exploration_of ? `<b>Repeated</b><div class="mono">${fmt.escape(row.repeated_exploration_of)}</div>` : ''}
+          ${row.has_feedback ? `
+            <b>Additional files</b><div>${row.additional_files}</div>
+            <b>Revisits</b><div>${row.revisits}</div>
+            <b>Raw reward</b><div>${row.raw_reward.toFixed(3)}</div>
+            <b>Adjusted reward</b><div>${row.adjusted_reward.toFixed(3)}</div>
+            <b>Source</b><div>${fmt.escape(row.feedback_source)}</div>
+          ` : '<b>Feedback</b><div><i>not yet received</i></div>'}
+          <b>Memory keys</b><div>${mk}</div>
+        </div>
+      </div>`;
+  }
+
+  async function renderQueries() {
+    try {
+      const rows = await fetchJSON('/api/queries?limit=100');
+      $('#queries-sub').textContent = `${rows.length} most recent`;
+      if (!rows.length) {
+        $('#queries-body').innerHTML = `<div class="empty">No queries yet. Issue a dev_context call to see traffic.</div>`;
+        return;
+      }
+      const html = ['<table>',
+        '<thead><tr>',
+        '<th>Time</th><th>Intent</th><th>Repo</th><th>Query</th><th>Latency</th><th>Tokens</th><th>Reward</th>',
+        '</tr></thead><tbody>'];
+      for (const row of rows) {
+        const open = state.expanded.has(row.query_id);
+        html.push(`<tr class="row-clickable" data-id="${fmt.escape(row.query_id)}">
+          <td class="mono">${fmt.time(row.timestamp)}</td>
+          <td><span class="badge intent">${fmt.escape(row.intent || 'general')}</span></td>
+          <td>${fmt.escape(row.repo) || '<span class="badge">—</span>'}</td>
+          <td class="query-text">${fmt.escape(row.query)}</td>
+          <td>${row.latency_ms} ms</td>
+          <td>${row.prompt_tokens}</td>
+          <td>${rewardBadge(row)}</td>
+        </tr>`);
+        if (open) {
+          html.push(`<tr><td colspan="7" style="padding:0;">${queryDetail(row)}</td></tr>`);
+        }
+      }
+      html.push('</tbody></table>');
+      $('#queries-body').innerHTML = html.join('');
+      $$('#queries-body tr.row-clickable').forEach(tr => {
+        tr.addEventListener('click', () => {
+          const id = tr.dataset.id;
+          state.expanded.has(id) ? state.expanded.delete(id) : state.expanded.add(id);
+          renderQueries();
+        });
+      });
+    } catch (e) {
+      $('#queries-body').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
+    }
+  }
+
+  // ---------- Heuristics ----------
+  function deltaCell(d) {
+    if (d.delta === 0) return `<span class="delta delta-zero">·</span>`;
+    const cls = d.delta > 0 ? 'delta-up' : 'delta-down';
+    const sign = d.delta > 0 ? '+' : '';
+    return `<span class="delta ${cls}">${sign}${d.delta}</span>`;
+  }
+
+  async function renderHeuristics() {
+    try {
+      const v = await fetchJSON('/api/heuristics');
+      const intents = v.intents || [];
+      if (!intents.length) {
+        $('#heuristics-grid').innerHTML = `<div class="empty">No heuristic profiles initialised yet.</div>`;
+        return;
+      }
+      $('#heuristics-grid').innerHTML = intents.map(it => `
+        <div class="panel">
+          <div class="panel-header">
+            <h2>${fmt.escape(it.intent)} <span class="badge intent" style="margin-left:6px;">${fmt.escape(it.current_profile_id)}</span></h2>
+            <div class="sub">${it.samples_7d} samples · μ ${it.mean_raw_reward_7d.toFixed(2)} · p50 ${it.p50_raw_reward_7d.toFixed(2)}</div>
+          </div>
+          <div style="padding: 12px 16px;">
+            <div class="knobs">
+              <span class="k">knob</span><span class="v">value</span><span class="delta">Δ default</span>
+              ${(it.deltas || []).map(d => `
+                <span class="k mono">${fmt.escape(d.knob)}</span>
+                <span class="v mono">${d.current}</span>
+                ${deltaCell(d)}
+              `).join('')}
+            </div>
+            <div class="history">
+              ${(it.recent_history || []).length === 0
+                ? '<li>no profile changes recorded</li>'
+                : (it.recent_history || []).map(h => `
+                  <li class="kind-${fmt.escape(h.kind)}">
+                    <b>${fmt.escape(h.kind)}</b>
+                    ${fmt.time(h.timestamp)}
+                    <span style="color:var(--text-dim);">${fmt.escape(h.reason || '')}</span>
+                  </li>`).join('')}
+            </div>
+            <div class="sub" style="margin-top:8px;color:var(--text-dim);font-size:11.5px;">
+              today: ${it.samples_today} · explicit ${fmt.pct(it.explicit_fraction_7d || 0)} · implicit ${fmt.pct(it.implicit_fraction_7d || 0)}
+            </div>
+          </div>
+        </div>
+      `).join('');
+
+      const status = v.frozen ? 'frozen (read-only)' : (v.tunable_knobs.length ? `bandit tuning: ${v.tunable_knobs.join(', ')}` : 'bandit idle');
+      const headerCard = `<div class="card"><div class="label">Bandit</div><div class="value">${v.frozen ? '❄' : '●'}</div><div class="sub">${fmt.escape(status)}</div></div>`;
+      const summaryEl = $('#summary');
+      if (state.tab === 'heuristics' && !summaryEl.dataset.banditAppended) {
+        summaryEl.insertAdjacentHTML('beforeend', headerCard);
+        summaryEl.dataset.banditAppended = '1';
+      }
+    } catch (e) {
+      $('#heuristics-grid').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
+    }
+  }
+
+  // ---------- Decisions ----------
+  function renderDecisionNode(node, children) {
+    const cls = ['decision-node'];
+    if (!node.supersedes) cls.push('root');
+    if (node.status === 'superseded') cls.push('superseded');
+    const badge = `<span class="badge ${node.status === 'active' ? 'active' : 'superseded'}">${fmt.escape(node.status || 'active')}</span>`;
+    const files = (node.files || []).map(f => `<code>${fmt.escape(f)}</code>`).join(' ');
+    const childHtml = (children || []).map(c => renderDecisionNode(c.node, c.children)).join('');
+    return `
+      <div class="${cls.join(' ')}">
+        <div><span class="name">${fmt.escape(node.name)}</span>
+          <span class="badge">${fmt.escape(node.decision_type)}</span>
+          ${badge}</div>
+        <div class="body">${fmt.escape(node.decision)}</div>
+        <div class="body" style="margin-top:4px;"><b style="color:var(--text-dim);">why:</b> ${fmt.escape(node.rationale)}</div>
+        ${node.alternatives ? `<div class="body"><b style="color:var(--text-dim);">rejected:</b> ${fmt.escape(node.alternatives)}</div>` : ''}
+        ${node.constraint ? `<div class="body"><b style="color:var(--text-dim);">constraint:</b> ${fmt.escape(node.constraint)}</div>` : ''}
+        ${files ? `<div class="body" style="margin-top:4px;">${files}</div>` : ''}
+        ${node.scope ? `<div class="body"><b style="color:var(--text-dim);">scope:</b> ${fmt.escape(node.scope)}</div>` : ''}
+        ${childHtml}
+      </div>`;
+  }
+
+  function buildDecisionTree(decisions) {
+    const byName = new Map(decisions.map(d => [d.name, { node: d, children: [] }]));
+    const roots = [];
+    for (const d of decisions) {
+      const entry = byName.get(d.name);
+      if (d.supersedes && byName.has(d.supersedes)) {
+        // Older decision was superseded by this one — older sits under newer.
+        byName.get(d.supersedes).children.push(entry);
+      } else {
+        roots.push(entry);
+      }
+    }
+    return roots;
+  }
+
+  async function renderDecisions() {
+    const repo = state.decisionsRepo;
+    if (!repo) {
+      $('#decisions-body').innerHTML = `<div class="empty">Pick a repo to inspect saved decisions.</div>`;
+      $('#decisions-sub').textContent = '';
+      return;
+    }
+    try {
+      const ds = await fetchJSON(`/api/decisions?repo=${encodeURIComponent(repo)}`);
+      $('#decisions-sub').textContent = `${ds.length} decisions for ${repo}`;
+      if (!ds.length) {
+        $('#decisions-body').innerHTML = `<div class="empty">No decisions saved for ${fmt.escape(repo)} yet.</div>`;
+        return;
+      }
+      const tree = buildDecisionTree(ds);
+      $('#decisions-body').innerHTML = tree.map(t => renderDecisionNode(t.node, t.children)).join('');
+    } catch (e) {
+      $('#decisions-body').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
+    }
+  }
+
+  // ---------- Flows ----------
+  function renderFlowSVG(flow) {
+    const entries = flow.entry_points || [];
+    const files = flow.files || [];
+    if (!entries.length && !files.length) return '';
+    const rowH = 28, colGap = 220, padX = 14, padY = 18;
+    const nodeW = 190, nodeH = 22;
+    const maxRows = Math.max(entries.length, files.length, 1);
+    const height = padY * 2 + maxRows * rowH;
+    const width  = padX * 2 + nodeW + colGap;
+    let svg = `<svg class="flow-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet">`;
+    entries.forEach((e, i) => {
+      const x = padX, y = padY + i * rowH;
+      svg += `<rect class="node-entry" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
+      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">▸ ${fmt.escape(fmt.truncate(e, 30))}</text>`;
+    });
+    files.forEach((f, i) => {
+      const x = padX + nodeW + colGap - nodeW, y = padY + i * rowH;
+      svg += `<rect class="node-file" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
+      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">${fmt.escape(fmt.truncate(f, 30))}</text>`;
+    });
+    const ex = padX + nodeW, fx = padX + colGap;
+    for (let i = 0; i < entries.length; i++) {
+      for (let j = 0; j < files.length; j++) {
+        const y1 = padY + i * rowH + nodeH / 2;
+        const y2 = padY + j * rowH + nodeH / 2;
+        const mx = (ex + fx) / 2;
+        svg += `<path class="edge" d="M${ex} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${fx} ${y2}" fill="none"/>`;
+      }
+    }
+    svg += '</svg>';
+    return svg;
+  }
+
+  async function renderFlows() {
+    const repo = state.flowsRepo;
+    if (!repo) {
+      $('#flows-body').innerHTML = `<div class="empty">Pick a repo to inspect saved flows.</div>`;
+      return;
+    }
+    try {
+      const flows = await fetchJSON(`/api/flows?repo=${encodeURIComponent(repo)}`);
+      if (!flows.length) {
+        $('#flows-body').innerHTML = `<div class="empty">No flows saved for ${fmt.escape(repo)} yet.</div>`;
+        return;
+      }
+      $('#flows-body').innerHTML = flows.map(f => `
+        <div class="panel">
+          <div class="panel-header">
+            <h2>${fmt.escape(f.name)}</h2>
+            <div class="sub">${fmt.escape(f.source || 'agent')} · updated ${fmt.time(f.updated_at)}</div>
+          </div>
+          <div style="padding: 12px 16px;">
+            <div style="color:var(--text); white-space: pre-wrap;">${fmt.escape(f.purpose || '')}</div>
+            ${renderFlowSVG(f)}
+          </div>
+        </div>
+      `).join('');
+    } catch (e) {
+      $('#flows-body').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
+    }
+  }
+
+  // ---------- Repos & tab switching ----------
+  async function refreshRepos() {
+    try {
+      const repos = await fetchJSON('/api/repos');
+      state.repos = repos;
+      for (const id of ['decisions-repo', 'flows-repo']) {
+        const sel = document.getElementById(id);
+        if (!sel) continue;
+        const current = sel.value;
+        sel.innerHTML = repos.length
+          ? repos.map(r => `<option value="${fmt.escape(r)}">${fmt.escape(r)}</option>`).join('')
+          : `<option value="">(no repos indexed)</option>`;
+        const want = current && repos.includes(current) ? current : (repos[0] || '');
+        sel.value = want;
+        if (id === 'decisions-repo') state.decisionsRepo = want;
+        if (id === 'flows-repo') state.flowsRepo = want;
+      }
+    } catch (e) { /* silent */ }
+  }
+
+  function setActiveTab(tab) {
+    state.tab = tab;
+    $$('nav.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+    $$('main section[data-pane]').forEach(s => s.hidden = (s.dataset.pane !== tab));
+    refreshActive();
+  }
+
+  function refreshActive() {
+    renderSummary();
+    if (state.tab === 'queries')    renderQueries();
+    if (state.tab === 'heuristics') renderHeuristics();
+    if (state.tab === 'decisions')  renderDecisions();
+    if (state.tab === 'flows')      renderFlows();
+    $('#last-refresh').textContent = 'refreshed ' + fmt.time(Date.now());
+  }
+
+  function reschedule() {
+    if (state.timer) clearInterval(state.timer);
+    if (!state.autoRefresh) return;
+    state.timer = setInterval(refreshActive, Math.max(1, state.intervalSec) * 1000);
+  }
+
+  // ---------- Wire up ----------
+  $$('nav.tabs button').forEach(b => b.addEventListener('click', () => setActiveTab(b.dataset.tab)));
+  $('#auto-refresh').addEventListener('change', e => { state.autoRefresh = e.target.checked; reschedule(); });
+  $('#refresh-interval').addEventListener('change', e => { state.intervalSec = Number(e.target.value) || 3; reschedule(); });
+  $('#decisions-repo').addEventListener('change', e => { state.decisionsRepo = e.target.value; renderDecisions(); });
+  $('#flows-repo').addEventListener('change', e => { state.flowsRepo = e.target.value; renderFlows(); });
+
+  // Initial paint.
+  refreshRepos().then(() => { refreshActive(); reschedule(); });
+})();
+</script>
+</body>
+</html>
