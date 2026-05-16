@@ -279,6 +279,9 @@ func (s *Server) toolDefinitions() []map[string]any {
 				"if you forget it, devrouter falls back to the most recent dev_context call on this connection " +
 				"(best-effort). `additional_files` is the count of files you had to read beyond what dev_context " +
 				"returned (zero is best). " +
+				"If a saved flow drove your work, pass `flow_id` as \"{repo}/{flow_name}\" so the dashboard can " +
+				"score each file in the flow as useful or dead weight. Use `missing_files` to report files you " +
+				"needed but the flow didn't include — they appear in the dashboard as 'augmented' nodes. " +
 				"This is the primary signal that lets devrouter tune its budget/trim heuristics over time.",
 			"inputSchema": map[string]any{
 				"type": "object",
@@ -288,6 +291,8 @@ func (s *Server) toolDefinitions() []map[string]any {
 					"revisited_files":  map[string]any{"type": "integer", "description": "Count of files you read more than once during the task (optional)"},
 					"file_paths":       map[string]any{"type": "string", "description": "File paths you ended up reading (comma-separated, optional; used to detect over-aggressive trimming)"},
 					"success":          map[string]any{"type": "boolean", "description": "Whether the task was completed successfully (optional)"},
+					"flow_id":          map[string]any{"type": "string", "description": "Saved flow that drove this task, formatted \"{repo}/{flow_name}\" (optional; sourced from a flow-typed entry in primary_context)"},
+					"missing_files":    map[string]any{"type": "string", "description": "Files you needed but the matched flow didn't include (comma-separated, optional; surfaces as augmented nodes on the dashboard)"},
 				},
 				"required": []string{"additional_files"},
 			},

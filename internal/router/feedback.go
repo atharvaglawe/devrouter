@@ -31,6 +31,24 @@ type FeedbackInput struct {
 	RevisitedFiles  int    `json:"revisited_files"`
 	FilePaths       string `json:"file_paths"`
 	Success         bool   `json:"success"`
+
+	// FlowID joins this feedback to a specific saved flow so the
+	// dashboard can score each file in the flow as useful / dead and
+	// the bandit can shape reward by flow-quality (see slice 3).
+	// Format: "{repo}/{flow_name}". Optional — when empty, no flow
+	// overlay update happens and the rest of the feedback (bandit,
+	// FP attribution, anchor learning) runs unchanged. The agent
+	// learns the correct value from the `name` field of any
+	// flow-typed entry in primary_context.
+	FlowID string `json:"flow_id"`
+
+	// MissingFiles is the slice-2 channel: files the agent had to
+	// read to finish the task that *were not* in the matched flow.
+	// Comma-separated to match the existing FilePaths convention.
+	// Tracked as `missing:{path}` counters on the flow overlay so
+	// the dashboard can render an "augmented files" column. Has no
+	// effect on the bandit reward — purely a flow-completeness signal.
+	MissingFiles string `json:"missing_files"`
 }
 
 // splitCSV is the standard comma-separated parser used across the router
@@ -58,6 +76,25 @@ type FeedbackResult struct {
 	AdjustedReward float64 `json:"adjusted_reward,omitempty"`
 	JoinedVia      string  `json:"joined_via,omitempty"` // "explicit" | "lru_fallback" | "dropped"
 	Note           string  `json:"note,omitempty"`
+
+	// FlowOverlay is populated when flow_id was supplied AND the
+	// overlay write succeeded. Lets the caller verify their feedback
+	// landed without having to round-trip the dashboard.
+	FlowOverlay *FlowOverlayResult `json:"flow_overlay,omitempty"`
+}
+
+// FlowOverlayResult is the per-call snapshot of what changed on the
+// flow:overlay:{repo}:{name} hash for this feedback event. Returned
+// to the caller so they can verify the feedback landed without
+// round-tripping the dashboard. Purely observational — the flow
+// overlay does NOT feed back into the bandit reward (see comment
+// on applyFlowOverlay in SubmitFeedback).
+type FlowOverlayResult struct {
+	Repo          string `json:"repo"`
+	Name          string `json:"name"`
+	MarkedUseful  int    `json:"marked_useful"`
+	MarkedDead    int    `json:"marked_dead"`
+	MarkedMissing int    `json:"marked_missing"`
 }
 
 // SubmitFeedback computes the reward for one dev_feedback call, persists
@@ -182,6 +219,21 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 	// similar to this one. Best-effort, never blocks the feedback reply.
 	fpRecorded := r.attributeFalsePositives(ctx, traceFields, in)
 
+	// Slice 1/2: apply the agent's read+missing file lists to the named
+	// flow's overlay. Counters are append-only and idempotent enough
+	// that a duplicated event would just slightly bias the ratios.
+	// Logged but never errored to the caller — flow overlays must
+	// never break the feedback handshake.
+	//
+	// Intentionally NOT fed back into the bandit reward: the bandit
+	// tunes codegraph context-shape knobs (caller_hops, max_snippets,
+	// ...) while flow signal scores whether a saved *memory* was
+	// accurate. Those are different layers; mixing them muddies both.
+	// Stale flows are surfaced via the dashboard observability path
+	// and addressed by memory-relevance learning (or human pruning),
+	// not by shifting the bandit.
+	flowResult := r.applyFlowOverlay(ctx, in, queryID)
+
 	log.Printf("[feedback] joined=%s queryID=%s intent=%s additional=%d revisits=%d raw=%.2f adjusted=%.2f fp_recorded=%d",
 		joinedVia, queryID, intent, in.AdditionalFiles, in.RevisitedFiles, raw, adjusted, fpRecorded)
 
@@ -192,6 +244,49 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 		RawReward:      raw,
 		AdjustedReward: adjusted,
 		JoinedVia:      joinedVia,
+		FlowOverlay:    flowResult,
+	}
+}
+
+// applyFlowOverlay is the FlowID-gated wrapper around Memory.UpdateFlowOverlay.
+// It parses the "repo/name" join key, invokes the storage update, and
+// returns a FlowOverlayResult for the caller's reply. Returns nil when
+// flow_id is absent or the overlay update fails (errors are logged,
+// never propagated — feedback path must never break the agent's task).
+//
+// MarkedUseful is the count of distinct files this event credited to
+// the flow (approximate: bounded by the agent's file_paths length;
+// the authoritative per-file breakdown lives on the overlay hash).
+// MarkedDead is left zero here for the same reason — the dashboard
+// reads the overlay directly for accurate numbers.
+func (r *Router) applyFlowOverlay(ctx context.Context, in FeedbackInput, queryID string) *FlowOverlayResult {
+	if in.FlowID == "" || r.Memory == nil {
+		return nil
+	}
+	repo, name, ok := strings.Cut(in.FlowID, "/")
+	if !ok || repo == "" || name == "" {
+		log.Printf("[feedback] flow_id %q is not in {repo}/{name} format; skipping overlay", in.FlowID)
+		return nil
+	}
+	readFiles := splitCSV(in.FilePaths)
+	missing := splitCSV(in.MissingFiles)
+
+	if err := r.Memory.UpdateFlowOverlay(ctx, repo, name, memory.FlowOverlayUpdate{
+		QueryID:         queryID,
+		ReadFiles:       readFiles,
+		MissingFiles:    missing,
+		Success:         in.Success,
+		AdditionalFiles: in.AdditionalFiles,
+	}); err != nil {
+		log.Printf("[feedback] UpdateFlowOverlay(%s/%s) failed (non-fatal): %v", repo, name, err)
+		return nil
+	}
+
+	return &FlowOverlayResult{
+		Repo:          repo,
+		Name:          name,
+		MarkedUseful:  len(readFiles),
+		MarkedMissing: len(missing),
 	}
 }
 

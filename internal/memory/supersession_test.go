@@ -2,19 +2,21 @@ package memory
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestSupersessionPreservesLineage verifies that SupersedeDecision creates bidirectional links
 // and marks the old decision as superseded without deleting it.
 func TestSupersessionPreservesLineage(t *testing.T) {
 	ctx := context.Background()
-	store := setupTestRedis(t)
-	defer store.rdb.Close()
+	store, repo, _ := setupTestRedis(t)
 
 	// Save two decisions
 	d1 := DecisionMemory{
-		Repo:         "test-repo",
+		Repo:         repo,
 		Name:         "use-redis",
 		DecisionType: "architecture",
 		Decision:     "Use Redis for caching",
@@ -26,7 +28,7 @@ func TestSupersessionPreservesLineage(t *testing.T) {
 	}
 
 	d2 := DecisionMemory{
-		Repo:         "test-repo",
+		Repo:         repo,
 		Name:         "use-postgres",
 		DecisionType: "architecture",
 		Decision:     "Use PostgreSQL for caching",
@@ -38,12 +40,12 @@ func TestSupersessionPreservesLineage(t *testing.T) {
 	}
 
 	// Supersede d1 with d2
-	if err := store.SupersedeDecision("test-repo", "use-redis", "use-postgres"); err != nil {
+	if err := store.SupersedeDecision(repo, "use-redis", "use-postgres"); err != nil {
 		t.Fatalf("SupersedeDecision: %v", err)
 	}
 
 	// Verify d1 is marked as superseded
-	d1Key := memPrefix + "test-repo" + ":decision:" + sanitizeKey("use-redis")
+	d1Key := memPrefix + repo + ":decision:" + sanitizeKey("use-redis")
 	status, err := store.rdb.HGet(ctx, d1Key, "status").Result()
 	if err != nil {
 		t.Fatalf("Get d1 status: %v", err)
@@ -62,7 +64,7 @@ func TestSupersessionPreservesLineage(t *testing.T) {
 	}
 
 	// Verify d2 has supersedes pointing to d1
-	d2Key := memPrefix + "test-repo" + ":decision:" + sanitizeKey("use-postgres")
+	d2Key := memPrefix + repo + ":decision:" + sanitizeKey("use-postgres")
 	supersedes, err := store.rdb.HGet(ctx, d2Key, "supersedes").Result()
 	if err != nil {
 		t.Fatalf("Get d2 supersedes: %v", err)
@@ -83,18 +85,17 @@ func TestSupersessionPreservesLineage(t *testing.T) {
 
 // TestSupersessionRejectsNonExistent verifies that SupersedeDecision rejects non-existent decisions.
 func TestSupersessionRejectsNonExistent(t *testing.T) {
-	store := setupTestRedis(t)
-	defer store.rdb.Close()
+	store, repo, _ := setupTestRedis(t)
 
 	// Try to supersede a non-existent decision
-	err := store.SupersedeDecision("test-repo", "nonexistent", "also-nonexistent")
+	err := store.SupersedeDecision(repo, "nonexistent", "also-nonexistent")
 	if err == nil {
 		t.Fatal("SupersedeDecision should have failed for non-existent decisions")
 	}
 
 	// Save d1 only
 	d1 := DecisionMemory{
-		Repo:         "test-repo",
+		Repo:         repo,
 		Name:         "use-redis",
 		DecisionType: "architecture",
 		Decision:     "Use Redis",
@@ -106,7 +107,7 @@ func TestSupersessionRejectsNonExistent(t *testing.T) {
 	}
 
 	// Try to supersede with non-existent new decision
-	err = store.SupersedeDecision("test-repo", "use-redis", "use-postgres")
+	err = store.SupersedeDecision(repo, "use-redis", "use-postgres")
 	if err == nil {
 		t.Fatal("SupersedeDecision should have failed when new decision doesn't exist")
 	}
@@ -115,8 +116,7 @@ func TestSupersessionRejectsNonExistent(t *testing.T) {
 // TestListDecisionsFiltersSuperseded verifies that ListDecisions without includeSuperseded=true
 // only returns active decisions.
 func TestListDecisionsFiltersSuperseded(t *testing.T) {
-	store := setupTestRedis(t)
-	defer store.rdb.Close()
+	store, repo, _ := setupTestRedis(t)
 
 	// Save and supersede a chain: d1 -> d2 -> d3
 	decisions := []struct {
@@ -130,7 +130,7 @@ func TestListDecisionsFiltersSuperseded(t *testing.T) {
 
 	for _, d := range decisions {
 		dm := DecisionMemory{
-			Repo:         "test-repo",
+			Repo:         repo,
 			Name:         d.name,
 			DecisionType: "architecture",
 			Decision:     d.desc,
@@ -143,15 +143,15 @@ func TestListDecisionsFiltersSuperseded(t *testing.T) {
 	}
 
 	// Create chain: use-redis -> use-postgres -> use-memcached
-	if err := store.SupersedeDecision("test-repo", "use-redis", "use-postgres"); err != nil {
+	if err := store.SupersedeDecision(repo, "use-redis", "use-postgres"); err != nil {
 		t.Fatalf("Supersede use-redis with use-postgres: %v", err)
 	}
-	if err := store.SupersedeDecision("test-repo", "use-postgres", "use-memcached"); err != nil {
+	if err := store.SupersedeDecision(repo, "use-postgres", "use-memcached"); err != nil {
 		t.Fatalf("Supersede use-postgres with use-memcached: %v", err)
 	}
 
 	// List with includeSuperseded=false should only return use-memcached
-	hits := store.ListDecisions("test-repo", "", "", "", false)
+	hits := store.ListDecisions(repo, "", "", "", false)
 
 	if len(hits) != 1 {
 		t.Errorf("Expected 1 active decision, got %d", len(hits))
@@ -161,7 +161,7 @@ func TestListDecisionsFiltersSuperseded(t *testing.T) {
 	}
 
 	// List with includeSuperseded=true should return all 3
-	hits = store.ListDecisions("test-repo", "", "", "", true)
+	hits = store.ListDecisions(repo, "", "", "", true)
 
 	if len(hits) != 3 {
 		t.Errorf("Expected 3 decisions with includeSuperseded=true, got %d", len(hits))
@@ -196,12 +196,11 @@ func TestListDecisionsFiltersSuperseded(t *testing.T) {
 // TestSupersessionBidirectionalLinks verifies both supersedes and superseded_by are set correctly.
 func TestSupersessionBidirectionalLinks(t *testing.T) {
 	ctx := context.Background()
-	store := setupTestRedis(t)
-	defer store.rdb.Close()
+	store, repo, _ := setupTestRedis(t)
 
 	// Save two decisions
 	d1 := DecisionMemory{
-		Repo:         "test-repo",
+		Repo:         repo,
 		Name:         "old-approach",
 		DecisionType: "refactor",
 		Decision:     "Use approach A",
@@ -209,7 +208,7 @@ func TestSupersessionBidirectionalLinks(t *testing.T) {
 		Scope:        "global",
 	}
 	d2 := DecisionMemory{
-		Repo:         "test-repo",
+		Repo:         repo,
 		Name:         "new-approach",
 		DecisionType: "refactor",
 		Decision:     "Use approach B",
@@ -225,13 +224,13 @@ func TestSupersessionBidirectionalLinks(t *testing.T) {
 	}
 
 	// Create supersession
-	if err := store.SupersedeDecision("test-repo", "old-approach", "new-approach"); err != nil {
+	if err := store.SupersedeDecision(repo, "old-approach", "new-approach"); err != nil {
 		t.Fatalf("SupersedeDecision: %v", err)
 	}
 
 	// Verify both links exist
-	oldKey := memPrefix + "test-repo" + ":decision:" + sanitizeKey("old-approach")
-	newKey := memPrefix + "test-repo" + ":decision:" + sanitizeKey("new-approach")
+	oldKey := memPrefix + repo + ":decision:" + sanitizeKey("old-approach")
+	newKey := memPrefix + repo + ":decision:" + sanitizeKey("new-approach")
 
 	oldSupersededBy, _ := store.rdb.HGet(ctx, oldKey, "superseded_by").Result()
 	newSupersedes, _ := store.rdb.HGet(ctx, newKey, "supersedes").Result()
@@ -255,24 +254,71 @@ func TestSupersessionBidirectionalLinks(t *testing.T) {
 	}
 }
 
-// setupTestRedis creates a test Store with initialized indexes.
-// Note: This requires Redis to be running. For unit tests, consider using miniredis.
-func setupTestRedis(t *testing.T) *Store {
+// setupTestRedis returns a Store, a process-unique test repo name, and
+// a cleanup function. The repo name is unique per test invocation so
+// concurrent tests don't collide, and cleanup SCANs+DELs only keys
+// under that repo's prefixes — never FlushDB.
+//
+// Why not FlushDB:
+//
+//	The previous implementation called `store.rdb.FlushDB(ctx)` which
+//	wipes the entire production keyspace on DB 0. devrouter shares DB 0
+//	with everything else in this process, so running `go test
+//	./internal/memory/...` against a developer machine destroyed every
+//	saved memory, decision, trace, flow overlay, and heuristics profile
+//	for every repo. That was a real foot-gun; this isolation pattern
+//	closes it for good.
+//
+// The cleanup function is also registered with t.Cleanup so callers
+// can use either `defer cleanup()` (back-compat) or just ignore the
+// return value and rely on Go's test cleanup ordering.
+func setupTestRedis(t *testing.T) (store *Store, repo string, cleanup func()) {
 	t.Helper()
 
-	store, err := NewStore("localhost:6379")
+	s, err := NewStore("localhost:6379")
 	if err != nil {
 		t.Skipf("Redis not available or NewStore failed: %v", err)
 	}
 
-	// Clean up test data
-	ctx := context.Background()
-	store.rdb.FlushDB(ctx)
+	// Unique per test invocation. Time-based + test name so a flaky
+	// rerun doesn't reuse the same repo and observe stale keys.
+	safeName := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return '-'
+	}, t.Name())
+	repo = fmt.Sprintf("test-%s-%d", safeName, time.Now().UnixNano())
 
-	// Re-initialize indexes after flush
-	if err := store.ensureIndexes(ctx); err != nil {
-		t.Fatalf("ensureIndexes after flush: %v", err)
+	clean := func() {
+		ctx := context.Background()
+		patterns := []string{
+			// Memory hashes for this test's repo across every type.
+			memPrefix + repo + ":*",
+			// Flow overlay hashes use a parallel keyspace.
+			flowOverlayPrefix + repo + ":*",
+			// Memory false-positive sorted sets are scoped per memory
+			// key, so deleting the memory keys orphans them; this
+			// catches the orphan ZSETs explicitly.
+			"memory:fp:" + memPrefix + repo + ":*",
+		}
+		for _, pat := range patterns {
+			var cursor uint64
+			for {
+				keys, next, err := s.rdb.Scan(ctx, cursor, pat, 500).Result()
+				if err != nil {
+					break
+				}
+				if len(keys) > 0 {
+					s.rdb.Del(ctx, keys...)
+				}
+				cursor = next
+				if cursor == 0 {
+					break
+				}
+			}
+		}
 	}
-
-	return store
+	t.Cleanup(clean)
+	return s, repo, clean
 }

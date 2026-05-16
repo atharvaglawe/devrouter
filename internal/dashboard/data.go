@@ -278,6 +278,11 @@ func LoadDecisions(_ context.Context, mem *memory.Store, repo string) []Decision
 
 // FlowNode is one flow memory with the files / entry points / linked
 // funcs that the UI renders as a small dependency graph.
+//
+// FileStats, AugmentedFiles and the *Feedback fields are populated from
+// the flow:overlay:{repo}:{name} hash that dev_feedback writes when
+// agents echo flow_id. They are absent (omitempty) for flows that have
+// never received feedback, so the UI can render them as neutral.
 type FlowNode struct {
 	Name        string   `json:"name"`
 	Repo        string   `json:"repo"`
@@ -286,12 +291,31 @@ type FlowNode struct {
 	EntryPoints []string `json:"entry_points,omitempty"`
 	Source      string   `json:"source"`
 	UpdatedAt   int64    `json:"updated_at"`
+
+	FileStats      []FileFeedbackStat `json:"file_stats,omitempty"`      // slice 1: per-file useful/dead
+	AugmentedFiles []FileFeedbackStat `json:"augmented_files,omitempty"` // slice 2: agent-reported missing
+	TotalFeedback  int                `json:"total_feedback,omitempty"`
+	LastFeedbackAt int64              `json:"last_feedback_at,omitempty"`
+}
+
+// FileFeedbackStat is the dashboard-facing per-file aggregate. Mirrors
+// memory.FlowFileStat but carries the path inline so the UI can render
+// a flat list without ordering tricks.
+type FileFeedbackStat struct {
+	Path   string `json:"path"`
+	Useful int    `json:"useful,omitempty"`
+	Dead   int    `json:"dead,omitempty"`
+	// Missing is set for AugmentedFiles (slice 2) and counts how many
+	// agents reported needing this file outside the flow.
+	Missing int `json:"missing,omitempty"`
 }
 
 // LoadFlows pulls every flow memory for the given repo by enumerating
-// the FT.SEARCH index. Scoped to "*" (any text) so the UI never misses
+// the FT.SEARCH index, then bulk-loads the matching overlays in a
+// single pipelined batch so listing N flows is two round-trips
+// regardless of N. Scoped to "*" (any text) so the UI never misses
 // flows that fall outside the embedding match window.
-func LoadFlows(ctx context.Context, rdb *redis.Client, repo string) []FlowNode {
+func LoadFlows(ctx context.Context, rdb *redis.Client, store *memory.Store, repo string) []FlowNode {
 	if rdb == nil || repo == "" {
 		return nil
 	}
@@ -307,6 +331,7 @@ func LoadFlows(ctx context.Context, rdb *redis.Client, repo string) []FlowNode {
 	}
 	hits := parseFTHits(res)
 	out := make([]FlowNode, 0, len(hits))
+	names := make([]string, 0, len(hits))
 	for _, h := range hits {
 		out = append(out, FlowNode{
 			Name:        h["name"],
@@ -317,10 +342,186 @@ func LoadFlows(ctx context.Context, rdb *redis.Client, repo string) []FlowNode {
 			Source:      h["source"],
 			UpdatedAt:   parseInt64(h["updated_at"]),
 		})
+		names = append(names, h["name"])
 	}
+
+	// Attach overlays. Store may be nil under tests/test harnesses that
+	// pass only a redis client; skip cleanly when so. Missing overlays
+	// (flow has no feedback yet) come back as zero-value entries from
+	// LoadFlowOverlays and emit nothing onto the FlowNode.
+	if store != nil && len(names) > 0 {
+		overlays := store.LoadFlowOverlays(ctx, repo, names)
+		for i := range out {
+			ov, ok := overlays[out[i].Name]
+			if !ok || ov.TotalFeedback == 0 {
+				continue
+			}
+			out[i].TotalFeedback = ov.TotalFeedback
+			out[i].LastFeedbackAt = ov.LastFeedbackAt
+			if len(ov.Files) > 0 {
+				stats := make([]FileFeedbackStat, 0, len(ov.Files))
+				for path, st := range ov.Files {
+					if st.Useful == 0 && st.Dead == 0 {
+						continue
+					}
+					stats = append(stats, FileFeedbackStat{
+						Path:   path,
+						Useful: st.Useful,
+						Dead:   st.Dead,
+					})
+				}
+				sort.SliceStable(stats, func(a, b int) bool {
+					return stats[a].Path < stats[b].Path
+				})
+				out[i].FileStats = stats
+			}
+			if len(ov.Missing) > 0 {
+				aug := make([]FileFeedbackStat, 0, len(ov.Missing))
+				for path, n := range ov.Missing {
+					if n == 0 {
+						continue
+					}
+					aug = append(aug, FileFeedbackStat{Path: path, Missing: n})
+				}
+				sort.SliceStable(aug, func(a, b int) bool {
+					if aug[a].Missing != aug[b].Missing {
+						return aug[a].Missing > aug[b].Missing
+					}
+					return aug[a].Path < aug[b].Path
+				})
+				out[i].AugmentedFiles = aug
+			}
+		}
+	}
+
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].UpdatedAt > out[j].UpdatedAt
 	})
+	return out
+}
+
+// FlowSignal is the cross-flow observability aggregate for the
+// Heuristics tab. Computed by walking every flow:overlay:* hash once
+// per dashboard refresh — bounded by total flows in Redis, which is
+// O(hundreds) in practice, so doing it on the request path is fine.
+//
+// This view is explicitly NOT folded into the bandit (the flow signal
+// scores memory accuracy, not codegraph context-shape — different
+// layer). It lives on the Heuristics tab purely so devs can spot
+// stale flows next to the bandit drift that those flows might be
+// quietly biasing through false-positive memory retrieval.
+type FlowSignal struct {
+	TotalFlows           int             `json:"total_flows"`              // flows with any feedback at all
+	TotalFeedbackEvents  int             `json:"total_feedback_events"`    // sum of total_feedback across overlays
+	FilesUseful          int             `json:"files_useful"`             // sum of file_useful counters
+	FilesDead            int             `json:"files_dead"`               // sum of file_dead counters
+	FilesMissing         int             `json:"files_missing"`            // sum of missing counters
+	ValidatedRate        float64         `json:"validated_rate"`           // useful / (useful + dead); 0 if denominator 0
+	StaleFlows           []FlowSignalRow `json:"stale_flows,omitempty"`    // top dead-ratio flows (≥3 events)
+	UnderspecifiedFlows  []FlowSignalRow `json:"underspecified_flows,omitempty"` // top missing-count flows
+}
+
+// FlowSignalRow is one flow's roll-up for the stale / underspecified
+// leaderboards. Sorted by the relevant metric on the server side so
+// the UI can render top-N without re-sorting.
+type FlowSignalRow struct {
+	Repo          string  `json:"repo"`
+	Name          string  `json:"name"`
+	TotalFeedback int     `json:"total_feedback"`
+	Useful        int     `json:"useful"`
+	Dead          int     `json:"dead"`
+	Missing       int     `json:"missing"`
+	DeadRatio     float64 `json:"dead_ratio,omitempty"`
+}
+
+// flowSignalMinFeedback gates entries into the stale-flow leaderboard.
+// A flow needs at least this many feedback events before its dead-ratio
+// is shown to humans — below this the signal is too noisy to act on.
+const flowSignalMinFeedback = 3
+
+// LoadFlowSignal walks every flow overlay in Redis and rolls them up
+// into the cross-flow summary the Heuristics tab renders.
+//
+// Two leaderboards are computed:
+//   - StaleFlows: top-N by dead_ratio, gated by flowSignalMinFeedback
+//   - UnderspecifiedFlows: top-N by total missing-file reports
+//
+// Both lists are bounded at 8 entries so the panel stays compact.
+func LoadFlowSignal(ctx context.Context, store *memory.Store) FlowSignal {
+	if store == nil {
+		return FlowSignal{}
+	}
+	overlays := store.LoadAllFlowOverlays(ctx)
+	out := FlowSignal{}
+
+	stale := make([]FlowSignalRow, 0, len(overlays))
+	missing := make([]FlowSignalRow, 0, len(overlays))
+
+	for _, ov := range overlays {
+		if ov.TotalFeedback == 0 {
+			continue
+		}
+		out.TotalFlows++
+		out.TotalFeedbackEvents += ov.TotalFeedback
+
+		var useful, dead int
+		for _, st := range ov.Files {
+			useful += st.Useful
+			dead += st.Dead
+		}
+		var missingCount int
+		for _, n := range ov.Missing {
+			missingCount += n
+		}
+		out.FilesUseful += useful
+		out.FilesDead += dead
+		out.FilesMissing += missingCount
+
+		row := FlowSignalRow{
+			Repo:          ov.Repo,
+			Name:          ov.Name,
+			TotalFeedback: ov.TotalFeedback,
+			Useful:        useful,
+			Dead:          dead,
+			Missing:       missingCount,
+		}
+		if total := useful + dead; total > 0 {
+			row.DeadRatio = float64(dead) / float64(total)
+		}
+		if ov.TotalFeedback >= flowSignalMinFeedback && row.DeadRatio > 0 {
+			stale = append(stale, row)
+		}
+		if missingCount > 0 {
+			missing = append(missing, row)
+		}
+	}
+
+	if total := out.FilesUseful + out.FilesDead; total > 0 {
+		out.ValidatedRate = float64(out.FilesUseful) / float64(total)
+	}
+
+	sort.SliceStable(stale, func(i, j int) bool {
+		if stale[i].DeadRatio != stale[j].DeadRatio {
+			return stale[i].DeadRatio > stale[j].DeadRatio
+		}
+		return stale[i].TotalFeedback > stale[j].TotalFeedback
+	})
+	sort.SliceStable(missing, func(i, j int) bool {
+		if missing[i].Missing != missing[j].Missing {
+			return missing[i].Missing > missing[j].Missing
+		}
+		return missing[i].TotalFeedback > missing[j].TotalFeedback
+	})
+
+	const maxRows = 8
+	if len(stale) > maxRows {
+		stale = stale[:maxRows]
+	}
+	if len(missing) > maxRows {
+		missing = missing[:maxRows]
+	}
+	out.StaleFlows = stale
+	out.UnderspecifiedFlows = missing
 	return out
 }
 

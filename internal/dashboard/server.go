@@ -96,7 +96,14 @@ func newMux(cfg Config) *http.ServeMux {
 
 	mux.HandleFunc("/api/flows", func(w http.ResponseWriter, r *http.Request) {
 		repo := r.URL.Query().Get("repo")
-		writeJSON(w, LoadFlows(r.Context(), cfg.Memory.RDB(), repo))
+		writeJSON(w, LoadFlows(r.Context(), cfg.Memory.RDB(), cfg.Memory, repo))
+	})
+
+	// /api/flow_signal is the cross-flow aggregate the Heuristics tab
+	// renders as the "Flow signal" panel. Walks every flow:overlay:*
+	// hash on each request (cheap — bounded by total flows).
+	mux.HandleFunc("/api/flow_signal", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, LoadFlowSignal(r.Context(), cfg.Memory))
 	})
 
 	mux.HandleFunc("/api/repos", func(w http.ResponseWriter, r *http.Request) {

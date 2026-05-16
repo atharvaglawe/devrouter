@@ -24,6 +24,21 @@ const (
 	funcIndex      = "idx:mem:func"
 	flowIndex      = "idx:mem:flow"
 	decisionIndex  = "idx:mem:decision"
+
+	// flowOverlayPrefix holds per-flow agent-feedback aggregates. One
+	// hash per flow, keyed as `flow:overlay:{repo}:{sanitised_name}`.
+	// Fields:
+	//   file_useful:{path}   int   — agent read this file from the flow
+	//   file_dead:{path}     int   — agent finished without reading it (success && no extras)
+	//   missing:{path}       int   — agent had to read this file but it wasn't in the flow
+	//   total_feedback       int   — count of feedback events received
+	//   last_feedback_at     int64 — unix-ms of most recent update
+	//   last_query_id        str   — most recent contributing query (audit)
+	// Per-file counters keep file paths in the sub-key (not value) so a
+	// single HGETALL on the overlay returns the full per-file breakdown
+	// with no second round-trip. We HINCRBY for monotonic counters and
+	// HSET for scalar metadata in the same pipeline.
+	flowOverlayPrefix = "flow:overlay:"
 )
 
 // FileMemory describes what a source file does.
@@ -399,6 +414,281 @@ func (s *Store) SaveFlow(m FlowMemory) error {
 		"updated_at":   time.Now().UnixMilli(),
 		"embedding":    Float32ToBytes(vec),
 	}).Err()
+}
+
+// FlowOverlayUpdate is one piece of agent feedback applied to a saved flow.
+//
+// ReadFiles is what the agent actually consumed during the task (sourced
+// from dev_feedback.file_paths). MissingFiles is what the agent had to
+// fetch outside the flow (slice 2; optional). Success and AdditionalFiles
+// come straight from dev_feedback and gate when a file counts as "dead":
+// only when the agent succeeded *without* extra reads can absence from
+// ReadFiles be confidently scored as dead weight — otherwise the file
+// may simply not have been needed *this* time and we abstain.
+type FlowOverlayUpdate struct {
+	QueryID         string
+	ReadFiles       []string
+	MissingFiles    []string
+	Success         bool
+	AdditionalFiles int
+}
+
+// FlowOverlay is the deserialised per-flow feedback aggregate as served
+// to the dashboard. Counts are monotonic; the dashboard derives ratios
+// at render time.
+type FlowOverlay struct {
+	Repo             string                       `json:"repo"`
+	Name             string                       `json:"name"`
+	Files            map[string]FlowFileStat      `json:"files,omitempty"`
+	Missing          map[string]int               `json:"missing,omitempty"`
+	TotalFeedback    int                          `json:"total_feedback"`
+	LastFeedbackAt   int64                        `json:"last_feedback_at,omitempty"`
+	LastQueryID      string                       `json:"last_query_id,omitempty"`
+}
+
+// FlowFileStat is the per-file useful/dead pair. Both counters can be
+// zero (file is in the flow but no feedback has touched it yet).
+type FlowFileStat struct {
+	Useful int `json:"useful"`
+	Dead   int `json:"dead"`
+}
+
+// UpdateFlowOverlay applies one feedback event to flow:overlay:{repo}:{name}.
+//
+// Counter rules:
+//   - file is in ReadFiles               → file_useful:{path} ++
+//   - file is NOT in ReadFiles AND
+//     Success AND AdditionalFiles == 0   → file_dead:{path}   ++
+//   - file in MissingFiles               → missing:{path}     ++
+//
+// We only attribute "dead" when the task explicitly succeeded with zero
+// additional reads — otherwise a file's absence from ReadFiles is
+// ambiguous (the agent may have failed early or branched off the flow).
+// This keeps the dead signal high-precision at the cost of recall, which
+// matters because the dashboard uses it to grey out nodes.
+//
+// All-or-nothing within the pipeline: a single round-trip applies every
+// counter for the event plus the scalar metadata (total/last_at). On
+// Redis error we return it; SubmitFeedback logs and swallows.
+func (s *Store) UpdateFlowOverlay(ctx context.Context, repo, name string, upd FlowOverlayUpdate) error {
+	if repo == "" || name == "" {
+		return fmt.Errorf("repo and name required")
+	}
+	flowKey := memPrefix + repo + ":flow:" + sanitizeKey(name)
+	exists, err := s.rdb.Exists(ctx, flowKey).Result()
+	if err != nil {
+		return fmt.Errorf("exists check: %w", err)
+	}
+	if exists == 0 {
+		// Don't create overlays for nonexistent flows — keeps the
+		// dashboard's overlay map honest with the flow index.
+		return fmt.Errorf("flow %s/%s not found", repo, name)
+	}
+
+	flowFiles, _ := s.rdb.HGet(ctx, flowKey, "files").Result()
+	knownFiles := splitOverlayCSV(flowFiles)
+
+	readSet := normaliseFileSet(upd.ReadFiles)
+	overlayKey := flowOverlayPrefix + repo + ":" + sanitizeKey(name)
+
+	pipe := s.rdb.Pipeline()
+	canMarkDead := upd.Success && upd.AdditionalFiles == 0
+
+	for _, f := range knownFiles {
+		norm := normalisePathLower(f)
+		if norm == "" {
+			continue
+		}
+		// Substring match in either direction matches the existing
+		// filesOverlap helper used by FP attribution (lines may be
+		// quoted with or without leading "/" or trailing ":NN-MM").
+		matched := false
+		for r := range readSet {
+			if r == norm || strings.Contains(r, norm) || strings.Contains(norm, r) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			pipe.HIncrBy(ctx, overlayKey, "file_useful:"+f, 1)
+		} else if canMarkDead {
+			pipe.HIncrBy(ctx, overlayKey, "file_dead:"+f, 1)
+		}
+	}
+
+	// MissingFiles are agent-reported additions; track even when the
+	// path isn't in the canonical flow files yet — that's the whole
+	// point of the signal.
+	for _, f := range upd.MissingFiles {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		pipe.HIncrBy(ctx, overlayKey, "missing:"+f, 1)
+	}
+
+	pipe.HIncrBy(ctx, overlayKey, "total_feedback", 1)
+	pipe.HSet(ctx, overlayKey, map[string]interface{}{
+		"last_feedback_at": time.Now().UnixMilli(),
+		"last_query_id":    upd.QueryID,
+	})
+
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+// LoadFlowOverlay returns the parsed overlay for a single flow. Returns
+// a zero-value overlay (not nil) when no feedback has landed yet — the
+// dashboard treats this uniformly as "no signal" and renders neutral.
+func (s *Store) LoadFlowOverlay(ctx context.Context, repo, name string) FlowOverlay {
+	if repo == "" || name == "" {
+		return FlowOverlay{}
+	}
+	key := flowOverlayPrefix + repo + ":" + sanitizeKey(name)
+	fields, err := s.rdb.HGetAll(ctx, key).Result()
+	if err != nil || len(fields) == 0 {
+		return FlowOverlay{Repo: repo, Name: name}
+	}
+	return parseFlowOverlay(repo, name, fields)
+}
+
+// LoadFlowOverlays bulk-loads overlays for every (repo, name) pair in a
+// single pipelined batch — used by the dashboard's /api/flows endpoint
+// so listing N flows costs one round-trip, not N.
+func (s *Store) LoadFlowOverlays(ctx context.Context, repo string, names []string) map[string]FlowOverlay {
+	out := make(map[string]FlowOverlay, len(names))
+	if repo == "" || len(names) == 0 {
+		return out
+	}
+	pipe := s.rdb.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(names))
+	for i, n := range names {
+		cmds[i] = pipe.HGetAll(ctx, flowOverlayPrefix+repo+":"+sanitizeKey(n))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return out
+	}
+	for i, n := range names {
+		fields, err := cmds[i].Result()
+		if err != nil || len(fields) == 0 {
+			out[n] = FlowOverlay{Repo: repo, Name: n}
+			continue
+		}
+		out[n] = parseFlowOverlay(repo, n, fields)
+	}
+	return out
+}
+
+// LoadAllFlowOverlays is the cross-repo variant: SCANs the overlay
+// keyspace once. Used by the heuristics aggregator (slice 3) which
+// rolls per-bucket dead/useful ratios across every repo.
+func (s *Store) LoadAllFlowOverlays(ctx context.Context) []FlowOverlay {
+	var cursor uint64
+	var out []FlowOverlay
+	for {
+		keys, next, err := s.rdb.Scan(ctx, cursor, flowOverlayPrefix+"*", 500).Result()
+		if err != nil {
+			break
+		}
+		for _, k := range keys {
+			// Strip the "flow:overlay:" prefix and split repo:name. Name
+			// may itself contain "_" but no further ":" — sanitizeKey
+			// rewrites ":" to "_".
+			rest := strings.TrimPrefix(k, flowOverlayPrefix)
+			repo, name, ok := strings.Cut(rest, ":")
+			if !ok {
+				continue
+			}
+			fields, err := s.rdb.HGetAll(ctx, k).Result()
+			if err != nil || len(fields) == 0 {
+				continue
+			}
+			out = append(out, parseFlowOverlay(repo, name, fields))
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return out
+}
+
+// parseFlowOverlay deserialises a single overlay HGETALL result.
+func parseFlowOverlay(repo, name string, fields map[string]string) FlowOverlay {
+	ov := FlowOverlay{
+		Repo:  repo,
+		Name:  name,
+		Files: make(map[string]FlowFileStat),
+	}
+	for k, v := range fields {
+		switch {
+		case strings.HasPrefix(k, "file_useful:"):
+			path := strings.TrimPrefix(k, "file_useful:")
+			st := ov.Files[path]
+			st.Useful, _ = strconv.Atoi(v)
+			ov.Files[path] = st
+		case strings.HasPrefix(k, "file_dead:"):
+			path := strings.TrimPrefix(k, "file_dead:")
+			st := ov.Files[path]
+			st.Dead, _ = strconv.Atoi(v)
+			ov.Files[path] = st
+		case strings.HasPrefix(k, "missing:"):
+			path := strings.TrimPrefix(k, "missing:")
+			if ov.Missing == nil {
+				ov.Missing = make(map[string]int)
+			}
+			ov.Missing[path], _ = strconv.Atoi(v)
+		case k == "total_feedback":
+			ov.TotalFeedback, _ = strconv.Atoi(v)
+		case k == "last_feedback_at":
+			ov.LastFeedbackAt, _ = strconv.ParseInt(v, 10, 64)
+		case k == "last_query_id":
+			ov.LastQueryID = v
+		}
+	}
+	if len(ov.Files) == 0 {
+		ov.Files = nil
+	}
+	return ov
+}
+
+// splitOverlayCSV is the same comma-split used by every CSV field in
+// devrouter (file_paths, files, callers, ...). Kept private to memory
+// because router/splitCSV is identical and we don't want a cyclic dep.
+func splitOverlayCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// normaliseFileSet lowercases + trims line-range suffixes (":NN-MM") and
+// strips a leading "/" so substring matching in UpdateFlowOverlay is
+// symmetric with the router/feedback.go normalisePath helper.
+func normaliseFileSet(in []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(in))
+	for _, s := range in {
+		if n := normalisePathLower(s); n != "" {
+			out[n] = struct{}{}
+		}
+	}
+	return out
+}
+
+func normalisePathLower(p string) string {
+	p = strings.TrimSpace(p)
+	p = strings.TrimPrefix(p, "/")
+	if i := strings.IndexByte(p, ':'); i > 0 {
+		p = p[:i]
+	}
+	return strings.ToLower(p)
 }
 
 // SaveDecision persists a developer decision with conflict detection.

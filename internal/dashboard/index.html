@@ -229,8 +229,87 @@
   }
   .flow-svg .node-entry { fill: #1f3a5f; stroke: var(--accent); }
   .flow-svg .node-file { fill: var(--bg-hi); stroke: var(--border); }
+  .flow-svg .node-file.validated { fill: #14331f; stroke: #3aa86b; }
+  .flow-svg .node-file.dead { fill: #1a1a1a; stroke: var(--text-dim); stroke-dasharray: 3 2; opacity: 0.55; }
+  .flow-svg .node-file.augmented { fill: #2a1f3a; stroke: #a78bfa; stroke-dasharray: 4 2; }
   .flow-svg .node-text { fill: var(--text); font-size: 11px; }
+  .flow-svg .node-text.dead { fill: var(--text-dim); text-decoration: line-through; }
+  .flow-svg .node-badge { font-size: 9.5px; fill: var(--text-dim); }
+  .flow-svg .node-badge.useful { fill: #3aa86b; }
+  .flow-svg .node-badge.dead { fill: #c47a7a; }
+  .flow-svg .node-badge.augmented { fill: #a78bfa; }
   .flow-svg .edge { stroke: var(--border); stroke-width: 1; }
+  .flow-meta {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+  }
+  .flow-meta .chip {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    padding: 2px 8px;
+    border-radius: 10px;
+  }
+  .flow-meta .chip.useful { border-color: #3aa86b; color: #6dd49a; }
+  .flow-meta .chip.dead { border-color: var(--text-dim); color: var(--text-dim); }
+  .flow-meta .chip.missing { border-color: #a78bfa; color: #c9b6ff; }
+  .flow-toggle {
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+  }
+  .flow-toggle input { vertical-align: middle; margin-right: 4px; }
+  /* Flow signal panel on Heuristics tab */
+  .flow-signal-summary {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin: 8px 0 14px;
+  }
+  .flow-signal-summary .stat {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .flow-signal-summary .stat .label { color: var(--text-dim); font-size: 11.5px; }
+  .flow-signal-summary .stat .value { font-size: 18px; margin-top: 2px; }
+  .flow-signal-lists {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .flow-signal-lists h3 {
+    margin: 0 0 6px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .flow-signal-lists ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 12px;
+  }
+  .flow-signal-lists li {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 0;
+    border-bottom: 1px dashed var(--border);
+  }
+  .flow-signal-lists li:last-child { border-bottom: 0; }
+  .flow-signal-lists .flow-ref { color: var(--text); }
+  .flow-signal-lists .flow-ref .repo { color: var(--text-dim); }
+  .flow-signal-lists .metric { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .flow-signal-empty { color: var(--text-dim); font-size: 12px; font-style: italic; padding: 6px 0; }
   .empty {
     padding: 30px;
     text-align: center;
@@ -291,6 +370,13 @@
 
     <section data-pane="heuristics" hidden>
       <div class="heuristics-grid" id="heuristics-grid"></div>
+      <div class="panel" id="flow-signal-panel" hidden style="margin-top:14px;">
+        <div class="panel-header">
+          <h2>Flow signal</h2>
+          <div class="sub">Agent feedback on saved flows · observational, does not drive the bandit</div>
+        </div>
+        <div style="padding: 12px 16px;" id="flow-signal-body"></div>
+      </div>
     </section>
 
     <section data-pane="decisions" hidden>
@@ -321,6 +407,8 @@
     decisionsRepo: '',
     flowsRepo: '',
     expanded: new Set(),
+    // Per-flow "show only validated" toggle, keyed by `${repo}/${name}`.
+    flowValidatedOnly: new Set(),
     autoRefresh: true,
     intervalSec: 3,
     timer: null,
@@ -511,6 +599,58 @@
     } catch (e) {
       $('#heuristics-grid').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
     }
+
+    // Slice 3 observability: cross-flow aggregate from feedback overlays.
+    // Rendered below the bandit panels as a separate, clearly-labelled
+    // surface — explicitly NOT folded into reward computation. Hidden
+    // when no flows have received any agent feedback yet.
+    renderFlowSignal();
+  }
+
+  async function renderFlowSignal() {
+    try {
+      const fs = await fetchJSON('/api/flow_signal');
+      const panel = $('#flow-signal-panel');
+      const body = $('#flow-signal-body');
+      if (!fs || !fs.total_flows) {
+        panel.hidden = true;
+        return;
+      }
+      panel.hidden = false;
+      const stale = fs.stale_flows || [];
+      const missing = fs.underspecified_flows || [];
+      body.innerHTML = `
+        <div class="flow-signal-summary">
+          <div class="stat"><div class="label">Flows scored</div><div class="value">${fs.total_flows}</div></div>
+          <div class="stat"><div class="label">Feedback events</div><div class="value">${fs.total_feedback_events}</div></div>
+          <div class="stat"><div class="label">Validated rate</div><div class="value">${fmt.pct(fs.validated_rate || 0)}</div></div>
+          <div class="stat"><div class="label">Missing reports</div><div class="value">${fs.files_missing || 0}</div></div>
+        </div>
+        <div class="flow-signal-lists">
+          <div>
+            <h3>Stale flows (highest dead-ratio)</h3>
+            ${stale.length === 0
+              ? `<div class="flow-signal-empty">No flow has crossed the noise threshold yet.</div>`
+              : `<ul>${stale.map(r => `
+                  <li>
+                    <span class="flow-ref"><span class="repo">${fmt.escape(r.repo)}/</span>${fmt.escape(r.name)}</span>
+                    <span class="metric">${fmt.pct(r.dead_ratio)} · ${r.dead}✗/${r.useful}✓ · n=${r.total_feedback}</span>
+                  </li>`).join('')}</ul>`}
+          </div>
+          <div>
+            <h3>Underspecified flows (most missing-file reports)</h3>
+            ${missing.length === 0
+              ? `<div class="flow-signal-empty">No agent has reported missing files yet.</div>`
+              : `<ul>${missing.map(r => `
+                  <li>
+                    <span class="flow-ref"><span class="repo">${fmt.escape(r.repo)}/</span>${fmt.escape(r.name)}</span>
+                    <span class="metric">+${r.missing} missing · n=${r.total_feedback}</span>
+                  </li>`).join('')}</ul>`}
+          </div>
+        </div>`;
+    } catch (e) {
+      // Silent: flow signal is a nice-to-have on the heuristics tab.
+    }
   }
 
   // ---------- Decisions ----------
@@ -573,27 +713,66 @@
   }
 
   // ---------- Flows ----------
-  function renderFlowSVG(flow) {
+  // classifyFile returns the visual state for a given file path in a
+  // flow, derived from the per-file overlay counters returned on
+  // flow.file_stats. "neutral" means no feedback signal yet OR
+  // useful == dead (abstain rather than guess).
+  function classifyFile(stats) {
+    if (!stats) return { state: 'neutral', useful: 0, dead: 0 };
+    if (stats.useful > stats.dead) return { state: 'validated', useful: stats.useful, dead: stats.dead };
+    if (stats.dead > stats.useful) return { state: 'dead', useful: stats.useful, dead: stats.dead };
+    return { state: 'neutral', useful: stats.useful || 0, dead: stats.dead || 0 };
+  }
+
+  function buildFileClassification(flow) {
+    const byPath = new Map();
+    (flow.file_stats || []).forEach(s => byPath.set(s.path, s));
+    const files = (flow.files || []).map(p => ({ path: p, ...classifyFile(byPath.get(p)) }));
+    return { files, augmented: flow.augmented_files || [] };
+  }
+
+  function renderFlowSVG(flow, opts) {
+    const validatedOnly = !!(opts && opts.validatedOnly);
     const entries = flow.entry_points || [];
-    const files = flow.files || [];
-    if (!entries.length && !files.length) return '';
-    const rowH = 28, colGap = 220, padX = 14, padY = 18;
-    const nodeW = 190, nodeH = 22;
-    const maxRows = Math.max(entries.length, files.length, 1);
+    const { files: classified, augmented } = buildFileClassification(flow);
+    const files = validatedOnly ? classified.filter(f => f.state === 'validated') : classified;
+    const aug = validatedOnly ? [] : augmented;
+    if (!entries.length && !files.length && !aug.length) return '';
+    const rowH = 28, colGap = 240, padX = 14, padY = 18;
+    const nodeW = 220, nodeH = 22;
+    const cols = aug.length > 0 ? 3 : 2;
+    const maxRows = Math.max(entries.length, files.length, aug.length, 1);
     const height = padY * 2 + maxRows * rowH;
-    const width  = padX * 2 + nodeW + colGap;
+    const width  = padX * 2 + nodeW + colGap * (cols - 1);
     let svg = `<svg class="flow-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet">`;
     entries.forEach((e, i) => {
       const x = padX, y = padY + i * rowH;
       svg += `<rect class="node-entry" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
-      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">▸ ${fmt.escape(fmt.truncate(e, 30))}</text>`;
+      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">▸ ${fmt.escape(fmt.truncate(e, 32))}</text>`;
     });
+    const filesX = padX + colGap;
     files.forEach((f, i) => {
-      const x = padX + nodeW + colGap - nodeW, y = padY + i * rowH;
-      svg += `<rect class="node-file" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
-      svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">${fmt.escape(fmt.truncate(f, 30))}</text>`;
+      const y = padY + i * rowH;
+      const cls = `node-file ${f.state === 'neutral' ? '' : f.state}`.trim();
+      const textCls = `node-text ${f.state === 'dead' ? 'dead' : ''}`.trim();
+      const badgeCls = f.state === 'validated' ? 'useful' : (f.state === 'dead' ? 'dead' : '');
+      const badge = (f.useful || f.dead)
+        ? `<text class="node-badge ${badgeCls}" x="${filesX + nodeW - 6}" y="${y + 14}" text-anchor="end">${f.useful}✓${f.dead ? ` / ${f.dead}✗` : ''}</text>`
+        : '';
+      svg += `<rect class="${cls}" x="${filesX}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
+      svg += `<text class="${textCls}" x="${filesX + 8}" y="${y + 15}">${fmt.escape(fmt.truncate(f.path, 34))}</text>`;
+      svg += badge;
     });
-    const ex = padX + nodeW, fx = padX + colGap;
+    if (cols === 3) {
+      const augX = padX + colGap * 2;
+      aug.forEach((a, i) => {
+        const y = padY + i * rowH;
+        svg += `<rect class="node-file augmented" x="${augX}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
+        svg += `<text class="node-text" x="${augX + 8}" y="${y + 15}">${fmt.escape(fmt.truncate(a.path, 32))}</text>`;
+        svg += `<text class="node-badge augmented" x="${augX + nodeW - 6}" y="${y + 14}" text-anchor="end">+${a.missing}</text>`;
+      });
+    }
+    const ex = padX + nodeW, fx = filesX;
     for (let i = 0; i < entries.length; i++) {
       for (let j = 0; j < files.length; j++) {
         const y1 = padY + i * rowH + nodeH / 2;
@@ -604,6 +783,28 @@
     }
     svg += '</svg>';
     return svg;
+  }
+
+  // renderFlowMeta surfaces overlay aggregates as chips below the
+  // graph. Returns empty string when no feedback has touched the flow
+  // yet so unscored flows render exactly as they did pre-overlay.
+  function renderFlowMeta(flow) {
+    if (!flow.total_feedback) return '';
+    let useful = 0, dead = 0;
+    (flow.file_stats || []).forEach(s => { useful += (s.useful || 0); dead += (s.dead || 0); });
+    let missing = 0;
+    (flow.augmented_files || []).forEach(a => { missing += (a.missing || 0); });
+    const flowKey = `${flow.repo}/${flow.name}`;
+    const validatedOnly = state.flowValidatedOnly.has(flowKey);
+    return `
+      <div class="flow-meta">
+        <span class="chip">${flow.total_feedback} feedback event${flow.total_feedback === 1 ? '' : 's'}</span>
+        <span class="chip useful">${useful} useful</span>
+        ${dead ? `<span class="chip dead">${dead} dead</span>` : ''}
+        ${missing ? `<span class="chip missing">+${missing} missing</span>` : ''}
+        <span class="chip" style="border-color:transparent;">last ${fmt.time(flow.last_feedback_at)}</span>
+        <label class="flow-toggle"><input type="checkbox" data-flow-toggle="${fmt.escape(flowKey)}" ${validatedOnly ? 'checked' : ''}> show only validated</label>
+      </div>`;
   }
 
   async function renderFlows() {
@@ -618,18 +819,33 @@
         $('#flows-body').innerHTML = `<div class="empty">No flows saved for ${fmt.escape(repo)} yet.</div>`;
         return;
       }
-      $('#flows-body').innerHTML = flows.map(f => `
-        <div class="panel">
-          <div class="panel-header">
-            <h2>${fmt.escape(f.name)}</h2>
-            <div class="sub">${fmt.escape(f.source || 'agent')} · updated ${fmt.time(f.updated_at)}</div>
-          </div>
-          <div style="padding: 12px 16px;">
-            <div style="color:var(--text); white-space: pre-wrap;">${fmt.escape(f.purpose || '')}</div>
-            ${renderFlowSVG(f)}
-          </div>
-        </div>
-      `).join('');
+      $('#flows-body').innerHTML = flows.map(f => {
+        const flowKey = `${f.repo}/${f.name}`;
+        const validatedOnly = state.flowValidatedOnly.has(flowKey);
+        return `
+          <div class="panel">
+            <div class="panel-header">
+              <h2>${fmt.escape(f.name)}</h2>
+              <div class="sub">${fmt.escape(f.source || 'agent')} · updated ${fmt.time(f.updated_at)}</div>
+            </div>
+            <div style="padding: 12px 16px;">
+              <div style="color:var(--text); white-space: pre-wrap;">${fmt.escape(f.purpose || '')}</div>
+              ${renderFlowSVG(f, { validatedOnly })}
+              ${renderFlowMeta(f)}
+            </div>
+          </div>`;
+      }).join('');
+
+      // Wire per-flow "show only validated" toggles. Flips a Set
+      // entry and re-renders the flows pane.
+      $$('#flows-body input[data-flow-toggle]').forEach(el => {
+        el.addEventListener('change', () => {
+          const k = el.dataset.flowToggle;
+          if (el.checked) state.flowValidatedOnly.add(k);
+          else state.flowValidatedOnly.delete(k);
+          renderFlows();
+        });
+      });
     } catch (e) {
       $('#flows-body').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
     }
