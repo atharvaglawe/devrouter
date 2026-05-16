@@ -42,7 +42,7 @@ as deep call-chain graphs (1–5 hops, configurable per flow) sourced
 from the codegraph snapshot. Tour on the `goserving` benchmark repo:
 
 <p align="center">
-  <video src="docs/assets/devrouter-goserving.mp4" width="900" autoplay loop muted playsinline></video>
+  <img src="docs/assets/devrouter-goserving.gif" alt="DevRouter dashboard demo on the goserving repo" width="900">
 </p>
 
 Port and shutoff knobs in
