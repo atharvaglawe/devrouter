@@ -14,6 +14,11 @@ type LastCallEntry struct {
 	QueryID   string
 	Intent    string
 	ProfileID string
+	// Repo and TopicID carry the per-(intent, repo, topic) bucket
+	// coordinates so the LRU-fallback path of dev_feedback can route
+	// the reward to the same bucket that served the original query.
+	Repo      string
+	TopicID   string
 	Timestamp time.Time
 }
 

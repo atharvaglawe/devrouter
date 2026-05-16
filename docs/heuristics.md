@@ -144,6 +144,111 @@ By default no dials are eligible for movement (Phase 1 — the bandit is
 dormant but everything around it is wired up). Turn on movement with
 `DEVROUTER_HEURISTICS_BANDIT` (see Settings below).
 
+## Per-(intent, repo, topic) buckets — the two-tier model
+
+The bandit doesn't actually tune one profile per intent. It tunes one
+profile per **bucket**, where a bucket is the triple
+`(intent, repo, topic_id)`. The `topic_id` comes from online
+clustering of the query embedding within a `(intent, repo)`.
+
+This exists because real codebases have multiple distinct query
+shapes per intent. "debug a flaky test" and "debug a panic in the
+indexer" both classify as `debug`, but they want very different
+dial settings — the panic query benefits from deeper call traces
+while the flaky test benefits from more siblings and snippets.
+A single per-intent profile averages those preferences together
+and ends up serving neither well.
+
+The bucket layer is a thin overlay on top of the existing per-intent
+system. Two tiers:
+
+| Tier | Used when | Stored at |
+|------|-----------|-----------|
+| **Intent-global** (today's behaviour) | A bucket has accumulated fewer than `DEVROUTER_HEURISTICS_TOPIC_SAMPLE_FLOOR` (default 20) centroid samples — i.e. the bucket is **cold**. The bandit still runs but tunes the intent-global profile, exactly as it did before topics existed. | `heuristics:current:{intent}:*` |
+| **Per-bucket** (topic-aware) | A bucket has crossed the sample floor — the bandit has enough signal to tune that bucket independently. The bucket auto-seeds from the intent-global profile on first hot read, then diverges as its own rewards land. | `heuristics:bucket:{intent}:{repo}:{topic}:current` |
+
+The fallback is the safety net: cold buckets never get noisy tuning,
+and a brand-new install behaves identically to the pre-topic system
+until a bucket warms up. When a bucket does warm up, only that bucket's
+profile drifts; unrelated buckets stay on the intent-global profile.
+
+### Centroid lifecycle
+
+For each `(intent, repo)`, devrouter maintains up to
+`DEVROUTER_HEURISTICS_MAX_TOPICS` (default 32) centroids. New queries
+take the L2-normalised embedding, find the nearest existing centroid,
+and:
+
+- If `cosine_similarity >= DEVROUTER_HEURISTICS_NEW_TOPIC_SIM`
+  (default 0.65), the query is **absorbed** into that centroid
+  (running mean over samples, re-normalised) and gets its `topic_id`.
+- Otherwise it **spawns** a new centroid with a fresh `topic_id`
+  (`t-0`, `t-1`, …) up to the per-(intent, repo) cap.
+- When at cap, the least-recently-seen centroid is **LRU-evicted**
+  and its slot reused for the new cluster. Evicted centroids leave
+  their bandit state (`heuristics:bucket:*`) in place — those keys
+  age out via their own TTL or get cleared via `dev_heuristics_reset`.
+
+### Topic labels
+
+Each `TopicEntry` carries a human-readable `label` (e.g.
+`redis-session-cache`) derived from the seed query at topic creation.
+The label is purely cosmetic — nothing in the bandit, trace, or
+feedback paths keys on it — but it makes the dashboard's **Topics**
+tab and Live-Queries panel far more readable than the raw `t-N` IDs.
+
+How labels are produced (see `ExtractTopicLabel` in
+`internal/heuristics/topics.go`):
+
+1. Lowercase the query and tokenize on any non-alphanum boundary.
+2. Drop stopwords (articles, question words, generic verbs like
+   "explain"/"show"/"fix"/"add") and tokens shorter than 3 chars.
+3. Deduplicate while preserving first-seen order — the head of a
+   query is overwhelmingly where the topical nouns live.
+4. Take up to 3 tokens, hyphen-join, cap at 40 chars on a hyphen
+   boundary so labels never end mid-token.
+
+Labels are set on topic **creation** (new slot OR LRU-evict-and-
+reuse). They are also **backfilled** in the absorb path when an
+existing entry has an empty `label` — so any topic predating this
+feature gets a label organically the moment a labelable query
+matches it.
+
+### Reward routing
+
+Every `feedback:trace:{query_id}` record now carries `topic_id` and
+`repo`. Explicit feedback (`dev_feedback`) and implicit-repeat
+detection both route the reward back to the exact bucket whose profile
+served the original query — so a topic that consistently triggers
+repeats sees its own bandit signal drop while unrelated topics stay
+untouched.
+
+### Knobs
+
+| Variable | Default | Purpose |
+|----------|--------:|---------|
+| `DEVROUTER_HEURISTICS_TOPICS` | `true` | Master switch. Off = topic resolution is skipped entirely; every query uses the intent-global profile (pre-topic behaviour). |
+| `DEVROUTER_HEURISTICS_MAX_TOPICS` | `32` | Cap on centroids per `(intent, repo)`. Higher = finer-grained tuning, more bandit fan-out, slower warm-up. |
+| `DEVROUTER_HEURISTICS_NEW_TOPIC_SIM` | `0.65` | Cosine floor for spawning a new topic. Tuned for `nomic-embed-text-v1.5`. |
+| `DEVROUTER_HEURISTICS_TOPIC_SAMPLE_FLOOR` | `20` | Per-bucket centroid-sample count required before bandit perturbation kicks in. Below this, queries inherit the intent-global profile. |
+
+### Inspecting
+
+`dev_feedback_stats` returns `Buckets` under each intent — one row per
+`(repo, topic_id)` with centroid samples, `hot_enough` flag, the
+bucket's current profile, and 7-day reward stats. The dashboard
+**Heuristics** tab nests these under each intent card; the
+**Topics** tab is a flat browser over every centroid.
+
+Raw Redis inspection:
+
+| Key | Contents |
+|-----|----------|
+| `heuristics:topics:{intent}:{repo}` | Hash of `{topic_id -> centroid JSON}` for that bucket key. |
+| `heuristics:bucket:{intent}:{repo}:{topic}:current` | Per-bucket live profile (JSON). |
+| `heuristics:bucket:{intent}:{repo}:{topic}:history` | Per-bucket promote / discard / rollback log. |
+| `heuristics:bucket:{intent}:{repo}:{topic}:reward:{yyyy-mm-dd}` | Per-bucket daily reward rows (90-day TTL). |
+
 ## Safety
 
 | Mechanism | What it guarantees |
@@ -213,7 +318,11 @@ Recommended rollout:
 - [`internal/heuristics/bandit.go`](../internal/heuristics/bandit.go)
   — perturbation, promotion, discard, rollback.
 - [`internal/heuristics/store.go`](../internal/heuristics/store.go)
-  — Redis schema (current / default / history / reward / trace).
+  — Redis schema (current / default / history / reward / trace) plus
+  the `…For(intent, repo, topic, …)` per-bucket variants.
+- [`internal/heuristics/topics.go`](../internal/heuristics/topics.go)
+  — online centroid clustering, LRU eviction, and the sample-floor
+  lookup that drives the two-tier model above.
 - [`internal/heuristics/picker.go`](../internal/heuristics/picker.go)
   — process-wide handle that wires all of the above together; reads
   the env vars listed above.

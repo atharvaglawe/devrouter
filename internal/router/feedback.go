@@ -33,13 +33,17 @@ type FeedbackInput struct {
 	Success         bool   `json:"success"`
 
 	// FlowID joins this feedback to a specific saved flow so the
-	// dashboard can score each file in the flow as useful / dead and
-	// the bandit can shape reward by flow-quality (see slice 3).
+	// dashboard can score each file in the flow as useful / dead.
 	// Format: "{repo}/{flow_name}". Optional — when empty, no flow
 	// overlay update happens and the rest of the feedback (bandit,
 	// FP attribution, anchor learning) runs unchanged. The agent
 	// learns the correct value from the `name` field of any
 	// flow-typed entry in primary_context.
+	//
+	// Intentionally NOT folded into the bandit reward: flow quality
+	// scores memory accuracy, the bandit tunes codegraph context
+	// shape — different layers. Surfaced on the dashboard's
+	// Heuristics tab as the "Flow signal" panel for observability.
 	FlowID string `json:"flow_id"`
 
 	// MissingFiles is the slice-2 channel: files the agent had to
@@ -116,9 +120,16 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 	// Resolve trace -> intent + profile_id + prompt_tokens + trimmed paths.
 	// traceFields is retained beyond the join so the FP-attribution block
 	// below can read query + memory_keys without a second HGETALL.
+	//
+	// repo + topicID identify which per-(intent, repo, topic) bucket
+	// served the original query; we route the reward to exactly that
+	// bucket so a hot bucket's tuning gets the signal directly instead
+	// of fanning it across the whole intent.
 	var (
 		intent       string
 		profileID    string
+		repo         string
+		topicID      string
 		promptTokens int
 		traceFields  map[string]string
 	)
@@ -131,6 +142,8 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 			traceFields = fields
 			intent = fields["intent"]
 			profileID = fields["heuristic_profile_id"]
+			repo = fields["repo"]
+			topicID = fields["topic_id"]
 			promptTokens, _ = strconv.Atoi(fields["prompt_tokens"])
 		}
 	}
@@ -140,6 +153,8 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 			queryID = e.QueryID
 			intent = e.Intent
 			profileID = e.ProfileID
+			repo = e.Repo
+			topicID = e.TopicID
 			joinedVia = "lru_fallback"
 			// Re-load prompt_tokens from the trace if the LRU pointed us
 			// at a real one; the LRU itself doesn't carry this.
@@ -147,6 +162,12 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 			if err == nil && len(fields) > 0 {
 				traceFields = fields
 				promptTokens, _ = strconv.Atoi(fields["prompt_tokens"])
+				if repo == "" {
+					repo = fields["repo"]
+				}
+				if topicID == "" {
+					topicID = fields["topic_id"]
+				}
 			}
 		}
 	}
@@ -162,7 +183,7 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 	// the signal comes from additional_files.
 	var trimmedPaths []string
 
-	rollingMean := r.Heuristics.Store.RollingMean(ctx, intent, 50)
+	rollingMean := r.Heuristics.Store.RollingMeanFor(ctx, intent, repo, topicID, 50)
 	raw, adjusted := heuristics.Compute(
 		in.AdditionalFiles, in.RevisitedFiles, promptTokens,
 		trimmedPaths, splitCSV(in.FilePaths),
@@ -181,8 +202,8 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 		Weight:          heuristics.ExplicitWeight,
 		Timestamp:       now,
 	}
-	if err := r.Heuristics.Store.AppendReward(ctx, intent, row); err != nil {
-		log.Printf("[feedback] AppendReward error (non-fatal): %v", err)
+	if err := r.Heuristics.Store.AppendRewardFor(ctx, intent, repo, topicID, row); err != nil {
+		log.Printf("[feedback] AppendRewardFor error (non-fatal): %v", err)
 	}
 
 	patch := map[string]interface{}{
@@ -198,7 +219,7 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 		log.Printf("[feedback] PatchTrace error (non-fatal): %v", err)
 	}
 
-	r.Heuristics.Update(intent, profileID, adjusted, heuristics.ExplicitWeight)
+	r.Heuristics.UpdateWithTopic(intent, repo, topicID, profileID, adjusted, heuristics.ExplicitWeight)
 
 	// AnchorLearner reward attribution. dev_feedback's file_paths are
 	// the agent's authoritative "I actually read these" list; any

@@ -17,6 +17,13 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
+// serverStartTime is captured at package init so /api/version can
+// return a stable "this build is running since X" value. The
+// dashboard JS polls this and reloads the window when the value
+// changes — saves users from having to hard-refresh after every
+// rebuild during active development.
+var serverStartTime = time.Now()
+
 // Config bundles everything the dashboard needs from the host process.
 // Memory and Heuristics may be nil — the corresponding tabs degrade to
 // "not configured" rather than blocking server startup.
@@ -108,6 +115,21 @@ func newMux(cfg Config) *http.ServeMux {
 
 	mux.HandleFunc("/api/repos", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, LoadRepos(r.Context(), cfg.Memory.RDB()))
+	})
+
+	mux.HandleFunc("/api/topics", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, LoadTopics(r.Context(), cfg.Heuristics))
+	})
+
+	// /api/version lets the dashboard JS detect a restarted server
+	// (start_ms changes) and auto-reload the window — otherwise a
+	// long-lived tab keeps running the old JS even though /api/*
+	// JSON has happily been updating, which is confusing during
+	// development. Cheap, no Redis touch.
+	mux.HandleFunc("/api/version", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]any{
+			"start_ms": serverStartTime.UnixMilli(),
+		})
 	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

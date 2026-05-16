@@ -36,11 +36,30 @@ func (f *fakeStore) AppendHistory(_ context.Context, _ string, e HistoryEntry) e
 	return nil
 }
 
+// The …For variants route global-bucket writes to the legacy keys, so
+// for tests pointed at the intent-global surface we just delegate.
+func (f *fakeStore) SetCurrentFor(ctx context.Context, intent, repo, topic string, p Profile) error {
+	if isGlobalBucket(repo, topic) {
+		return f.SetCurrent(ctx, intent, p)
+	}
+	cp := p
+	f.lastSetCurrent = &cp
+	return nil
+}
+
+func (f *fakeStore) AppendHistoryFor(ctx context.Context, intent, repo, topic string, e HistoryEntry) error {
+	if isGlobalBucket(repo, topic) {
+		return f.AppendHistory(ctx, intent, e)
+	}
+	f.historyEvents = append(f.historyEvents, e)
+	return nil
+}
+
 func TestBanditNoKnobsAlwaysReturnsBase(t *testing.T) {
 	b := NewBandit(nil)
 	base := Default("debug")
 	for i := 0; i < 100; i++ {
-		got := b.Select("debug", base)
+		got := b.Select("debug", "", IntentGlobalTopic, base, 0)
 		if got.ID() != base.ID() {
 			t.Errorf("with no tunable knobs, Select should always return base")
 			break
@@ -57,7 +76,7 @@ func TestBanditPerturbsWithEpsilon(t *testing.T) {
 	// With ε=0.1, ~10 of 100 selects should differ from base.
 	candidateHits := 0
 	for i := 0; i < 1000; i++ {
-		got := b.Select("debug", base)
+		got := b.Select("debug", "", IntentGlobalTopic, base, 0)
 		if got.ID() != base.ID() {
 			candidateHits++
 		}
@@ -77,7 +96,7 @@ func TestBanditPerturbsWithEpsilon(t *testing.T) {
 // `tries` calls (test should skip in that case).
 func forceCandidate(b *Bandit, intent string, base Profile, tries int) string {
 	for i := 0; i < tries; i++ {
-		got := b.Select(intent, base)
+		got := b.Select(intent, "", IntentGlobalTopic, base, 0)
 		if got.ID() != base.ID() {
 			return got.ID()
 		}
@@ -98,10 +117,10 @@ func TestBanditPromotesOnLift(t *testing.T) {
 	}
 
 	for i := 0; i < PromotionWindow; i++ {
-		b.Update("refactor", candidateID, 0.9, 1.0)
+		b.Update("refactor", "", IntentGlobalTopic, candidateID, 0.9, 1.0)
 	}
 	for i := 0; i < 5; i++ {
-		b.Update("refactor", base.ID(), 0.5, 1.0)
+		b.Update("refactor", "", IntentGlobalTopic, base.ID(), 0.5, 1.0)
 	}
 
 	if store.lastSetCurrent == nil {
@@ -126,7 +145,7 @@ func TestBanditRollbackOnThreeStrikes(t *testing.T) {
 	}
 
 	for i := 0; i < RollbackStrikes; i++ {
-		b.Update("refactor", candidateID, 0.10, 1.0)
+		b.Update("refactor", "", IntentGlobalTopic, candidateID, 0.10, 1.0)
 	}
 
 	if store.lastSetCurrent == nil {
@@ -151,14 +170,30 @@ func TestBanditDiscardsOnNoLift(t *testing.T) {
 	}
 
 	for i := 0; i < PromotionWindow; i++ {
-		b.Update("refactor", candidateID, 0.5, 1.0)
+		b.Update("refactor", "", IntentGlobalTopic, candidateID, 0.5, 1.0)
 	}
 	for i := 0; i < 5; i++ {
-		b.Update("refactor", base.ID(), 0.5, 1.0)
+		b.Update("refactor", "", IntentGlobalTopic, base.ID(), 0.5, 1.0)
 	}
 
 	if store.lastSetCurrent != nil {
 		t.Errorf("discard must not call SetCurrent (no promotion); got %+v",
 			store.lastSetCurrent)
+	}
+}
+
+// TestBanditSampleFloorBlocksColdBucket asserts that a per-bucket
+// call (real repo + real topic) below TopicBanditSampleFloor never
+// gets a perturbed candidate, even with knobs enabled and high ε.
+func TestBanditSampleFloorBlocksColdBucket(t *testing.T) {
+	b := NewBandit(nil)
+	b.EnableKnob("max_trace")
+	withDeterministicRNG(b, 1)
+	base := Default("debug")
+	for i := 0; i < 500; i++ {
+		got := b.Select("debug", "repoA", "t-0", base, TopicBanditSampleFloor-1)
+		if got.ID() != base.ID() {
+			t.Fatalf("cold bucket below floor should always return base; got %s", got.ID())
+		}
 	}
 }

@@ -14,6 +14,10 @@ override only what differs.
 | `DEVROUTER_MEMORY_MAX_DISTANCE` | `0.60` | Cosine-distance ceiling for vector recall. Lower = stricter relevance. Distance bands for `nomic-embed-text-v1.5`: `<0.2` paraphrase, `0.2–0.4` same topic, `0.4–0.6` weak topical, `>0.6` incidental. See [`retrieval-rules.md`](retrieval-rules.md) Section 6.1. |
 | `DEVROUTER_HEURISTICS_FROZEN` | `false` | When `true`, disables all bandit profile mutations (telemetry still collected). Used during incident recovery and isolated experiments. |
 | `DEVROUTER_HEURISTICS_BANDIT` | _(unset)_ | Comma-separated knob names to perturb (`max_trace`, `caller_hops`, …) or `all`. Empty = no perturbation. |
+| `DEVROUTER_HEURISTICS_TOPICS` | `true` | Master switch for per-(intent, repo, topic) heuristic buckets. When off, every query uses the intent-global profile (today's pre-topic behaviour). Opt-out values: `off`, `none`, `disabled`, `false`, `0`. See [`heuristics.md`](heuristics.md) for the two-tier model. |
+| `DEVROUTER_HEURISTICS_MAX_TOPICS` | `32` | Maximum number of topic centroids stored per (intent, repo) bucket. New queries beyond the cap LRU-evict the least-recently-seen centroid. Range `1..256`. Higher = finer-grained tuning at the cost of more bandit fan-out; lower = coarser buckets but faster warm-up. |
+| `DEVROUTER_HEURISTICS_NEW_TOPIC_SIM` | `0.65` | Cosine-similarity floor below which a new query spawns a new topic centroid instead of being absorbed into the nearest existing one. Range `0..1`. Lower = coarser clusters (fewer topics), higher = finer clusters (more topics). Tuned for `nomic-embed-text-v1.5`. |
+| `DEVROUTER_HEURISTICS_TOPIC_SAMPLE_FLOOR` | `20` | Per-bucket centroid-sample count required before the bandit will perturb a topic-specific profile. Below this floor, queries inherit the intent-global profile so cold buckets never get noisy tuning. Range `0..10000`. Set to `0` to perturb buckets from the first query (not recommended). |
 | `DEVROUTER_DASHBOARD_ADDR` | `127.0.0.1:8088` | Bind address for the bundled read-only HTTP dashboard. Localhost-only by default. Override with any `host:port` (e.g. `:9090`). Opt-out values: `off`, `none`, `disabled`, `false`, `0`. See the [Dashboard](#dashboard) section below. |
 | `CODEGRAPH_URL` | `http://localhost:4747` | Override only if devrouter's per-repo indexer is running on a non-default port or remote host. (`GITNEXUS_URL` is an accepted legacy alias.) |
 
@@ -108,16 +112,24 @@ the first instance binds the port, the rest log one line and keep
 serving MCP traffic without the dashboard. So you only ever see the UI
 for one devrouter per port, never a startup crash.
 
-Four tabs:
+Five tabs:
 
 - **Live Queries** — every `dev_context` call as it lands. Click a row
   to expand the full retrieval trace (intent, profile, latency, tokens,
-  returned memory keys). Reward badge fills in once `dev_feedback`
-  joins the trace.
+  returned memory keys). The **Topic** column shows which per-(intent,
+  repo, topic) bucket served the query (`global` means the cold-bucket
+  fallback was used). Reward badge fills in once `dev_feedback` joins
+  the trace.
 - **Heuristics** — per-intent current vs frozen-default profile, every
   knob's delta (so you can see exactly what the bandit has shifted),
   reward distribution over the last 7 days, and the recent
-  promote / discard / rollback history.
+  promote / discard / rollback history. Each intent card now nests the
+  per-(repo, topic) buckets the bandit has spun up, marked **hot** once
+  they cross the sample floor or **cold N/floor** while warming up.
+- **Topics** — flat browser over every centroid the topic-clustering
+  layer has created. Filter by intent or repo. Centroid samples and
+  hot/cold status are shown id-only (`t-0`, `t-3`, …) per design —
+  cluster auto-naming is deliberately out of scope.
 - **Decisions** — `decision_save` records grouped per repo, rendered as
   a supersession tree (older decisions appear under the newer decisions
   that replaced them).

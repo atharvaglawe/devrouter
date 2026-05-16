@@ -197,6 +197,33 @@ type RetrievalTrace struct {
 	// hashes across the heuristics:reward:* and feedback:trace:* keys.
 	HeuristicProfileID string `json:"heuristic_profile_id,omitempty"`
 
+	// Repo and TopicID identify the per-(intent, repo, topic) heuristic
+	// bucket this query was scored against. Filled when topics are
+	// enabled (which they are by default — see TopicsEnabled). Used by
+	// dev_feedback / repeat-detection to route the reward back to the
+	// exact bucket whose profile generated the retrieval.
+	//
+	// TopicID == "*" (IntentGlobalTopic) means this query landed on
+	// the intent-global fallback — either topics are off, the bucket
+	// is below the sample floor, or embedding failed. The reward
+	// still has to credit the right bucket to drive cold-bucket
+	// warm-up, so we always persist both fields when known.
+	Repo    string `json:"repo,omitempty"`
+	TopicID string `json:"topic_id,omitempty"`
+
+	// TopicLabel is the human-readable kebab-case tag derived from the
+	// seed query that created this topic (e.g. "redis-session-cache").
+	// Purely cosmetic — nothing keys on it. Empty when the topic is the
+	// intent-global sentinel or pre-dates the labelling feature.
+	TopicLabel string `json:"topic_label,omitempty"`
+
+	// HeuristicFromTopic records whether the profile was sourced from
+	// the bucket-specific profile (true) or from the intent-global
+	// surface (false). Lets the dashboard distinguish "hot bucket
+	// using its own tuning" from "cold bucket inheriting the global"
+	// at a glance.
+	HeuristicFromTopic bool `json:"heuristic_from_topic,omitempty"`
+
 	// RepeatedExplorationOf is set when the implicit-repeat detector
 	// finds a semantically-similar prior query within the lookback
 	// window — value is the prior query_id. The prior query's reward

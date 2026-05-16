@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -358,36 +359,65 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	// --- INTENT ---
 	intent := DetectIntent(query)
 	trace.Intent = string(intent)
+	trace.Repo = repo
+
+	repoPath := r.Graph.RepoPath(repo)
+	branch := memory.CurrentBranch(repoPath)
+
+	// --- EMBED ONCE ---
+	// SearchAll, topic resolution, and repeat detection all need the
+	// same query embedding. Embed synchronously first so we pay nomic
+	// once per query and feed the result into all three downstream
+	// paths. On embed failure we degrade: SearchAll falls back to
+	// its own retry, topic resolve returns IntentGlobalTopic, and
+	// repeat detection is skipped.
+	var queryEmbed []float32
+	if emb, err := memory.Embed(query); err == nil {
+		queryEmbed = emb
+	} else {
+		log.Printf("[router] embed error (non-fatal, falling back): %v", err)
+	}
+
+	// --- TOPIC RESOLVE ---
+	// Always resolved (even when below the bandit floor) so the trace
+	// records which bucket the query landed in — that's how
+	// dev_feedback / repeat-detection later route the reward to the
+	// right place to drive bucket warm-up.
+	topicID := heuristics.IntentGlobalTopic
+	var topicLabel string
+	if r.Heuristics != nil && r.Heuristics.Topics != nil && len(queryEmbed) > 0 {
+		topicID, topicLabel = r.Heuristics.Topics.Resolve(ctx, string(intent), repo, queryEmbed, query)
+	}
+	trace.TopicID = topicID
+	trace.TopicLabel = topicLabel
 
 	// --- HEURISTIC PROFILE ---
-	// Pick the per-intent profile (numeric budget+trim knobs) that the
-	// rest of the pipeline will respect. In Phase 1 this is just the
-	// current Redis-stored profile; Phase 2+ may return a perturbed
-	// candidate (with probability Epsilon).
+	// PickWithTopic returns the bucket's profile when the bucket is
+	// hot enough (>= TopicBanditSampleFloor centroid samples);
+	// otherwise it serves the intent-global profile so a cold bucket
+	// behaves exactly like today's pre-topic pipeline.
 	var (
 		profileID string
 		profile   heuristics.Profile
+		fromTopic bool
 	)
 	if r.Heuristics != nil {
-		profileID, profile = r.Heuristics.Pick(string(intent))
+		profileID, profile, fromTopic = r.Heuristics.PickWithTopic(string(intent), repo, topicID)
 	} else {
 		profile = heuristics.Default(string(intent))
 		profileID = profile.ID()
 	}
 	trace.HeuristicProfileID = profileID
+	trace.HeuristicFromTopic = fromTopic
 
 	// --- MEMORY + REPEAT DETECTION (run in parallel) ---
 	//
-	// The two remaining parallel branches have no data dependency on
-	// each other:
-	//   - SearchAll embeds+KNNs the raw query
-	//   - Repeat detection embeds the query and cosines vs recent_queries:{repo}
+	// Two parallel branches with no data dependency:
+	//   - SearchAllWithEmbed reuses the embedding we already computed
+	//   - Repeat detection cosines that same vector vs recent_queries:{repo}
 	//
 	// The query plan is supplied by the MCP caller in the dev_context
 	// arguments — see HandleQueryWithPlan.
-	repoPath := r.Graph.RepoPath(repo)
-	branch := memory.CurrentBranch(repoPath)
-
 	var (
 		rawHits            []memory.MemoryHit
 		searchLatency      int64
@@ -396,7 +426,6 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 		plannerEmptyReason string
 		planLatency        int64
 		repeatHit          heuristics.RepeatHit
-		queryEmbed         []float32
 		wg                 sync.WaitGroup
 	)
 
@@ -420,23 +449,21 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	go func() {
 		defer wg.Done()
 		t0 := time.Now()
-		rawHits = r.Memory.SearchAll(query, repo, branch)
+		if len(queryEmbed) > 0 {
+			rawHits = r.Memory.SearchAllWithEmbed(queryEmbed, repo, branch)
+		} else {
+			rawHits = r.Memory.SearchAll(query, repo, branch)
+		}
 		searchLatency = time.Since(t0).Milliseconds()
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if r.Heuristics == nil || repo == "" {
+		if r.Heuristics == nil || repo == "" || len(queryEmbed) == 0 {
 			return
 		}
-		emb, err := memory.Embed(query)
-		if err != nil {
-			log.Printf("[router] repeat-embed error (non-fatal): %v", err)
-			return
-		}
-		queryEmbed = emb
-		hit, err := r.Heuristics.Store.DetectRepeat(context.Background(), repo, emb)
+		hit, err := r.Heuristics.Store.DetectRepeat(context.Background(), repo, queryEmbed)
 		if err != nil {
 			log.Printf("[router] repeat detect error (non-fatal): %v", err)
 			return
@@ -449,12 +476,17 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	// --- HANDLE REPEAT-EXPLORATION FALLOUT ---
 	// If the current query is similar enough to a recent prior query,
 	// retroactively penalise that prior query's profile and stamp this
-	// trace so retrieve_debug surfaces the chain.
+	// trace so retrieve_debug surfaces the chain. Reward routing is
+	// per-(intent, repo, topic): the bucket whose profile served the
+	// PRIOR query takes the hit, so a topic that consistently triggers
+	// repeats sees its own bandit signal drop while unrelated topics
+	// stay untouched.
 	if r.Heuristics != nil && repeatHit.Sim >= heuristics.RepeatSimThreshold {
 		raw, fired := heuristics.ComputeImplicit(repeatHit.Sim)
 		if fired {
 			trace.RepeatedExplorationOf = repeatHit.PrevQueryID
-			rollingMean := r.Heuristics.Store.RollingMean(ctx, repeatHit.PrevIntent, 50)
+			rollingMean := r.Heuristics.Store.RollingMeanFor(ctx,
+				repeatHit.PrevIntent, repeatHit.PrevRepo, repeatHit.PrevTopicID, 50)
 			adjusted := raw - rollingMean
 			row := heuristics.RewardRow{
 				QueryID:        repeatHit.PrevQueryID,
@@ -465,7 +497,8 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 				Weight:         heuristics.ImplicitWeight,
 				Timestamp:      time.Now().UnixMilli(),
 			}
-			_ = r.Heuristics.Store.AppendReward(ctx, repeatHit.PrevIntent, row)
+			_ = r.Heuristics.Store.AppendRewardFor(ctx,
+				repeatHit.PrevIntent, repeatHit.PrevRepo, repeatHit.PrevTopicID, row)
 			_ = r.Heuristics.Store.PatchTrace(ctx, repeatHit.PrevQueryID, map[string]interface{}{
 				"repeat_query":    "true",
 				"raw_reward":      fmt.Sprintf("%g", raw),
@@ -473,19 +506,25 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 				"feedback_source": "implicit_repeat",
 				"feedback_at":     fmt.Sprintf("%d", row.Timestamp),
 			})
-			r.Heuristics.Update(repeatHit.PrevIntent, repeatHit.PrevProfileID, adjusted, heuristics.ImplicitWeight)
-			log.Printf("[heuristics] implicit_repeat: prev=%s sim=%.3f raw=%.2f adjusted=%.2f",
-				repeatHit.PrevQueryID, repeatHit.Sim, raw, adjusted)
+			r.Heuristics.UpdateWithTopic(repeatHit.PrevIntent, repeatHit.PrevRepo, repeatHit.PrevTopicID,
+				repeatHit.PrevProfileID, adjusted, heuristics.ImplicitWeight)
+			log.Printf("[heuristics] implicit_repeat: prev=%s sim=%.3f raw=%.2f adjusted=%.2f bucket=%s/%s",
+				repeatHit.PrevQueryID, repeatHit.Sim, raw, adjusted,
+				repeatHit.PrevRepo, repeatHit.PrevTopicID)
 		}
 	}
 
 	// Always record the current query so the next dev_context can detect
-	// repeats against it.
+	// repeats against it. Repo + TopicID are denormalised onto the entry
+	// so the next repeat lookup can immediately route the reward without
+	// having to re-load the prior query's trace.
 	if r.Heuristics != nil && repo != "" && len(queryEmbed) > 0 {
 		_ = r.Heuristics.Store.RecordQuery(context.Background(), repo, heuristics.RecentQueryEntry{
 			QueryID:   trace.QueryID,
 			Intent:    string(intent),
 			ProfileID: profileID,
+			Repo:      repo,
+			TopicID:   topicID,
 			Embedding: queryEmbed,
 		})
 	}
@@ -1186,6 +1225,8 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 				QueryID:   trace.QueryID,
 				Intent:    string(intent),
 				ProfileID: profileID,
+				Repo:      repo,
+				TopicID:   topicID,
 				Timestamp: time.Now(),
 			})
 		}
@@ -1219,6 +1260,15 @@ func traceHashFields(t *prompt.RetrievalTrace, repo, query, intent, profileID st
 	}
 	if t.RepeatedExplorationOf != "" {
 		fields["repeated_exploration_of"] = t.RepeatedExplorationOf
+	}
+	if t.TopicID != "" {
+		fields["topic_id"] = t.TopicID
+	}
+	if t.TopicLabel != "" {
+		fields["topic_label"] = t.TopicLabel
+	}
+	if t.HeuristicFromTopic {
+		fields["heuristic_from_topic"] = "true"
 	}
 	if t.Outcome != nil {
 		fields["prompt_tokens"] = fmt.Sprintf("%d", t.Outcome.PromptTokens)
@@ -2855,6 +2905,20 @@ func (r *Router) SaveFuncMemory(repo, name, file, purpose, callers, callees, sco
 }
 
 // SaveFlowMemory persists a flow-level memory.
+//
+// In addition to the user-supplied fields, SaveFlowMemory snapshots the
+// codegraph neighbourhood (callers, callees, importers, extends,
+// methods) around each entry point and freezes it onto the FlowMemory.
+// That snapshot is what the dashboard renders as the per-flow graph,
+// giving the human reader the same call-chain view the LLM saw during
+// dev_context for this flow's seed symbols — without re-querying
+// codegraph at view time (which would be slow) or losing the view
+// when codegraph is reindexed (which would be lossy).
+//
+// The snapshot is best-effort: any failure (entry_points empty,
+// codegraph unreachable, all queries returning nothing) is logged and
+// swallowed so the flow itself still saves cleanly. Without a
+// snapshot, the dashboard falls back to the legacy bipartite SVG.
 func (r *Router) SaveFlowMemory(repo, name, purpose, files, entryPoints, scope string) error {
 	if repo == "" || name == "" || purpose == "" {
 		return fmt.Errorf("repo, name, and purpose are required")
@@ -2862,14 +2926,18 @@ func (r *Router) SaveFlowMemory(repo, name, purpose, files, entryPoints, scope s
 	if scope == "" {
 		scope = memory.ScopeForFiles(r.Graph.RepoPath(repo), files)
 	}
+
+	subgraphJSON := snapshotFlowSubgraph(r.Graph, repo, entryPoints, name)
+
 	err := r.Memory.SaveFlow(memory.FlowMemory{
-		Repo:        repo,
-		Name:        name,
-		Purpose:     purpose,
-		Files:       files,
-		EntryPoints: entryPoints,
-		Source:      "agent",
-		Scope:       scope,
+		Repo:         repo,
+		Name:         name,
+		Purpose:      purpose,
+		Files:        files,
+		EntryPoints:  entryPoints,
+		Source:       "agent",
+		Scope:        scope,
+		SubgraphJSON: subgraphJSON,
 	})
 	// Flow memories list multiple files (CSV) — credit each one as
 	// an implicit "useful" signal for whichever pattern anchored it.
@@ -2879,6 +2947,41 @@ func (r *Router) SaveFlowMemory(repo, name, purpose, files, entryPoints, scope s
 		}
 	}
 	return err
+}
+
+// snapshotFlowSubgraph captures the codegraph neighbourhood for the
+// flow's entry-point symbols and returns it as a JSON string ready to
+// drop into FlowMemory.SubgraphJSON. Returns "" on any failure — that
+// signals the dashboard to fall back to the existing bipartite SVG
+// without breaking the save path.
+func snapshotFlowSubgraph(graph *codegraph.Client, repo, entryPoints, flowName string) string {
+	if graph == nil || repo == "" {
+		return ""
+	}
+	seeds := splitCSV(entryPoints)
+	if len(seeds) == 0 {
+		return ""
+	}
+	sg, err := graph.Subgraph(repo, seeds)
+	if err != nil {
+		log.Printf("[flow] subgraph snapshot %q (%s): %v (non-fatal)", flowName, repo, err)
+		return ""
+	}
+	if sg == nil || (len(sg.Nodes) == 0 && len(sg.Edges) == 0) {
+		// Codegraph reached but nothing relevant — common when the
+		// agent supplied entry_points that aren't in the symbol
+		// table (typos, qualified names like "pkg.Func" vs bare
+		// "Func", or flows describing routes/configs that aren't
+		// node-shaped). Quietly return "" rather than persisting
+		// an empty subgraph that just adds bytes for no UI value.
+		return ""
+	}
+	raw, err := json.Marshal(sg)
+	if err != nil {
+		log.Printf("[flow] subgraph marshal %q: %v (non-fatal)", flowName, err)
+		return ""
+	}
+	return string(raw)
 }
 
 // SaveDecisionMemory persists a developer decision.

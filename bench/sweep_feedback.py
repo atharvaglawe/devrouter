@@ -41,6 +41,10 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
 DEVROUTER_BIN = ROOT / "devrouter"
+# Dashboard URL: env-var override so CI can point at a non-default
+# port; default tracks the binary's own default of 8088 (the previous
+# hardcoded 8089 was a copy from an older config and caused
+# Connection refused during reseed runs).
 DASHBOARD_URL = os.environ.get("DEVROUTER_DASHBOARD_URL", "http://127.0.0.1:8088")
 
 
