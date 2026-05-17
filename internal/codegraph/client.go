@@ -387,6 +387,60 @@ func (c *Client) Extends(symbolName string, repo string) ([]CallEdge, error) {
 	return c.queryEdges(cypher, repo)
 }
 
+// CrossWireCallees returns 1-hop "wire transitions" — outbound HTTP /
+// RPC calls from `symbolName` that land on a known route handler.
+//
+// Codegraph emits two relations that, joined together, encode a
+// service-to-service call through an HTTP API:
+//
+//	(caller:Function) --FETCHES--> (route:Route) <--HANDLES_ROUTE-- (handler:Function)
+//
+// Walking just CALLS will never cross a process boundary because
+// every call chain dead-ends at the HTTP client invocation. Walking
+// FETCHES + HANDLES_ROUTE recovers the wire-side transition: from
+// `caller` (e.g. `EnforceRefresh` in weaver) to `handler` (e.g.
+// `GetCandidatesController` in kosmos) with the route URL as the
+// hop reason.
+//
+// We require the handler to be function-level (`startLine IS NOT
+// NULL`) so the BFS continues into the handler's downstream callees
+// rather than getting stuck at a File-level node. File-level
+// HANDLES_ROUTE remains in the graph as a fallback for visualisation
+// but is not promoted to a callee here.
+//
+// CallEdge.From = caller name; CallEdge.To = handler name;
+// CallEdge.FilePath = handler file (so the dashboard can place it
+// in the same column band as a regular callee). The route URL
+// itself is dropped on the floor — callers that need it should use
+// the underlying Cypher.
+func (c *Client) CrossWireCallees(symbolName string, repo string) ([]CallEdge, error) {
+	cypher := fmt.Sprintf(
+		`MATCH (caller)-[:CodeRelation {type: "FETCHES"}]->(route)<-[:CodeRelation {type: "HANDLES_ROUTE"}]-(handler)
+		 WHERE caller.name = "%s" AND handler.startLine IS NOT NULL
+		 RETURN DISTINCT caller.name AS from, handler.name AS to, handler.filePath AS file
+		 LIMIT 15`,
+		escapeCypher(symbolName),
+	)
+	return c.queryEdges(cypher, repo)
+}
+
+// CrossWireCallers is the upstream mirror of CrossWireCallees — for a
+// handler symbol, recover all function-level callers that fetch the
+// route the handler serves. Used when the seed lands on the server
+// side and we want to surface every client (across services) that
+// hits this endpoint, the same way upstream CALLS BFS surfaces
+// in-process callers.
+func (c *Client) CrossWireCallers(symbolName string, repo string) ([]CallEdge, error) {
+	cypher := fmt.Sprintf(
+		`MATCH (caller)-[:CodeRelation {type: "FETCHES"}]->(route)<-[:CodeRelation {type: "HANDLES_ROUTE"}]-(handler)
+		 WHERE handler.name = "%s" AND caller.startLine IS NOT NULL
+		 RETURN DISTINCT caller.name AS from, handler.name AS to, caller.filePath AS file
+		 LIMIT 15`,
+		escapeCypher(symbolName),
+	)
+	return c.queryEdges(cypher, repo)
+}
+
 // Methods finds HAS_METHOD relationships for a struct/interface.
 func (c *Client) Methods(symbolName string, repo string) ([]CallEdge, error) {
 	cypher := fmt.Sprintf(
@@ -458,7 +512,9 @@ type SubgraphNode struct {
 // SubgraphEdge is one directed relationship between two SubgraphNode names.
 // Type matches the codegraph CodeRelation.type the edge was derived from
 // (mostly "CALLS", with "IMPORTS" / "EXTENDS" / "HAS_METHOD" for the
-// supplementary structural relations).
+// supplementary structural relations, plus "INVOKES" for synthetic
+// wire-cross edges that fold a (FETCHES → Route ← HANDLES_ROUTE)
+// path into a single client-to-handler hop).
 type SubgraphEdge struct {
 	From string `json:"from"`
 	To   string `json:"to"`
@@ -588,26 +644,46 @@ func (c *Client) Subgraph(repo string, seeds []string) (*Subgraph, error) {
 	// new callees at depth d, and uses the *newly-added* set as the
 	// next frontier. Capping the frontier keeps the BFS bounded even
 	// on dense graphs (init/main-style functions).
+	//
+	// Wire-cross step: at each frontier node we also probe FETCHES +
+	// HANDLES_ROUTE via CrossWireCallees so the BFS jumps across the
+	// HTTP boundary. The handler symbol enters the next frontier as
+	// a "callee", which keeps the dashboard's column placement
+	// intact (callees stay on the right) while letting the BFS
+	// continue walking CALLS into the handler's downstream graph.
 	expandCalleesBFS := func(seedName string) {
 		frontier := []string{seedName}
 		for d := 1; d <= subgraphMaxDepth && len(frontier) > 0; d++ {
 			next := make([]string, 0, len(frontier)*4)
 			for _, name := range frontier {
 				callees, err := c.CalleesWithPath(name, repo)
-				if err != nil {
-					continue
-				}
-				if len(callees) >= 15 {
-					sg.Truncated = true
-				}
-				for _, e := range callees {
-					if upsertNode(e.To, e.FilePath, "callee", d) {
-						next = append(next, e.To)
+				if err == nil {
+					if len(callees) >= 15 {
+						sg.Truncated = true
 					}
-					addEdge(e.From, e.To, "CALLS")
+					for _, e := range callees {
+						if upsertNode(e.To, e.FilePath, "callee", d) {
+							next = append(next, e.To)
+						}
+						addEdge(e.From, e.To, "CALLS")
+					}
+					if len(nodes) >= subgraphMaxNodes {
+						return
+					}
 				}
-				if len(nodes) >= subgraphMaxNodes {
-					return
+				// Wire-cross — pull in HTTP/RPC handlers reached from
+				// this node and seed them into the next frontier so
+				// CALLS BFS continues on the handler side.
+				if wires, err := c.CrossWireCallees(name, repo); err == nil {
+					for _, e := range wires {
+						if upsertNode(e.To, e.FilePath, "callee", d) {
+							next = append(next, e.To)
+						}
+						addEdge(e.From, e.To, "INVOKES")
+					}
+					if len(nodes) >= subgraphMaxNodes {
+						return
+					}
 				}
 			}
 			if len(next) > subgraphMaxFrontier {
@@ -625,26 +701,41 @@ func (c *Client) Subgraph(repo string, seeds []string) (*Subgraph, error) {
 	// expandCallersBFS is the upstream mirror — same algorithm walking
 	// CallersWithPath. Negative depth so the UI can place callers in
 	// columns to the left of the seed.
+	//
+	// Wire-cross step: when the seed is server-side (a handler), we
+	// also surface every function-level client that hits the same
+	// route via CrossWireCallers. The client enters the frontier as
+	// a "caller" so upstream CALLS BFS continues from it.
 	expandCallersBFS := func(seedName string) {
 		frontier := []string{seedName}
 		for d := 1; d <= subgraphMaxDepth && len(frontier) > 0; d++ {
 			next := make([]string, 0, len(frontier)*4)
 			for _, name := range frontier {
 				callers, err := c.CallersWithPath(name, repo)
-				if err != nil {
-					continue
-				}
-				if len(callers) >= 15 {
-					sg.Truncated = true
-				}
-				for _, e := range callers {
-					if upsertNode(e.From, e.FilePath, "caller", -d) {
-						next = append(next, e.From)
+				if err == nil {
+					if len(callers) >= 15 {
+						sg.Truncated = true
 					}
-					addEdge(e.From, e.To, "CALLS")
+					for _, e := range callers {
+						if upsertNode(e.From, e.FilePath, "caller", -d) {
+							next = append(next, e.From)
+						}
+						addEdge(e.From, e.To, "CALLS")
+					}
+					if len(nodes) >= subgraphMaxNodes {
+						return
+					}
 				}
-				if len(nodes) >= subgraphMaxNodes {
-					return
+				if wires, err := c.CrossWireCallers(name, repo); err == nil {
+					for _, e := range wires {
+						if upsertNode(e.From, e.FilePath, "caller", -d) {
+							next = append(next, e.From)
+						}
+						addEdge(e.From, e.To, "INVOKES")
+					}
+					if len(nodes) >= subgraphMaxNodes {
+						return
+					}
 				}
 			}
 			if len(next) > subgraphMaxFrontier {

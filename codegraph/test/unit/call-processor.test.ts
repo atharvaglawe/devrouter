@@ -1912,7 +1912,14 @@ describe('processNextjsFetchRoutes', () => {
     const fetchCalls: ExtractedFetchCall[] = [
       { filePath: 'src/page.tsx', fetchURL: '/api/grants', lineNumber: 10 },
     ];
-    const routeRegistry = new Map([['/api/grants', 'src/app/api/grants/route.ts']]);
+    const routeRegistry = [
+      {
+        routeKey: '/api/grants',
+        pathTemplate: '/api/grants',
+        httpMethod: '*',
+        filePath: 'src/app/api/grants/route.ts',
+      },
+    ];
 
     processNextjsFetchRoutes(graph, fetchCalls, routeRegistry);
 
@@ -1931,7 +1938,14 @@ describe('processNextjsFetchRoutes', () => {
     const fetchCalls: ExtractedFetchCall[] = [
       { filePath: 'src/page.tsx', fetchURL: '/api/grants', lineNumber: 10 },
     ];
-    const routeRegistry = new Map([['/api/grants', 'src/app/api/grants/route.ts']]);
+    const routeRegistry = [
+      {
+        routeKey: '/api/grants',
+        pathTemplate: '/api/grants',
+        httpMethod: '*',
+        filePath: 'src/app/api/grants/route.ts',
+      },
+    ];
 
     const consumerContents = new Map([
       [
@@ -1964,7 +1978,14 @@ describe('processNextjsFetchRoutes', () => {
     const fetchCalls: ExtractedFetchCall[] = [
       { filePath: 'src/page.tsx', fetchURL: '/api/grants', lineNumber: 10 },
     ];
-    const routeRegistry = new Map([['/api/grants', 'src/app/api/grants/route.ts']]);
+    const routeRegistry = [
+      {
+        routeKey: '/api/grants',
+        pathTemplate: '/api/grants',
+        httpMethod: '*',
+        filePath: 'src/app/api/grants/route.ts',
+      },
+    ];
 
     const consumerContents = new Map([
       [
@@ -1994,10 +2015,20 @@ describe('processNextjsFetchRoutes', () => {
       { filePath: 'src/dashboard.tsx', fetchURL: '/api/grants', lineNumber: 10 },
       { filePath: 'src/dashboard.tsx', fetchURL: '/api/users', lineNumber: 20 },
     ];
-    const routeRegistry = new Map([
-      ['/api/grants', 'src/app/api/grants/route.ts'],
-      ['/api/users', 'src/app/api/users/route.ts'],
-    ]);
+    const routeRegistry = [
+      {
+        routeKey: '/api/grants',
+        pathTemplate: '/api/grants',
+        httpMethod: '*',
+        filePath: 'src/app/api/grants/route.ts',
+      },
+      {
+        routeKey: '/api/users',
+        pathTemplate: '/api/users',
+        httpMethod: '*',
+        filePath: 'src/app/api/users/route.ts',
+      },
+    ];
 
     const consumerContents = new Map([
       [
@@ -2030,10 +2061,20 @@ describe('processNextjsFetchRoutes', () => {
     const fetchCalls: ExtractedFetchCall[] = [
       { filePath: 'src/page.tsx', fetchURL: '/api/grants', lineNumber: 10 },
     ];
-    const routeRegistry = new Map([
-      ['/api/grants', 'src/app/api/grants/route.ts'],
-      ['/api/users', 'src/app/api/users/route.ts'],
-    ]);
+    const routeRegistry = [
+      {
+        routeKey: '/api/grants',
+        pathTemplate: '/api/grants',
+        httpMethod: '*',
+        filePath: 'src/app/api/grants/route.ts',
+      },
+      {
+        routeKey: '/api/users',
+        pathTemplate: '/api/users',
+        httpMethod: '*',
+        filePath: 'src/app/api/users/route.ts',
+      },
+    ];
 
     const consumerContents = new Map([['src/page.tsx', `const { data } = await res.json();`]]);
 

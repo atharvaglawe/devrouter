@@ -124,6 +124,9 @@ export const csharpProvider = defineLanguage({
   namedBindingExtractor: extractCSharpNamedBindings,
   interfaceNamePattern: /^I[A-Z]/,
   mroStrategy: 'implements-split',
+  // C# uses explicit `:` for interface implementation; structural-only matches
+  // collide with CRUD method names like Java does.
+  structuralImplementsEnabled: false,
   fieldExtractor: createFieldExtractor(csharpFieldConfig),
   methodExtractor: createMethodExtractor(csharpMethodConfig),
   classExtractor: createClassExtractor({

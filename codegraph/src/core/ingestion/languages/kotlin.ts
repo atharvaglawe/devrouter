@@ -105,6 +105,9 @@ export const kotlinProvider = defineLanguage({
   namedBindingExtractor: extractKotlinNamedBindings,
   importPathPreprocessor: appendKotlinWildcard,
   mroStrategy: 'implements-split',
+  // Kotlin uses explicit `:` for interface implementation; structural-only
+  // matches collide with CRUD method names like Java does.
+  structuralImplementsEnabled: false,
   fieldExtractor: createFieldExtractor(kotlinConfig),
   methodExtractor: createMethodExtractor(kotlinMethodConfig),
   classExtractor: createClassExtractor({

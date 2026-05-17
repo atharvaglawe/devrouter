@@ -21,6 +21,7 @@ import {
   processSwitchCasesFromExtracted,
   processRoutesFromExtracted,
   processNextjsFetchRoutes,
+  processProviderTagFetches,
   extractFetchCallsFromFiles,
   seedCrossFileReceiverTypes,
   buildImportedReturnTypes,
@@ -30,6 +31,17 @@ import {
 } from './call-processor.js';
 import { buildHeritageMap } from './heritage-map.js';
 import { nextjsFileToRouteURL, normalizeFetchURL } from './route-extractors/nextjs.js';
+import {
+  scanProviderConfig,
+  resolveTag as resolveProviderTag,
+} from './route-extractors/provider-resolver.js';
+import {
+  buildResolvedGetters,
+  getterKey,
+  type ConfigTagBinding,
+  type TrivialGetterBinding,
+  type ResolvedGetterMap,
+} from './route-extractors/config-tag-resolver.js';
 import { expoFileToRouteURL } from './route-extractors/expo.js';
 import { phpFileToRouteURL } from './route-extractors/php.js';
 import {
@@ -61,11 +73,13 @@ import {
   extractExtractedHeritageFromFiles,
 } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
+import { processStructuralImplements } from './structural-implements-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
 import { createResolutionContext } from './resolution-context.js';
 import { createASTCache } from './ast-cache.js';
 import { type PipelineProgress, getLanguageFromFilename } from '../../_shared/index.js';
+import type { GraphNode } from '../../_shared/graph/types.js';
 import { PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
@@ -658,6 +672,10 @@ async function runChunkedParseAndResolve(
   allToolDefs: ExtractedToolDef[];
   allORMQueries: ExtractedORMQuery[];
   bindingAccumulator: BindingAccumulator;
+  /** Struct-tag bindings collected from Go files for Phase 3.4. */
+  allConfigTags: ConfigTagBinding[];
+  /** Trivial getter functions collected from Go files for Phase 3.4. */
+  allTrivialGetters: TrivialGetterBinding[];
 }> {
   const symbolTable = ctx.symbols;
 
@@ -800,6 +818,12 @@ async function runChunkedParseAndResolve(
   // Accumulate MCP/RPC tool definitions (@mcp.tool(), @app.tool(), etc.)
   const allToolDefs: ExtractedToolDef[] = [];
   const allORMQueries: ExtractedORMQuery[] = [];
+  // Accumulate Go struct-tag bindings + trivial-getter functions for
+  // Phase 3.4. Worker path emits via WorkerExtractedData.configTags /
+  // .trivialGetters; sequential path emits via SequentialParsingExtras
+  // of the same shape. Both feed the same per-chunk merge.
+  const allConfigTags: ConfigTagBinding[] = [];
+  const allTrivialGetters: TrivialGetterBinding[] = [];
   const deferredWorkerCalls: ExtractedCall[] = [];
   const deferredWorkerHeritage: ExtractedHeritage[] = [];
   const deferredConstructorBindings: FileConstructorBindings[] = [];
@@ -817,7 +841,7 @@ async function runChunkedParseAndResolve(
         .map((p) => ({ path: p, content: chunkContents.get(p)! }));
 
       // Parse this chunk (workers or sequential fallback)
-      const chunkWorkerData = await processParsing(
+      const chunkParseResult = await processParsing(
         graph,
         chunkFiles,
         symbolTable,
@@ -839,6 +863,26 @@ async function runChunkedParseAndResolve(
         },
         workerPool,
       );
+      const chunkWorkerData = chunkParseResult.data;
+      // Sequential extras — populated only on the fallback path.
+      // Merge into the same accumulators the worker path feeds so
+      // Phase 3.5 (Route registry) sees a unified stream of routes
+      // and fetch calls regardless of which parsing mode ran.
+      if (chunkParseResult.sequentialExtras) {
+        for (const r of chunkParseResult.sequentialExtras.routes) {
+          allExtractedRoutes.push(r);
+        }
+        for (const c of chunkParseResult.sequentialExtras.fetchCalls) {
+          allFetchCalls.push(c);
+        }
+        if (chunkParseResult.sequentialExtras.configTags) {
+          for (const t of chunkParseResult.sequentialExtras.configTags) allConfigTags.push(t);
+        }
+        if (chunkParseResult.sequentialExtras.trivialGetters) {
+          for (const g of chunkParseResult.sequentialExtras.trivialGetters)
+            allTrivialGetters.push(g);
+        }
+      }
 
       const chunkBasePercent = 20 + (filesParsedSoFar / totalParseable) * 62;
 
@@ -969,6 +1013,12 @@ async function runChunkedParseAndResolve(
         }
         if (chunkWorkerData.ormQueries?.length) {
           for (const _item of chunkWorkerData.ormQueries) allORMQueries.push(_item);
+        }
+        if (chunkWorkerData.configTags?.length) {
+          for (const _item of chunkWorkerData.configTags) allConfigTags.push(_item);
+        }
+        if (chunkWorkerData.trivialGetters?.length) {
+          for (const _item of chunkWorkerData.trivialGetters) allTrivialGetters.push(_item);
         }
       } else {
         await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
@@ -1171,6 +1221,8 @@ async function runChunkedParseAndResolve(
     allToolDefs,
     allORMQueries,
     bindingAccumulator,
+    allConfigTags,
+    allTrivialGetters,
   };
 }
 
@@ -1202,6 +1254,33 @@ async function runGraphAnalysisPhases(
   if (isDev && mroResult.entries.length > 0) {
     console.log(
       `🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities, ${mroResult.overrideEdges} METHOD_OVERRIDES, ${mroResult.methodImplementsEdges} METHOD_IMPLEMENTS`,
+    );
+  }
+
+  // ── Phase 4.6: Structural IMPLEMENTS detection ─────────────────────
+  //
+  // Languages without an explicit `implements` keyword (Go, TypeScript
+  // structural typing, Python protocols) leave the heritage processor with
+  // ~zero IMPLEMENTS edges. We close that gap here by walking the graph and
+  // matching method-sets: a concrete type implements an interface when its
+  // method-set (name + arity) is a superset of the interface's. Runs after
+  // MRO so HAS_METHOD adjacency is complete, and before community detection
+  // so the new edges feed into modularity-based clustering.
+  onProgress({
+    phase: 'parsing',
+    percent: 81,
+    message: 'Detecting structural interface implementations...',
+    stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+  });
+  const structuralImplResult = processStructuralImplements(graph);
+  if (
+    isDev &&
+    (structuralImplResult.implementsEdges > 0 ||
+      structuralImplResult.methodImplementsEdges > 0)
+  ) {
+    console.log(
+      `🔌 Structural IMPLEMENTS: +${structuralImplResult.implementsEdges} IMPLEMENTS, +${structuralImplResult.methodImplementsEdges} METHOD_IMPLEMENTS ` +
+        `(${structuralImplResult.candidateConcreteTypes} concrete types × ${structuralImplResult.candidateInterfaces} interfaces, ${structuralImplResult.skippedEmptyInterfaces} empty + ${structuralImplResult.skippedSmallInterfaces} too-small + ${structuralImplResult.skippedDisabledLanguage} disabled-language interfaces skipped)`,
     );
   }
 
@@ -1428,6 +1507,8 @@ export const runPipelineFromRepo = async (
       allToolDefs,
       allORMQueries,
       bindingAccumulator,
+      allConfigTags,
+      allTrivialGetters,
     } = await runChunkedParseAndResolve(
       graph,
       ctx,
@@ -1445,8 +1526,23 @@ export const runPipelineFromRepo = async (
     // throws.
     bindingAccumulatorForCleanup = bindingAccumulator;
 
-    // ── Phase 3.5: Route Registry (Next.js + PHP + Laravel + decorators) ──
-    type RouteEntry = { filePath: string; source: string };
+    // ── Phase 3.5: Route Registry (Next.js + PHP + Laravel + decorators + Go) ──
+    // The registry is keyed by URL path so two registrations of the
+    // same path collapse into a single Route node — preserves the
+    // existing (Express / Laravel / Next.js) test contract that
+    // `app.get('/x', …)` and `app.post('/x', …)` share one node.
+    // Per-language extractors that need method-distinct nodes can
+    // post-process this map; for now we surface the discovered
+    // method via `httpMethod` on the node properties so consumers
+    // (Flow UI, matchers) can distinguish at the property level.
+    type RouteEntry = {
+      filePath: string;
+      source: string;
+      httpMethod: string;
+      pathTemplate: string;
+      handlerSymbol: string | null;
+      handlerReceiver: string | null;
+    };
     const routeRegistry = new Map<string, RouteEntry>();
 
     // Detect Expo Router app/ roots vs Next.js app/ roots (monorepo-safe).
@@ -1474,43 +1570,78 @@ export const runPipelineFromRepo = async (
       if (expoAppPaths.has(p)) {
         const expoURL = expoFileToRouteURL(p);
         if (expoURL && !routeRegistry.has(expoURL)) {
-          routeRegistry.set(expoURL, { filePath: p, source: 'expo-filesystem-route' });
+          routeRegistry.set(expoURL, {
+            filePath: p,
+            source: 'expo-filesystem-route',
+            httpMethod: '*',
+            pathTemplate: expoURL,
+            handlerSymbol: null,
+            handlerReceiver: null,
+          });
           continue;
         }
       }
       const nextjsURL = nextjsFileToRouteURL(p);
       if (nextjsURL && !routeRegistry.has(nextjsURL)) {
-        routeRegistry.set(nextjsURL, { filePath: p, source: 'nextjs-filesystem-route' });
+        routeRegistry.set(nextjsURL, {
+          filePath: p,
+          source: 'nextjs-filesystem-route',
+          httpMethod: '*',
+          pathTemplate: nextjsURL,
+          handlerSymbol: null,
+          handlerReceiver: null,
+        });
         continue;
       }
       if (p.endsWith('.php')) {
         const phpURL = phpFileToRouteURL(p);
         if (phpURL && !routeRegistry.has(phpURL)) {
-          routeRegistry.set(phpURL, { filePath: p, source: 'php-file-route' });
+          routeRegistry.set(phpURL, {
+            filePath: p,
+            source: 'php-file-route',
+            httpMethod: '*',
+            pathTemplate: phpURL,
+            handlerSymbol: null,
+            handlerReceiver: null,
+          });
         }
       }
     }
 
     const ensureSlash = (path: string) => (path.startsWith('/') ? path : '/' + path);
     let duplicateRoutes = 0;
-    const addRoute = (url: string, entry: RouteEntry) => {
-      if (routeRegistry.has(url)) {
+    const addRoute = (entry: RouteEntry) => {
+      const k = entry.pathTemplate;
+      if (routeRegistry.has(k)) {
         duplicateRoutes++;
         return;
       }
-      routeRegistry.set(url, entry);
+      routeRegistry.set(k, entry);
     };
+    if (isDev) {
+      console.log(
+        `📥 Phase 3.5 routes: extracted=${allExtractedRoutes.length} decorator=${allDecoratorRoutes.length}`,
+      );
+    }
     for (const route of allExtractedRoutes) {
       if (!route.routePath) continue;
-      addRoute(ensureSlash(route.routePath), {
+      addRoute({
         filePath: route.filePath,
         source: 'framework-route',
+        httpMethod: (route.httpMethod || '*').toUpperCase(),
+        pathTemplate: ensureSlash(route.routePath),
+        handlerSymbol: route.methodName ?? null,
+        handlerReceiver: route.controllerName ?? null,
       });
     }
     for (const dr of allDecoratorRoutes) {
-      addRoute(ensureSlash(dr.routePath), {
+      addRoute({
         filePath: dr.filePath,
         source: `decorator-${dr.decoratorName}`,
+        httpMethod: (dr.httpMethod || '*').toUpperCase(),
+        pathTemplate: ensureSlash(dr.routePath),
+        handlerSymbol: null,
+        handlerReceiver: null,
       });
     }
 
@@ -1519,6 +1650,27 @@ export const runPipelineFromRepo = async (
       const handlerPaths = [...routeRegistry.values()].map((e) => e.filePath);
       handlerContents = await readFileContents(repoPath, handlerPaths);
 
+      // One-pass index of (name → Function/Method nodes) so we can
+      // attribute HANDLES_ROUTE at function granularity when the
+      // extractor resolved a handler symbol. Built lazily — only
+      // materialised when at least one route carries a handlerSymbol.
+      let handlerIndex: Map<string, GraphNode[]> | null = null;
+      const buildHandlerIndex = (): Map<string, GraphNode[]> => {
+        if (handlerIndex) return handlerIndex;
+        const idx = new Map<string, GraphNode[]>();
+        for (const node of graph.iterNodes()) {
+          if (node.label !== 'Function' && node.label !== 'Method') continue;
+          const name = node.properties.name;
+          if (typeof name !== 'string' || !name) continue;
+          const list = idx.get(name);
+          if (list) list.push(node);
+          else idx.set(name, [node]);
+        }
+        handlerIndex = idx;
+        return idx;
+      };
+
+      let functionLevelHandlerEdges = 0;
       for (const [routeURL, entry] of routeRegistry) {
         const { filePath: handlerPath, source: routeSource } = entry;
         const content = handlerContents.get(handlerPath);
@@ -1537,14 +1689,25 @@ export const runPipelineFromRepo = async (
           id: routeNodeId,
           label: 'Route',
           properties: {
+            // `name` is the URL path — preserves the existing
+            // contract that consumers (Flow UI, tests) recognise
+            // routes by path. Method and resolved-handler info
+            // are surfaced as additional optional properties.
             name: routeURL,
             filePath: handlerPath,
+            ...(entry.httpMethod && entry.httpMethod !== '*'
+              ? { httpMethod: entry.httpMethod }
+              : {}),
+            pathTemplate: entry.pathTemplate,
+            ...(entry.handlerSymbol ? { handlerSymbol: entry.handlerSymbol } : {}),
+            ...(entry.handlerReceiver ? { handlerReceiver: entry.handlerReceiver } : {}),
             ...(responseKeys ? { responseKeys } : {}),
             ...(errorKeys ? { errorKeys } : {}),
             ...(middleware && middleware.length > 0 ? { middleware } : {}),
           },
         });
 
+        // Always emit the file-level edge as the safe fallback.
         const handlerFileId = generateId('File', handlerPath);
         graph.addRelationship({
           id: generateId('HANDLES_ROUTE', `${handlerFileId}->${routeNodeId}`),
@@ -1554,11 +1717,52 @@ export const runPipelineFromRepo = async (
           confidence: 1.0,
           reason: routeSource,
         });
+
+        // Function-level attribution. Only emit when the extractor
+        // gave us a handler symbol AND we can resolve it
+        // unambiguously (single matching Function/Method node).
+        // Ambiguous matches fall back silently to the file edge.
+        if (entry.handlerSymbol) {
+          const idx = buildHandlerIndex();
+          const candidates = idx.get(entry.handlerSymbol) ?? [];
+          // Prefer a candidate in the same file as the registration
+          // — most internal routers reference handlers within the
+          // same package — then the same directory, then unique.
+          let chosen: GraphNode | null = null;
+          if (candidates.length === 1) {
+            chosen = candidates[0];
+          } else if (candidates.length > 1) {
+            const sameFile = candidates.find(
+              (c) => c.properties.filePath === handlerPath,
+            );
+            if (sameFile) {
+              chosen = sameFile;
+            } else {
+              const handlerDir = handlerPath.replace(/\\/g, '/').split('/').slice(0, -1).join('/');
+              const sameDir = candidates.find((c) => {
+                const fp = String(c.properties.filePath ?? '').replace(/\\/g, '/');
+                return fp.startsWith(handlerDir + '/');
+              });
+              if (sameDir) chosen = sameDir;
+            }
+          }
+          if (chosen) {
+            graph.addRelationship({
+              id: generateId('HANDLES_ROUTE', `${chosen.id}->${routeNodeId}`),
+              sourceId: chosen.id,
+              targetId: routeNodeId,
+              type: 'HANDLES_ROUTE',
+              confidence: candidates.length === 1 ? 1.0 : 0.85,
+              reason: `${routeSource}|symbol:${entry.handlerSymbol}`,
+            });
+            functionLevelHandlerEdges += 1;
+          }
+        }
       }
 
       if (isDev) {
         console.log(
-          `🗺️ Route registry: ${routeRegistry.size} routes${duplicateRoutes > 0 ? ` (${duplicateRoutes} duplicate URLs skipped)` : ''}`,
+          `🗺️ Route registry: ${routeRegistry.size} routes${duplicateRoutes > 0 ? ` (${duplicateRoutes} duplicate keys skipped)` : ''}${functionLevelHandlerEdges > 0 ? `, ${functionLevelHandlerEdges} function-level HANDLES_ROUTE` : ''}`,
         );
       }
     }
@@ -1669,18 +1873,111 @@ export const runPipelineFromRepo = async (
     }
 
     if (routeRegistry.size > 0 && allFetchCalls.length > 0) {
-      const routeURLToFile = new Map<string, string>();
-      for (const [url, entry] of routeRegistry) routeURLToFile.set(url, entry.filePath);
+      const fetchRoutes = [...routeRegistry.entries()].map(([routeURL, entry]) => ({
+        routeKey: routeURL,
+        pathTemplate: entry.pathTemplate,
+        httpMethod: entry.httpMethod,
+        filePath: entry.filePath,
+      }));
 
       // Read consumer file contents so we can extract property access patterns
       const consumerPaths = [...new Set(allFetchCalls.map((c) => c.filePath))];
       const consumerContents = await readFileContents(repoPath, consumerPaths);
 
-      processNextjsFetchRoutes(graph, allFetchCalls, routeURLToFile, consumerContents);
+      processNextjsFetchRoutes(graph, allFetchCalls, fetchRoutes, consumerContents);
       if (isDev) {
         console.log(
           `🔗 Processed ${allFetchCalls.length} fetch() calls against ${routeRegistry.size} routes`,
         );
+      }
+
+      // ── Phase 3.4: Config-tag resolver (Go edge-walking) ──
+      // Fold every Go file's struct-tag bindings + trivial-getter
+      // functions into a `(receiver|"*"::name) → Set<tag>` map.
+      // This lets us recover a `providerTag` for non-literal call
+      // sites whose URL/path/host field is built from a config
+      // accessor like `config.GetABTestApiConfig().ApiPath` —
+      // entirely from static AST evidence, no string-mining heuristics.
+      const pendingCalls = allFetchCalls.filter(
+        (c) => !c.providerTag && (c.pendingGetterLookups?.length ?? 0) > 0,
+      );
+
+      // ── Phase 3.5: Provider-tag join ──
+      // For client calls whose URL is not statically recoverable but
+      // a provider tag is — either as a literal `providerTag` field
+      // or recovered from the resolver above — emit FETCHES edges to
+      // every Route under the resolved service-dir.
+      const initialTagOnly = allFetchCalls.filter(
+        (c) => c.providerTag && (!c.fetchURL || c.fetchURL === ''),
+      ).length;
+
+      if (initialTagOnly > 0 || pendingCalls.length > 0) {
+        try {
+          const providerIdx = await scanProviderConfig(repoPath);
+
+          // Phase 3.4 backfill — only build the resolver map if we
+          // actually have pending calls. The map itself is bounded
+          // by config-tag count × getter count, both of which are
+          // tiny in practice.
+          let backfilled = 0;
+          if (
+            pendingCalls.length > 0 &&
+            (allConfigTags.length > 0 || allTrivialGetters.length > 0)
+          ) {
+            const resolvedGetters: ResolvedGetterMap = buildResolvedGetters(
+              allConfigTags,
+              allTrivialGetters,
+            );
+            for (const c of pendingCalls) {
+              if (!c.pendingGetterLookups) continue;
+              for (const lk of c.pendingGetterLookups) {
+                const candidates = new Set<string>();
+                const a = resolvedGetters.get(getterKey(lk.receiver, lk.name));
+                const b = resolvedGetters.get(getterKey(null, lk.name));
+                if (a) for (const t of a) candidates.add(t);
+                if (b) for (const t of b) candidates.add(t);
+                // Pick the first candidate the provider-resolver
+                // index already knows about. This filters out tag
+                // values that aren't actually bound to a service —
+                // e.g. `path`/`host` sub-keys on a nested struct.
+                let chosen: string | null = null;
+                for (const t of candidates) {
+                  if (resolveProviderTag(t, providerIdx)) {
+                    chosen = t;
+                    break;
+                  }
+                }
+                if (chosen) {
+                  c.providerTag = chosen;
+                  backfilled++;
+                  break;
+                }
+              }
+            }
+            if (isDev) {
+              console.log(
+                `🔗 Config-tag resolver: ${pendingCalls.length} pending calls, ` +
+                  `${backfilled} backfilled providerTag ` +
+                  `(getters=${resolvedGetters.size}, fields=${allConfigTags.length})`,
+              );
+            }
+          }
+
+          const tagOnlyAfter = allFetchCalls.filter(
+            (c) => c.providerTag && (!c.fetchURL || c.fetchURL === ''),
+          ).length;
+          const emitted = processProviderTagFetches(graph, allFetchCalls, (tag) => {
+            const info = resolveProviderTag(tag, providerIdx);
+            return info ? { serviceDirs: info.serviceDirs, confidence: info.confidence } : null;
+          });
+          if (isDev) {
+            console.log(
+              `🔗 Provider-tag resolver: ${tagOnlyAfter} tag-only calls → ${emitted} FETCHES edges (tags=${providerIdx.byTag.size})`,
+            );
+          }
+        } catch (err) {
+          if (isDev) console.warn('Provider-tag resolver failed:', err);
+        }
       }
     }
 

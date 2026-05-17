@@ -233,6 +233,9 @@ export const phpProvider = defineLanguage({
   exportChecker: phpExportChecker,
   importResolver: resolvePhpImport,
   namedBindingExtractor: extractPhpNamedBindings,
+  // PHP uses explicit `implements`; structural-only matches collide with
+  // common method names like Java/Kotlin.
+  structuralImplementsEnabled: false,
   fieldExtractor: createFieldExtractor(phpFieldConfig),
   methodExtractor: createMethodExtractor(phpMethodConfig),
   classExtractor: createClassExtractor({

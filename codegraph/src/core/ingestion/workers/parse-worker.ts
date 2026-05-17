@@ -65,6 +65,24 @@ import { extractParsedCallSite } from '../call-sites/extract-language-call-site.
 import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
+import { extractGoApiEndpoints } from '../route-extractors/api-endpoint-go.js';
+import { extractJavaApiEndpoints } from '../route-extractors/api-endpoint-java.js';
+import { extractPythonApiEndpoints } from '../route-extractors/api-endpoint-python.js';
+import type { ExtractedApiEndpoints } from '../route-extractors/api-endpoint-types.js';
+import {
+  extractGoConfigTags,
+  extractGoTrivialGetters,
+  type ConfigTagBinding,
+  type TrivialGetterBinding,
+} from '../route-extractors/config-tag-resolver.js';
+import {
+  extractJavaConfigTags,
+  extractJavaTrivialGetters,
+} from '../route-extractors/config-tag-java.js';
+import {
+  extractPythonConfigTags,
+  extractPythonTrivialGetters,
+} from '../route-extractors/config-tag-python.js';
 import { generateId } from '../../../lib/utils.js';
 import { preprocessImportPath } from '../import-processor.js';
 import {
@@ -212,8 +230,28 @@ export interface ExtractedRoute {
 
 export interface ExtractedFetchCall {
   filePath: string;
+  /** Statically recovered URL or path. May be empty when the call
+   *  is provider-tag-only (`httpclient.GetClient("kosmos")`); the
+   *  provider-tag resolver in pipeline.ts joins by `providerTag`
+   *  in that case. */
   fetchURL: string;
   lineNumber: number;
+  /** Logical service tag (Spring `@FeignClient(name="kosmos")`,
+   *  Go `httpclient.GetClient("kosmos")`). Optional — set only by
+   *  the per-language API extractors. */
+  providerTag?: string | null;
+  /** HTTP method when the extractor recovered one. */
+  httpMethod?: string | null;
+  /** Bare name of the enclosing function, when known. */
+  callerSymbol?: string | null;
+  /** Receiver / class owning the caller method, when known. */
+  callerReceiver?: string | null;
+  /** Pending getter-chain lookups recorded by the extractor when
+   *  the call site's URL/path/host RHS was non-literal but contained
+   *  a function/method call. Phase 3.4 in pipeline.ts resolves these
+   *  via struct-tag bindings to backfill {@link providerTag}. Carried
+   *  as a serialisable shape so it survives the worker IPC boundary. */
+  pendingGetterLookups?: Array<{ receiver: string | null; name: string }>;
 }
 
 export interface ExtractedDecoratorRoute {
@@ -292,6 +330,10 @@ export interface ParseWorkerResult {
   constructorBindings: FileConstructorBindings[];
   /** All-scope type bindings from TypeEnv for BindingAccumulator (includes function-local). */
   fileScopeBindings: FileScopeBindings[];
+  /** Struct-tag bindings (Go) — see config-tag-resolver.ts. */
+  configTags: ConfigTagBinding[];
+  /** Trivial getter functions (Go) — see config-tag-resolver.ts. */
+  trivialGetters: TrivialGetterBinding[];
   skippedLanguages: Record<string, number>;
   fileCount: number;
 }
@@ -723,6 +765,8 @@ const processBatch = (
     ormQueries: [],
     constructorBindings: [],
     fileScopeBindings: [],
+    configTags: [],
+    trivialGetters: [],
     skippedLanguages: {},
     fileCount: 0,
   };
@@ -2225,6 +2269,68 @@ const processFileGroup = (
       result.routes.push(...extractedRoutes);
     }
 
+    // Extract API endpoints — language-generic shape detection. Each
+    // per-language extractor returns normalized {routes, clientCalls}
+    // which we adapt onto the existing ExtractedRoute /
+    // ExtractedFetchCall channels so the downstream Route node /
+    // HANDLES_ROUTE / FETCHES wiring is reused as-is.
+    let apiResult: ExtractedApiEndpoints | null = null;
+    if (language === SupportedLanguages.Go) {
+      apiResult = extractGoApiEndpoints(tree.rootNode, file.path);
+      // Config-tag resolver inputs — folded into a getter →
+      // tag-set map by pipeline.ts Phase 3.4 so that non-literal
+      // URL/path/host RHSs (e.g. `config.GetXyzApiConfig().ApiPath`,
+      // `props.getKosmosUrl()`) can still emit a providerTag.
+      const cts = extractGoConfigTags(tree.rootNode, file.path);
+      if (cts.length > 0) result.configTags.push(...cts);
+      const tgs = extractGoTrivialGetters(tree.rootNode, file.path);
+      if (tgs.length > 0) result.trivialGetters.push(...tgs);
+    } else if (language === SupportedLanguages.Java) {
+      apiResult = extractJavaApiEndpoints(tree.rootNode, file.path);
+      const cts = extractJavaConfigTags(tree.rootNode, file.path);
+      if (cts.length > 0) result.configTags.push(...cts);
+      const tgs = extractJavaTrivialGetters(tree.rootNode, file.path);
+      if (tgs.length > 0) result.trivialGetters.push(...tgs);
+    } else if (language === SupportedLanguages.Python) {
+      apiResult = extractPythonApiEndpoints(tree.rootNode, file.path);
+      const cts = extractPythonConfigTags(tree.rootNode, file.path);
+      if (cts.length > 0) result.configTags.push(...cts);
+      const tgs = extractPythonTrivialGetters(tree.rootNode, file.path);
+      if (tgs.length > 0) result.trivialGetters.push(...tgs);
+    }
+    if (apiResult) {
+      for (const r of apiResult.routes) {
+        result.routes.push({
+          filePath: r.filePath,
+          httpMethod: r.method,
+          routePath: r.pathTemplate,
+          controllerName: r.handlerReceiver,
+          methodName: r.handlerSymbol,
+          middleware: [],
+          prefix: null,
+          lineNumber: r.lineNumber,
+        });
+      }
+      for (const c of apiResult.clientCalls) {
+        // Calls with no static join key *and* no pending getter
+        // chain to resolve are dropped. Tag-only and pending-lookup
+        // calls flow through to be resolved against config + service-dir
+        // hints at Phase 3.4 / 3.5.
+        const hasPending = (c.pendingGetterLookups?.length ?? 0) > 0;
+        if (!c.pathLiteral && !c.providerTag && !hasPending) continue;
+        result.fetchCalls.push({
+          filePath: c.filePath,
+          fetchURL: c.pathLiteral ?? '',
+          lineNumber: c.lineNumber,
+          providerTag: c.providerTag,
+          httpMethod: c.method,
+          callerSymbol: c.callerSymbol,
+          callerReceiver: c.callerReceiver,
+          pendingGetterLookups: c.pendingGetterLookups,
+        });
+      }
+    }
+
     // Extract ORM queries (Prisma, Supabase)
     extractORMQueries(file.path, parseContent, result.ormQueries);
 
@@ -2264,6 +2370,8 @@ let accumulated: ParseWorkerResult = {
   ormQueries: [],
   constructorBindings: [],
   fileScopeBindings: [],
+  configTags: [],
+  trivialGetters: [],
   skippedLanguages: {},
   fileCount: 0,
 };
@@ -2292,6 +2400,8 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   appendAll(target.ormQueries, src.ormQueries);
   appendAll(target.constructorBindings, src.constructorBindings);
   appendAll(target.fileScopeBindings, src.fileScopeBindings);
+  appendAll(target.configTags, src.configTags);
+  appendAll(target.trivialGetters, src.trivialGetters);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -2344,6 +2454,8 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
         ormQueries: [],
         constructorBindings: [],
         fileScopeBindings: [],
+        configTags: [],
+        trivialGetters: [],
         skippedLanguages: {},
         fileCount: 0,
       };

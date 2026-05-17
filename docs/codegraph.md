@@ -23,7 +23,12 @@ turns a query into a response, see
 retrieval-shaping rules DevRouter applies on top of codegraph's raw
 output (intent-aware search mode routing, snippet dedup, graph
 relevance filtering, anchor injection, parallel fan-out), see
-[`codegraph-heuristics.md`](codegraph-heuristics.md).
+[`codegraph-heuristics.md`](codegraph-heuristics.md). For the
+extractor and structural-edge work that landed on top of the initial
+codegraph implementation (generic API-endpoint extraction across
+Go / Java / Python, provider-tag and config-tag resolution,
+structural IMPLEMENTS detection), see
+[`codegraph-fixes.md`](codegraph-fixes.md).
 
 ## Where it sits
 

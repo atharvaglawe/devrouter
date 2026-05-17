@@ -21,6 +21,15 @@ import (
 	"github.com/atharva-ag/devrouter/internal/prompt"
 )
 
+// funnelDebug toggles the verbose `[funnel] files=[...]` logs that list
+// every candidate path at each pipeline stage. The lists can run to
+// 100KB+ on traversal-heavy queries and will block any caller that
+// pipes stderr without a draining reader (e.g. the bench harness).
+// Off by default; enable with DEVROUTER_FUNNEL_LOG=1 when running
+// bench/diagnose_funnel.py or other one-shot diagnostics that
+// redirect stderr to a file.
+var funnelDebug = os.Getenv("DEVROUTER_FUNNEL_LOG") != ""
+
 type Router struct {
 	Graph      *codegraph.Client
 	Memory     *memory.Store
@@ -159,8 +168,14 @@ type graphBudget struct {
 // fetchExtends, fetchMethods, fetchImports) stay as intent-driven defaults
 // because turning them off entirely is a coarser decision than the bandit
 // is ready to make in v1.
-func graphBudgetFromProfile(p heuristics.Profile, memCount int, intent Intent) graphBudget {
-	p = p.ApplyMemoryShrink(memCount)
+//
+// filePointingMemCount counts only memory types that carry a path the
+// agent can act on (`file`, `func`). `flow`/`decision` memories trigger
+// on almost every query in repos seeded with generic process flows but
+// don't contribute scorable file pointers, so they should not gate the
+// shrink decision. See ApplyMemoryShrink doc + bench/diagnose_funnel.py.
+func graphBudgetFromProfile(p heuristics.Profile, filePointingMemCount int, intent Intent) graphBudget {
+	p = p.ApplyMemoryShrink(filePointingMemCount)
 	gb := graphBudget{
 		maxTrace:     p.MaxTrace,
 		callerHops:   p.CallerHops,
@@ -173,11 +188,11 @@ func graphBudgetFromProfile(p heuristics.Profile, memCount int, intent Intent) g
 	// Boolean fetch flag overrides — mirror the previous strong-memory
 	// shrink behaviour for booleans only (numeric shrink already applied
 	// by ApplyMemoryShrink above).
-	if memCount >= 3 {
+	if filePointingMemCount >= 3 {
 		gb.fetchExtends = false
 		gb.fetchMethods = false
 		gb.fetchImports = false
-	} else if memCount >= 2 {
+	} else if filePointingMemCount >= 2 {
 		gb.fetchExtends = false
 		gb.fetchMethods = false
 	}
@@ -354,6 +369,11 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 		Query:     query,
 		Timestamp: time.Now().UnixMilli(),
 		Signals:   make(map[string]float64),
+	}
+
+	if funnelDebug {
+		log.Printf("[funnel] qid=%s stage=enter query=%q repo=%s",
+			trace.QueryID, query, repo)
 	}
 
 	// --- INTENT ---
@@ -613,11 +633,19 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	memRes := buildAllMemories(rerankedHits, repoPath)
 
 	memCount := 0
+	filePointingMemCount := 0
 	if memRes.agent != nil {
 		memCount = len(memRes.agent.Files) + len(memRes.agent.Functions) + len(memRes.agent.Flows) + len(memRes.agent.Decisions)
+		// Only `file` and `func` memories carry a path the agent / bench
+		// can resolve. `flow` and `decision` memories may contribute to
+		// the prompt narrative but their primary_context entries have
+		// no `file` field — gating the strong-memory shrink on raw
+		// memCount over-counted these and crushed graph budget on
+		// flow-heavy repos. See heuristics.Profile.ApplyMemoryShrink.
+		filePointingMemCount = len(memRes.agent.Files) + len(memRes.agent.Functions)
 	}
-	log.Printf("[router] intent=%s memory_agent=%d auto_hints=%d",
-		intent, memCount, len(memRes.autoHints))
+	log.Printf("[router] intent=%s memory_agent=%d file_pointing=%d auto_hints=%d",
+		intent, memCount, filePointingMemCount, len(memRes.autoHints))
 
 	// effectiveQuery folds plan terms into the search vocabulary so name/content
 	// Cypher and queryKeywords pick them up. Deterministic when planner is nil.
@@ -664,6 +692,26 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 		}
 	}
 
+	// [funnel] stage 1: raw codegraph search results, before any rerank.
+	// Logs the symbol count, the unique file count, and the file paths so
+	// we can see exactly what enters the pipeline. Bounded at 10 candidates
+	// today; the funnel diagnosis lives in bench/results FINDINGS.
+	{
+		seen := map[string]bool{}
+		var paths []string
+		for _, sr := range searchResults {
+			if sr.FilePath == "" || seen[sr.FilePath] {
+				continue
+			}
+			seen[sr.FilePath] = true
+			paths = append(paths, sr.FilePath)
+		}
+		if funnelDebug {
+			log.Printf("[funnel] qid=%s stage=search symbols=%d unique_files=%d files=%v",
+				trace.QueryID, len(searchResults), len(paths), paths)
+		}
+	}
+
 	if pkgPath != "" {
 		searchResults = boostByPath(searchResults, pkgPath)
 	}
@@ -672,10 +720,14 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 
 	// Merge auto hints as additional seed symbols for graph traversal
 	hintSymbols := dedupAppend(symbols, memRes.autoHints)
+	if funnelDebug {
+		log.Printf("[funnel] qid=%s stage=hints symbols=%d hint_symbols=%d (auto_hints=%d)",
+			trace.QueryID, len(symbols), len(hintSymbols), len(memRes.autoHints))
+	}
 
 	// --- BUDGETED GRAPH TRAVERSAL ---
 	graphStartTime := time.Now()
-	gb := graphBudgetFromProfile(profile, memCount, intent)
+	gb := graphBudgetFromProfile(profile, filePointingMemCount, intent)
 	log.Printf("[router] graph budget: maxTrace=%d callerHops=%d callees=%v extends=%v methods=%v imports=%v profile=%s",
 		gb.maxTrace, gb.callerHops, gb.fetchCallees, gb.fetchExtends, gb.fetchMethods, gb.fetchImports, profileID)
 
@@ -1029,6 +1081,59 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	}
 	snippets := codegraph.ToSnippets(searchResults, snippetCap)
 
+	// [funnel] stage 2: post-graph-traversal. Counts the distinct files
+	// surfaced across snippets + chain (up/down) + graph buckets, before
+	// PrimaryContext / anchor injection / dedup. This is the largest
+	// candidate pool we ever build internally.
+	{
+		seen := map[string]bool{}
+		add := func(p string) {
+			if p != "" {
+				seen[p] = true
+			}
+		}
+		for _, s := range snippets {
+			add(s.File)
+		}
+		if chain != nil {
+			for _, e := range chain.Upstream {
+				add(e.FilePath)
+			}
+			for _, e := range chain.Downstream {
+				add(e.FilePath)
+			}
+		}
+		if graph != nil {
+			for _, e := range graph.Importers {
+				add(e.FilePath)
+			}
+			for _, e := range graph.Extends {
+				add(e.FilePath)
+			}
+			for _, e := range graph.Methods {
+				add(e.FilePath)
+			}
+			for _, p := range graph.Siblings {
+				add(p)
+			}
+		}
+		var chU, chD, gI, gE, gM, gS int
+		if chain != nil {
+			chU = len(chain.Upstream)
+			chD = len(chain.Downstream)
+		}
+		if graph != nil {
+			gI = len(graph.Importers)
+			gE = len(graph.Extends)
+			gM = len(graph.Methods)
+			gS = len(graph.Siblings)
+		}
+		if funnelDebug {
+			log.Printf("[funnel] qid=%s stage=traversal snippets=%d chain_up=%d chain_down=%d graph_imp=%d graph_ext=%d graph_meth=%d graph_sib=%d unique_files=%d",
+				trace.QueryID, len(snippets), chU, chD, gI, gE, gM, gS, len(seen))
+		}
+	}
+
 	// --- PRIMARY CONTEXT (flat list from agent memories) ---
 	primaryCtx := buildPrimaryContext(memRes)
 
@@ -1103,6 +1208,53 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	dp.Graph = graph
 	dp.ModelHint = modelHint(memCount)
 
+	// [funnel] stage 3: final DevPrompt — what the agent actually sees.
+	// Walks the same buckets the bench adapter walks, in the same order,
+	// dedup-by-path. This is the metric the bench scores.
+	{
+		seen := map[string]bool{}
+		var finalFiles []string
+		add := func(p string) {
+			if p == "" || seen[p] {
+				return
+			}
+			seen[p] = true
+			finalFiles = append(finalFiles, p)
+		}
+		for _, e := range dp.PrimaryContext {
+			add(e.File)
+		}
+		for _, s := range dp.CodeSnippets {
+			add(s.File)
+		}
+		if dp.CallChain != nil {
+			for _, e := range dp.CallChain.Upstream {
+				add(e.FilePath)
+			}
+			for _, e := range dp.CallChain.Downstream {
+				add(e.FilePath)
+			}
+		}
+		if dp.Graph != nil {
+			for _, e := range dp.Graph.Importers {
+				add(e.FilePath)
+			}
+			for _, e := range dp.Graph.Extends {
+				add(e.FilePath)
+			}
+			for _, e := range dp.Graph.Methods {
+				add(e.FilePath)
+			}
+			for _, p := range dp.Graph.Siblings {
+				add(p)
+			}
+		}
+		if funnelDebug {
+			log.Printf("[funnel] qid=%s stage=final primary_ctx=%d snippets=%d unique_files=%d files=%v",
+				trace.QueryID, len(dp.PrimaryContext), len(dp.CodeSnippets), len(finalFiles), finalFiles)
+		}
+	}
+
 	// Always surface the active plan so dev_context callers can see what
 	// drove retrieval (or that nothing did) without grepping stderr.
 	// Source = "agent" when the caller supplied a plan, "auto" when only
@@ -1127,7 +1279,88 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 		}
 	}
 
-	trimmed := trimResponse(&dp, profile, memCount)
+	// [funnel] stage 4: AFTER trimResponse. ApplyMemoryShrink can crush
+	// MaxSnippets to 1 and MaxSiblings to 3 when memCount>=3 — for repos
+	// with many generic flow memories (like mall) almost every query hits
+	// this clamp and returns ≤4 files even when the search/traversal
+	// pool had the answer further down.
+	preTrim := struct {
+		PC, Sn, ChU, ChD, GI, GE, GM, GS int
+	}{
+		PC: len(dp.PrimaryContext), Sn: len(dp.CodeSnippets),
+	}
+	if dp.CallChain != nil {
+		preTrim.ChU = len(dp.CallChain.Upstream)
+		preTrim.ChD = len(dp.CallChain.Downstream)
+	}
+	if dp.Graph != nil {
+		preTrim.GI = len(dp.Graph.Importers)
+		preTrim.GE = len(dp.Graph.Extends)
+		preTrim.GM = len(dp.Graph.Methods)
+		preTrim.GS = len(dp.Graph.Siblings)
+	}
+
+	trimmed := trimResponse(&dp, profile, filePointingMemCount)
+
+	{
+		var ChU, ChD, GI, GE, GM, GS int
+		if dp.CallChain != nil {
+			ChU = len(dp.CallChain.Upstream)
+			ChD = len(dp.CallChain.Downstream)
+		}
+		if dp.Graph != nil {
+			GI = len(dp.Graph.Importers)
+			GE = len(dp.Graph.Extends)
+			GM = len(dp.Graph.Methods)
+			GS = len(dp.Graph.Siblings)
+		}
+		seen := map[string]bool{}
+		add := func(p string) {
+			if p != "" {
+				seen[p] = true
+			}
+		}
+		for _, e := range dp.PrimaryContext {
+			add(e.File)
+		}
+		for _, s := range dp.CodeSnippets {
+			add(s.File)
+		}
+		if dp.CallChain != nil {
+			for _, e := range dp.CallChain.Upstream {
+				add(e.FilePath)
+			}
+			for _, e := range dp.CallChain.Downstream {
+				add(e.FilePath)
+			}
+		}
+		if dp.Graph != nil {
+			for _, e := range dp.Graph.Importers {
+				add(e.FilePath)
+			}
+			for _, e := range dp.Graph.Extends {
+				add(e.FilePath)
+			}
+			for _, e := range dp.Graph.Methods {
+				add(e.FilePath)
+			}
+			for _, p := range dp.Graph.Siblings {
+				add(p)
+			}
+		}
+		if funnelDebug {
+			log.Printf("[funnel] qid=%s stage=trimmed memCount=%d filePointing=%d dropped=%d "+
+				"pc=%d->%d snip=%d->%d chU=%d->%d chD=%d->%d "+
+				"gImp=%d->%d gExt=%d->%d gMeth=%d->%d gSib=%d->%d unique_files=%d",
+				trace.QueryID, memCount, filePointingMemCount, trimmed,
+				preTrim.PC, len(dp.PrimaryContext),
+				preTrim.Sn, len(dp.CodeSnippets),
+				preTrim.ChU, ChU, preTrim.ChD, ChD,
+				preTrim.GI, GI, preTrim.GE, GE,
+				preTrim.GM, GM, preTrim.GS, GS,
+				len(seen))
+		}
+	}
 
 	// Record packing stage and finalize trace
 	finalTokens := estimateTokens(&dp)
@@ -1384,9 +1617,10 @@ type trimConfig struct {
 }
 
 // trimCapsFromProfile derives the runtime trim caps from a Profile, with
-// the strong-memory shrink rules applied on top.
-func trimCapsFromProfile(p heuristics.Profile, memCount int) trimConfig {
-	p = p.ApplyMemoryShrink(memCount)
+// the strong-memory shrink rules applied on top. See ApplyMemoryShrink
+// doc — the count argument is *file-pointing* memories only.
+func trimCapsFromProfile(p heuristics.Profile, filePointingMemCount int) trimConfig {
+	p = p.ApplyMemoryShrink(filePointingMemCount)
 	return trimConfig{
 		maxUpstream:   p.MaxUpstream,
 		maxDownstream: p.MaxDownstream,
@@ -1405,8 +1639,8 @@ func trimCapsFromProfile(p heuristics.Profile, memCount int) trimConfig {
 // strength. Returns the count of items that were dropped (across all
 // sections) so the caller can record it as Outcome.TrimmedFiles for
 // trim-aggressiveness analysis.
-func trimResponse(dp *prompt.DevPrompt, profile heuristics.Profile, memCount int) int {
-	tc := trimCapsFromProfile(profile, memCount)
+func trimResponse(dp *prompt.DevPrompt, profile heuristics.Profile, filePointingMemCount int) int {
+	tc := trimCapsFromProfile(profile, filePointingMemCount)
 	dropped := 0
 
 	if dp.CallChain != nil {
