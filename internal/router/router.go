@@ -1214,7 +1214,7 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	// must not break the dev_context response.
 	if r.Heuristics != nil {
 		memKeys := agentMemoryKeys(memRes)
-		fields := traceHashFields(trace, repo, query, string(intent), profileID, profile, memKeys)
+		fields := traceHashFields(trace, repo, query, string(intent), profileID, profile, planSource, plan, memKeys)
 		if err := r.Heuristics.Store.PutTrace(context.Background(), trace.QueryID, fields); err != nil {
 			log.Printf("[router] persist trace failed (non-fatal): %v", err)
 		}
@@ -1242,7 +1242,7 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 // memory_keys (CSV) is added when this trace returned at least one
 // agent-written memory. dev_feedback uses it to attribute false
 // positives back to specific memory records.
-func traceHashFields(t *prompt.RetrievalTrace, repo, query, intent, profileID string, p heuristics.Profile, memKeys []string) map[string]interface{} {
+func traceHashFields(t *prompt.RetrievalTrace, repo, query, intent, profileID string, p heuristics.Profile, planSource string, plan QueryPlan, memKeys []string) map[string]interface{} {
 	fields := map[string]interface{}{
 		"query_id":             t.QueryID,
 		"query":                query,
@@ -1254,6 +1254,13 @@ func traceHashFields(t *prompt.RetrievalTrace, repo, query, intent, profileID st
 		"profile_caller_hops":  fmt.Sprintf("%d", p.CallerHops),
 		"final_tokens":         fmt.Sprintf("%d", t.FinalTokens),
 		"total_latency_ms":     fmt.Sprintf("%d", t.TotalLatencyMs),
+		"plan_source":          planSource,
+		"plan_auto_anchored":   fmt.Sprintf("%t", plan.MustAutoAnchored),
+		"plan_must_terms":      encodeStringSlice(plan.MustTerms),
+		"plan_should_terms":    encodeStringSlice(plan.ShouldTerms),
+		"plan_exclude_terms":   encodeStringSlice(plan.ExcludeTerms),
+		"plan_phrases":         encodeStringSlice(plan.Phrases),
+		"plan_context_hints":   encodeStringSlice(plan.ContextHints),
 	}
 	if len(memKeys) > 0 {
 		fields["memory_keys"] = strings.Join(memKeys, ",")
@@ -1280,6 +1287,14 @@ func traceHashFields(t *prompt.RetrievalTrace, repo, query, intent, profileID st
 		fields["latency_ms"] = fmt.Sprintf("%d", t.Outcome.LatencyMs)
 	}
 	return fields
+}
+
+func encodeStringSlice(in []string) string {
+	b, err := json.Marshal(in)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
 }
 
 func modelHint(memCount int) *prompt.ModelHint {
@@ -2919,7 +2934,7 @@ func (r *Router) SaveFuncMemory(repo, name, file, purpose, callers, callees, sco
 // codegraph unreachable, all queries returning nothing) is logged and
 // swallowed so the flow itself still saves cleanly. Without a
 // snapshot, the dashboard falls back to the legacy bipartite SVG.
-func (r *Router) SaveFlowMemory(repo, name, purpose, files, entryPoints, scope string) error {
+func (r *Router) SaveFlowMemory(repo, name, purpose, files, entryPoints, scope, queryID string) error {
 	if repo == "" || name == "" || purpose == "" {
 		return fmt.Errorf("repo, name, and purpose are required")
 	}
@@ -2927,7 +2942,26 @@ func (r *Router) SaveFlowMemory(repo, name, purpose, files, entryPoints, scope s
 		scope = memory.ScopeForFiles(r.Graph.RepoPath(repo), files)
 	}
 
-	subgraphJSON := snapshotFlowSubgraph(r.Graph, repo, entryPoints, name)
+	plan := QueryPlan{}
+	switch {
+	case queryID == "":
+		log.Printf("[flow] save %q: no query_id supplied — snapshot will be unfiltered", name)
+	case r.Heuristics == nil || r.Heuristics.Store == nil:
+		log.Printf("[flow] save %q: heuristics store unavailable — snapshot will be unfiltered (query_id=%s)", name, queryID)
+	default:
+		fields, err := r.Heuristics.Store.GetTrace(context.Background(), queryID)
+		switch {
+		case err != nil:
+			log.Printf("[flow] save %q: trace lookup query_id=%s failed: %v — snapshot will be unfiltered", name, queryID, err)
+		case len(fields) == 0:
+			log.Printf("[flow] save %q: no trace stored for query_id=%s — snapshot will be unfiltered", name, queryID)
+		default:
+			plan = tracePlanFromFields(fields)
+			log.Printf("[flow] save %q: loaded plan from query_id=%s (must=%v should=%v exclude=%v hints=%v)",
+				name, queryID, plan.MustTerms, plan.ShouldTerms, plan.ExcludeTerms, plan.ContextHints)
+		}
+	}
+	subgraphJSON := snapshotFlowSubgraph(r.Graph, repo, entryPoints, name, plan)
 
 	err := r.Memory.SaveFlow(memory.FlowMemory{
 		Repo:         repo,
@@ -2937,6 +2971,7 @@ func (r *Router) SaveFlowMemory(repo, name, purpose, files, entryPoints, scope s
 		EntryPoints:  entryPoints,
 		Source:       "agent",
 		Scope:        scope,
+		QueryID:      queryID,
 		SubgraphJSON: subgraphJSON,
 	})
 	// Flow memories list multiple files (CSV) — credit each one as
@@ -2954,7 +2989,7 @@ func (r *Router) SaveFlowMemory(repo, name, purpose, files, entryPoints, scope s
 // drop into FlowMemory.SubgraphJSON. Returns "" on any failure — that
 // signals the dashboard to fall back to the existing bipartite SVG
 // without breaking the save path.
-func snapshotFlowSubgraph(graph *codegraph.Client, repo, entryPoints, flowName string) string {
+func snapshotFlowSubgraph(graph *codegraph.Client, repo, entryPoints, flowName string, plan QueryPlan) string {
 	if graph == nil || repo == "" {
 		return ""
 	}
@@ -2976,12 +3011,412 @@ func snapshotFlowSubgraph(graph *codegraph.Client, repo, entryPoints, flowName s
 		// an empty subgraph that just adds bytes for no UI value.
 		return ""
 	}
+	if planIsEmpty(plan) {
+		log.Printf("[flow] subgraph %q: plan empty, snapshot kept as-is (nodes=%d edges=%d)",
+			flowName, len(sg.Nodes), len(sg.Edges))
+	} else {
+		beforeNodes, beforeEdges := len(sg.Nodes), len(sg.Edges)
+		sg = filterSubgraphByPlan(sg, plan, seeds)
+		afterNodes, afterEdges := 0, 0
+		if sg != nil {
+			afterNodes, afterEdges = len(sg.Nodes), len(sg.Edges)
+		}
+		log.Printf("[flow] subgraph filtered %q: nodes %d->%d edges %d->%d (must=%v exclude=%v hints=%v)",
+			flowName, beforeNodes, afterNodes, beforeEdges, afterEdges,
+			plan.MustTerms, plan.ExcludeTerms, plan.ContextHints)
+	}
+
+	// Collapse function-level subgraph into file-level so the Flow UI
+	// renders one node per file (cleaner, fewer edges, no per-function
+	// fan-out). The agent's symbol-level dev_context is unaffected —
+	// this only shapes the persisted snapshot used by the dashboard.
+	if sg != nil {
+		beforeNodes, beforeEdges := len(sg.Nodes), len(sg.Edges)
+		sg = collapseSubgraphToFileLevel(sg, seeds)
+		afterNodes, afterEdges := 0, 0
+		if sg != nil {
+			afterNodes, afterEdges = len(sg.Nodes), len(sg.Edges)
+		}
+		log.Printf("[flow] subgraph collapsed-to-files %q: nodes %d->%d edges %d->%d",
+			flowName, beforeNodes, afterNodes, beforeEdges, afterEdges)
+	}
 	raw, err := json.Marshal(sg)
 	if err != nil {
 		log.Printf("[flow] subgraph marshal %q: %v (non-fatal)", flowName, err)
 		return ""
 	}
 	return string(raw)
+}
+
+// tracePlanFromFields reconstructs the stored QueryPlan snapshot from
+// feedback:trace:{query_id}. JSON array fields are preferred; CSV fallback
+// keeps old rows readable if the storage format changes.
+func tracePlanFromFields(fields map[string]string) QueryPlan {
+	p := QueryPlan{
+		MustTerms:        decodeStringSlice(fields["plan_must_terms"]),
+		ShouldTerms:      decodeStringSlice(fields["plan_should_terms"]),
+		ExcludeTerms:     decodeStringSlice(fields["plan_exclude_terms"]),
+		Phrases:          decodeStringSlice(fields["plan_phrases"]),
+		ContextHints:     decodeStringSlice(fields["plan_context_hints"]),
+		MustAutoAnchored: fields["plan_auto_anchored"] == "true",
+	}
+	// Keep the same sanitization path used for live query plans.
+	sanitized := SanitizePlan(p)
+	sanitized.MustAutoAnchored = p.MustAutoAnchored
+	return sanitized
+}
+
+func decodeStringSlice(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err == nil {
+		return out
+	}
+	return splitCSV(raw)
+}
+
+// filterSubgraphByPlan applies a plan-aware relevance gate to a saved
+// Subgraph snapshot.
+//
+// agentSeeds is the original entry_points list the agent supplied. Only
+// names in this list are treated as "protected" — they're never pruned.
+// Any other name in sg.Seeds is a synthetic bare-name fallback added
+// inside codegraph.Subgraph() when a qualified seed didn't resolve;
+// those go through the same must-term gate as a regular node so noisy
+// fallbacks like "Init"/"Run" don't anchor unrelated chains.
+//
+// Policy (node-level):
+//   - Protected seeds (in agentSeeds) are always kept.
+//   - A seed is "relevant" only if its own name/file path contains a
+//     must-term. Synthetic seeds that don't carry the plan's anchor are
+//     demoted: their adjacent nodes don't get a free pass.
+//   - A non-seed (or non-protected seed) node is kept iff:
+//   - its own name+file contains a must-term, OR
+//   - it sits 1 hop away from a *relevant* seed (preserves immediate
+//     flow context for nodes the plan didn't directly name).
+//   - ExcludeTerms always drop matching nodes.
+//
+// Edges are kept only when both endpoints survive. Edge-level structural
+// text is intentionally not the gate: when one endpoint already carries
+// the must-term it would mask the other endpoint's irrelevance, which is
+// exactly the leak that produced the noise on bare-name seeds.
+func filterSubgraphByPlan(sg *codegraph.Subgraph, plan QueryPlan, agentSeeds []string) *codegraph.Subgraph {
+	if sg == nil || (len(plan.MustTerms) == 0 && len(plan.ExcludeTerms) == 0) {
+		return sg
+	}
+	nodesByName := make(map[string]codegraph.SubgraphNode, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		nodesByName[n.Name] = n
+	}
+	nodeText := func(name string) string {
+		n := nodesByName[name]
+		return strings.ToLower(n.Name + " " + n.FilePath)
+	}
+
+	protected := make(map[string]bool, len(agentSeeds))
+	for _, s := range agentSeeds {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			protected[s] = true
+		}
+	}
+
+	seedSet := make(map[string]bool, len(sg.Seeds))
+	relevantSeed := make(map[string]bool, len(sg.Seeds))
+	for _, s := range sg.Seeds {
+		seedSet[s] = true
+		if len(plan.MustTerms) == 0 || containsAnyTerm(nodeText(s), plan.MustTerms) {
+			relevantSeed[s] = true
+		}
+	}
+
+	// Hop-1 adjacency pass: which nodes touch a relevant seed via *any*
+	// edge type. Used as a free-pass for must-term gating below.
+	adjacentToRelevant := make(map[string]bool, 32)
+	for _, e := range sg.Edges {
+		if relevantSeed[e.From] {
+			adjacentToRelevant[e.To] = true
+		}
+		if relevantSeed[e.To] {
+			adjacentToRelevant[e.From] = true
+		}
+	}
+
+	keepNode := make(map[string]bool, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if protected[n.Name] {
+			// Agent-supplied entry point: always keep.
+			keepNode[n.Name] = true
+			continue
+		}
+		if shouldExcludeGraphTarget(n.Name, n.FilePath, plan.ExcludeTerms) {
+			continue
+		}
+		text := nodeText(n.Name)
+		if len(plan.MustTerms) == 0 || containsAnyTerm(text, plan.MustTerms) {
+			keepNode[n.Name] = true
+			continue
+		}
+		// Free-pass only for true 1-hop neighbours of a relevant seed.
+		// Synthetic seeds (Init/Run/etc.) without must-term match never
+		// trigger this branch, so their unrelated neighbours all drop.
+		if absInt(n.Depth) == 1 && adjacentToRelevant[n.Name] {
+			keepNode[n.Name] = true
+			continue
+		}
+	}
+
+	keptEdges := make([]codegraph.SubgraphEdge, 0, len(sg.Edges))
+	for _, e := range sg.Edges {
+		if !keepNode[e.From] || !keepNode[e.To] {
+			continue
+		}
+		keptEdges = append(keptEdges, e)
+	}
+
+	// Drop kept-but-orphan nodes. Protected seeds survive even when
+	// orphaned (they preserve the band even if codegraph found no
+	// neighbours). Synthetic seeds with no surviving edges are dropped.
+	referenced := make(map[string]bool, len(protected))
+	for s := range protected {
+		referenced[s] = true
+	}
+	for _, e := range keptEdges {
+		referenced[e.From] = true
+		referenced[e.To] = true
+	}
+	keptNodes := make([]codegraph.SubgraphNode, 0, len(sg.Nodes))
+	survivingSeeds := make([]string, 0, len(sg.Seeds))
+	survivingSeedSet := make(map[string]bool, len(sg.Seeds))
+	for _, n := range sg.Nodes {
+		if !keepNode[n.Name] || !referenced[n.Name] {
+			continue
+		}
+		keptNodes = append(keptNodes, n)
+		if seedSet[n.Name] {
+			survivingSeedSet[n.Name] = true
+		}
+	}
+	for _, s := range sg.Seeds {
+		if survivingSeedSet[s] {
+			survivingSeeds = append(survivingSeeds, s)
+		}
+	}
+
+	out := *sg
+	out.Seeds = survivingSeeds
+	out.Nodes = keptNodes
+	out.Edges = keptEdges
+	return &out
+}
+
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// fileRoleRank ranks aggregated file-level roles. Lower wins when a
+// single file contains functions in multiple roles (e.g. a file with
+// both a seed function and a callee should render as a seed file).
+func fileRoleRank(role string) int {
+	switch role {
+	case "seed":
+		return 0
+	case "caller":
+		return 1
+	case "callee":
+		return 2
+	case "method":
+		return 3
+	case "extends":
+		return 4
+	case "importer":
+		return 5
+	}
+	return 9
+}
+
+// collapseSubgraphToFileLevel reshapes a function-level Subgraph into a
+// file-level one: every unique file path becomes a single node, and
+// edges between functions become edges between their containing files
+// (deduped, self-loops removed). Nodes whose source file is unknown
+// (synthetic bare-name fallback symbols, importer rows whose only
+// identity IS the file path) are still represented so callers see a
+// complete picture.
+//
+// Why file-level: the per-function graph fan-outs hard on hubs like
+// logger / error helper functions, producing dense low-information
+// visualisations. The user's flow-level mental model is "which files
+// participate", not "which functions". Aggregating preserves the
+// interesting structure (which packages call into / are called from
+// the seed file) while collapsing noise.
+//
+// agentSeeds is the agent-supplied entry-point list. The file
+// containing any agent seed is marked as a "seed file" even when
+// the function-level role got demoted by an earlier filter pass.
+func collapseSubgraphToFileLevel(sg *codegraph.Subgraph, agentSeeds []string) *codegraph.Subgraph {
+	if sg == nil {
+		return sg
+	}
+
+	// Resolve each function's containing file. Importer-role nodes
+	// have Name = filename and FilePath = full path; treat their
+	// FilePath as authoritative. Function nodes likewise rely on
+	// FilePath. Nodes without a path (synthetic bare-name fallback)
+	// can't be aggregated and are dropped — by the time we get here
+	// they should already be filtered out, but be defensive.
+	fnToFile := make(map[string]string, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n.FilePath == "" {
+			continue
+		}
+		fnToFile[n.Name] = n.FilePath
+	}
+
+	// Per-file aggregate: best role + closest-to-seed depth across
+	// all functions in that file.
+	type fileAgg struct {
+		path     string
+		role     string
+		roleRank int
+		depth    int
+	}
+	files := make(map[string]*fileAgg, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n.FilePath == "" {
+			continue
+		}
+		rank := fileRoleRank(n.Role)
+		agg, ok := files[n.FilePath]
+		if !ok {
+			files[n.FilePath] = &fileAgg{
+				path: n.FilePath, role: n.Role, roleRank: rank, depth: n.Depth,
+			}
+			continue
+		}
+		switch {
+		case rank < agg.roleRank:
+			agg.role = n.Role
+			agg.roleRank = rank
+			agg.depth = n.Depth
+		case rank == agg.roleRank && absInt(n.Depth) < absInt(agg.depth):
+			agg.depth = n.Depth
+		}
+	}
+
+	// Promote files containing any agent-supplied seed to "seed".
+	// Anchor the bands to what the user actually asked for, even if
+	// the qualified name resolved to a non-seed role for some reason.
+	for _, s := range agentSeeds {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		fp := fnToFile[s]
+		if fp == "" {
+			continue
+		}
+		if agg := files[fp]; agg != nil {
+			agg.role = "seed"
+			agg.roleRank = fileRoleRank("seed")
+			agg.depth = 0
+		}
+	}
+
+	// Build node list — keyed by full path so edges have a stable,
+	// unique identifier. The dashboard renderer detects path-shaped
+	// names and renders basename / dirname appropriately.
+	outNodes := make([]codegraph.SubgraphNode, 0, len(files))
+	for path, agg := range files {
+		outNodes = append(outNodes, codegraph.SubgraphNode{
+			Name:     path,
+			FilePath: path,
+			Role:     agg.role,
+			Depth:    agg.depth,
+		})
+	}
+	sort.Slice(outNodes, func(i, j int) bool {
+		ri, rj := fileRoleRank(outNodes[i].Role), fileRoleRank(outNodes[j].Role)
+		if ri != rj {
+			return ri < rj
+		}
+		return outNodes[i].Name < outNodes[j].Name
+	})
+
+	// Resolve edge endpoints to files. For function-to-function
+	// edges, look up the file via fnToFile. For IMPORTS where one
+	// side is already a file-shaped node (Name == basename, FilePath
+	// == full path), the FilePath wins. Drop self-loops (intra-file
+	// calls aren't interesting at file granularity).
+	type edgeKey struct{ from, to, typ string }
+	resolveSide := func(name string) string {
+		if fp, ok := fnToFile[name]; ok {
+			return fp
+		}
+		return ""
+	}
+	seen := make(map[edgeKey]bool, len(sg.Edges))
+	outEdges := make([]codegraph.SubgraphEdge, 0, len(sg.Edges))
+	for _, e := range sg.Edges {
+		from := resolveSide(e.From)
+		to := resolveSide(e.To)
+		if from == "" || to == "" || from == to {
+			continue
+		}
+		if files[from] == nil || files[to] == nil {
+			continue
+		}
+		k := edgeKey{from: from, to: to, typ: e.Type}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		outEdges = append(outEdges, codegraph.SubgraphEdge{From: from, To: to, Type: e.Type})
+	}
+	sort.Slice(outEdges, func(i, j int) bool {
+		if outEdges[i].Type != outEdges[j].Type {
+			return outEdges[i].Type < outEdges[j].Type
+		}
+		if outEdges[i].From != outEdges[j].From {
+			return outEdges[i].From < outEdges[j].From
+		}
+		return outEdges[i].To < outEdges[j].To
+	})
+
+	// Seeds list: file paths of seed files, preserving original
+	// agent-seed order so the UI stacks them predictably.
+	seenSeed := make(map[string]bool, len(agentSeeds))
+	outSeeds := make([]string, 0, len(agentSeeds))
+	for _, s := range agentSeeds {
+		fp := fnToFile[strings.TrimSpace(s)]
+		if fp == "" || seenSeed[fp] {
+			continue
+		}
+		if files[fp] == nil {
+			continue
+		}
+		seenSeed[fp] = true
+		outSeeds = append(outSeeds, fp)
+	}
+	// Anything still tagged as "seed" but not driven by an agent
+	// entry point — append in deterministic order.
+	for _, n := range outNodes {
+		if n.Role == "seed" && !seenSeed[n.Name] {
+			seenSeed[n.Name] = true
+			outSeeds = append(outSeeds, n.Name)
+		}
+	}
+
+	out := *sg
+	out.Seeds = outSeeds
+	out.Nodes = outNodes
+	out.Edges = outEdges
+	return &out
 }
 
 // SaveDecisionMemory persists a developer decision.

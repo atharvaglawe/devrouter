@@ -194,6 +194,7 @@ func (s *Server) toolDefinitions() []map[string]any {
 					"purpose":      map[string]any{"type": "string", "description": "Step-by-step description of the flow: what triggers it, what happens, which files, where data flows"},
 					"files":        map[string]any{"type": "string", "description": "Key file paths involved (comma-separated)"},
 					"entry_points": map[string]any{"type": "string", "description": "Entry point functions that kick off this flow (comma-separated)"},
+					"query_id":     map[string]any{"type": "string", "description": "Optional query_id from dev_context. When supplied, devrouter reuses the stored query plan to filter noisy graph edges before snapshotting the flow graph."},
 					"scope":        map[string]any{"type": "string", "description": "Scope override. Use \"global\" to share across all branches. Omit to auto-detect: if any file differs from the release branch, scope is set to the current branch; otherwise \"global\"."},
 				},
 				"required": []string{"repo", "name", "purpose"},
@@ -279,6 +280,9 @@ func (s *Server) toolDefinitions() []map[string]any {
 				"if you forget it, devrouter falls back to the most recent dev_context call on this connection " +
 				"(best-effort). `additional_files` is the count of files you had to read beyond what dev_context " +
 				"returned (zero is best). " +
+				"If a saved flow drove your work, pass `flow_id` as \"{repo}/{flow_name}\" so the dashboard can " +
+				"score each file in the flow as useful or dead weight. Use `missing_files` to report files you " +
+				"needed but the flow didn't include — they appear in the dashboard as 'augmented' nodes. " +
 				"This is the primary signal that lets devrouter tune its budget/trim heuristics over time.",
 			"inputSchema": map[string]any{
 				"type": "object",
@@ -288,6 +292,8 @@ func (s *Server) toolDefinitions() []map[string]any {
 					"revisited_files":  map[string]any{"type": "integer", "description": "Count of files you read more than once during the task (optional)"},
 					"file_paths":       map[string]any{"type": "string", "description": "File paths you ended up reading (comma-separated, optional; used to detect over-aggressive trimming)"},
 					"success":          map[string]any{"type": "boolean", "description": "Whether the task was completed successfully (optional)"},
+					"flow_id":          map[string]any{"type": "string", "description": "Saved flow that drove this task, formatted \"{repo}/{flow_name}\" (optional; sourced from a flow-typed entry in primary_context)"},
+					"missing_files":    map[string]any{"type": "string", "description": "Files you needed but the matched flow didn't include (comma-separated, optional; surfaces as augmented nodes on the dashboard)"},
 				},
 				"required": []string{"additional_files"},
 			},
@@ -485,12 +491,13 @@ func (s *Server) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
 			Purpose     string `json:"purpose"`
 			Files       string `json:"files"`
 			EntryPoints string `json:"entry_points"`
+			QueryID     string `json:"query_id"`
 			Scope       string `json:"scope"`
 		}
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return s.errResp(req.ID, -32602, "invalid arguments: "+err.Error())
 		}
-		if err := s.router.SaveFlowMemory(args.Repo, args.Name, args.Purpose, args.Files, args.EntryPoints, args.Scope); err != nil {
+		if err := s.router.SaveFlowMemory(args.Repo, args.Name, args.Purpose, args.Files, args.EntryPoints, args.Scope, args.QueryID); err != nil {
 			return s.errResp(req.ID, -32000, err.Error())
 		}
 		return s.success(req.ID, map[string]any{

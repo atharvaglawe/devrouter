@@ -422,3 +422,284 @@ func TestMemoryStructuralVsFreetext(t *testing.T) {
 		t.Error("free-text missing 'error'")
 	}
 }
+
+// TestFilterSubgraphByPlanRelevantSeedAdjacency is the regression test for
+// the "lots of noise from bare-name fallback seeds" Flow UI bug.
+//
+// Reproduces a real captured snapshot for the
+// `{must=[rps multipage], context_hints=[rps]}` plan where:
+//   - "MultiPageRpsSERP.Init" is the agent's qualified entry point.
+//   - "Init" is a synthetic bare-name fallback seed (added inside
+//     codegraph.Subgraph because the qualified form didn't resolve).
+//
+// Assertions:
+//   - 1-hop callees of the relevant seed survive even when their own
+//     name doesn't carry the must term (immediate flow context).
+//   - The synthetic "Init" seed is itself dropped, taking its unrelated
+//     callers/callees and incoming IMPORTS with it.
+//   - 2-hop nodes that directly match a must-term are kept.
+func TestFilterSubgraphByPlanRelevantSeedAdjacency(t *testing.T) {
+	sg := &codegraph.Subgraph{
+		Seeds: []string{"MultiPageRpsSERP.Init", "Init"},
+		Nodes: []codegraph.SubgraphNode{
+			{Name: "MultiPageRpsSERP.Init", Role: "seed", Depth: 0,
+				FilePath: "oscar/app/pkg/multipagerpsserp/multipagerpsserp.go"},
+			{Name: "Init", Role: "seed", Depth: 0},
+			{Name: "SetMultiPageRpsData", Role: "callee", Depth: 1,
+				FilePath: "cmpkg/cme/setters.go"},
+			{Name: "AddSingleParams", Role: "callee", Depth: 1,
+				FilePath: "cmpkg/cme/setters.go"},
+			{Name: "chnm3", Role: "callee", Depth: 1,
+				FilePath: "cmpkg/channelname/chnm3.go"},
+			{Name: "EnableLogging", Role: "callee", Depth: 1,
+				FilePath: "lib/stdlog/debugapplog.go"},
+			{Name: "GetRpsProviderId", Role: "callee", Depth: 2,
+				FilePath: "cmpkg/rpsencryptedparams/getters.go"},
+			{Name: "Tag", Role: "callee", Depth: 2,
+				FilePath: "lib/debug/taggableVardump.go"},
+			{Name: "factory.go", Role: "importer", Depth: 1,
+				FilePath: "cmpkg/relink/buyplatforms/factory.go"},
+		},
+		Edges: []codegraph.SubgraphEdge{
+			{From: "MultiPageRpsSERP.Init", To: "SetMultiPageRpsData", Type: "CALLS"},
+			{From: "MultiPageRpsSERP.Init", To: "AddSingleParams", Type: "CALLS"},
+			{From: "SetMultiPageRpsData", To: "GetRpsProviderId", Type: "CALLS"},
+			{From: "AddSingleParams", To: "Tag", Type: "CALLS"},
+			{From: "Init", To: "chnm3", Type: "CALLS"},
+			{From: "Init", To: "EnableLogging", Type: "CALLS"},
+			{From: "factory.go", To: "Init", Type: "IMPORTS"},
+		},
+	}
+
+	plan := QueryPlan{
+		MustTerms:    []string{"rps", "multipage"},
+		ContextHints: []string{"rps"},
+	}
+	// Only the qualified form was supplied by the agent. "Init" is
+	// a synthetic bare-name fallback that should NOT be protected.
+	agentSeeds := []string{"MultiPageRpsSERP.Init"}
+
+	out := filterSubgraphByPlan(sg, plan, agentSeeds)
+	if out == nil {
+		t.Fatal("filterSubgraphByPlan returned nil")
+	}
+
+	gotNames := make(map[string]bool, len(out.Nodes))
+	for _, n := range out.Nodes {
+		gotNames[n.Name] = true
+	}
+	mustKeep := []string{
+		"MultiPageRpsSERP.Init", // protected agent seed
+		"SetMultiPageRpsData",   // hop-1 to relevant seed
+		"AddSingleParams",       // hop-1 to relevant seed
+		"GetRpsProviderId",      // direct must-term match (rps)
+	}
+	for _, name := range mustKeep {
+		if !gotNames[name] {
+			t.Errorf("expected %q to survive filter, got nodes=%v", name, gotNames)
+		}
+	}
+	mustDrop := []string{
+		"Init",          // synthetic bare-name seed, not protected
+		"chnm3",         // hop-1 to synthetic seed
+		"EnableLogging", // hop-1 to synthetic seed
+		"Tag",           // hop-2, no must match
+		"factory.go",    // IMPORTS hub, importer doesn't match must
+	}
+	for _, name := range mustDrop {
+		if gotNames[name] {
+			t.Errorf("expected %q to be dropped, but it survived. nodes=%v", name, gotNames)
+		}
+	}
+
+	survivingSeeds := make(map[string]bool, len(out.Seeds))
+	for _, s := range out.Seeds {
+		survivingSeeds[s] = true
+	}
+	if survivingSeeds["Init"] {
+		t.Error("synthetic seed 'Init' should be removed from out.Seeds")
+	}
+	if !survivingSeeds["MultiPageRpsSERP.Init"] {
+		t.Error("agent seed 'MultiPageRpsSERP.Init' should remain in out.Seeds")
+	}
+
+	for _, e := range out.Edges {
+		if !gotNames[e.From] || !gotNames[e.To] {
+			t.Errorf("dangling edge after filter: %s -> %s (%s)", e.From, e.To, e.Type)
+		}
+	}
+}
+
+// TestFilterSubgraphByPlanProtectsAgentSeedsLiteral covers the
+// edge case where the agent literally supplies a generic name like
+// "Init" as an entry_point — we must respect that and keep it even
+// when it doesn't match must-terms.
+func TestFilterSubgraphByPlanProtectsAgentSeedsLiteral(t *testing.T) {
+	sg := &codegraph.Subgraph{
+		Seeds: []string{"Init"},
+		Nodes: []codegraph.SubgraphNode{
+			{Name: "Init", Role: "seed", Depth: 0},
+			{Name: "noise", Role: "callee", Depth: 1, FilePath: "lib/x.go"},
+		},
+		Edges: []codegraph.SubgraphEdge{
+			{From: "Init", To: "noise", Type: "CALLS"},
+		},
+	}
+	out := filterSubgraphByPlan(sg, QueryPlan{MustTerms: []string{"rps"}}, []string{"Init"})
+	got := make(map[string]bool, len(out.Nodes))
+	for _, n := range out.Nodes {
+		got[n.Name] = true
+	}
+	if !got["Init"] {
+		t.Error("agent-supplied 'Init' should be protected even without must-term match")
+	}
+	if got["noise"] {
+		t.Error("non-relevant callee of literal-but-irrelevant seed should still drop")
+	}
+}
+
+// TestFilterSubgraphByPlanEmptyPlanIsPassthrough guards against the
+// filter accidentally dropping nodes when no plan is supplied (e.g.
+// snapshots saved without query_id).
+func TestFilterSubgraphByPlanEmptyPlanIsPassthrough(t *testing.T) {
+	sg := &codegraph.Subgraph{
+		Seeds: []string{"S"},
+		Nodes: []codegraph.SubgraphNode{
+			{Name: "S", Role: "seed", Depth: 0},
+			{Name: "X", Role: "callee", Depth: 1, FilePath: "lib/x.go"},
+		},
+		Edges: []codegraph.SubgraphEdge{
+			{From: "S", To: "X", Type: "CALLS"},
+		},
+	}
+	out := filterSubgraphByPlan(sg, QueryPlan{}, []string{"S"})
+	if len(out.Nodes) != 2 || len(out.Edges) != 1 {
+		t.Errorf("empty plan should be a no-op: got nodes=%d edges=%d, want 2/1",
+			len(out.Nodes), len(out.Edges))
+	}
+}
+
+// TestCollapseSubgraphToFileLevel asserts the function-level subgraph
+// is correctly aggregated into one node per file:
+//   - Multiple functions in the same file collapse to a single node.
+//   - Self-loops (intra-file calls) are dropped.
+//   - The agent-supplied seed's containing file is the seed file.
+//   - Edge endpoints are full file paths so the node Name is unique.
+//   - Duplicate function-edges between the same pair of files dedupe
+//     to one file edge.
+func TestCollapseSubgraphToFileLevel(t *testing.T) {
+	sg := &codegraph.Subgraph{
+		Seeds: []string{"pkg.Seed"},
+		Nodes: []codegraph.SubgraphNode{
+			{Name: "pkg.Seed", Role: "seed", Depth: 0, FilePath: "a/seed.go"},
+			{Name: "pkg.HelperA", Role: "callee", Depth: 1, FilePath: "a/seed.go"},
+			{Name: "pkg.HelperB", Role: "callee", Depth: 1, FilePath: "a/helpers.go"},
+			{Name: "pkg.HelperC", Role: "callee", Depth: 2, FilePath: "a/helpers.go"},
+			{Name: "pkg.Logger", Role: "callee", Depth: 1, FilePath: "lib/log.go"},
+		},
+		Edges: []codegraph.SubgraphEdge{
+			// Intra-file: dropped after collapse.
+			{From: "pkg.Seed", To: "pkg.HelperA", Type: "CALLS"},
+			// a/seed.go → a/helpers.go (two function edges, dedupe to one).
+			{From: "pkg.Seed", To: "pkg.HelperB", Type: "CALLS"},
+			{From: "pkg.HelperA", To: "pkg.HelperC", Type: "CALLS"},
+			// a/seed.go → lib/log.go.
+			{From: "pkg.Seed", To: "pkg.Logger", Type: "CALLS"},
+		},
+	}
+	out := collapseSubgraphToFileLevel(sg, []string{"pkg.Seed"})
+	if out == nil {
+		t.Fatal("collapseSubgraphToFileLevel returned nil")
+	}
+
+	gotFiles := make(map[string]codegraph.SubgraphNode, len(out.Nodes))
+	for _, n := range out.Nodes {
+		gotFiles[n.Name] = n
+	}
+	wantPaths := []string{"a/seed.go", "a/helpers.go", "lib/log.go"}
+	for _, p := range wantPaths {
+		if _, ok := gotFiles[p]; !ok {
+			t.Errorf("expected file node %q, got %v", p, gotFiles)
+		}
+	}
+	if len(out.Nodes) != 3 {
+		t.Errorf("expected 3 file nodes, got %d (%v)", len(out.Nodes), out.Nodes)
+	}
+	if got := gotFiles["a/seed.go"].Role; got != "seed" {
+		t.Errorf("a/seed.go role: got %q, want seed", got)
+	}
+	if got := gotFiles["a/seed.go"].FilePath; got != "a/seed.go" {
+		t.Errorf("a/seed.go FilePath: got %q, want a/seed.go", got)
+	}
+
+	// Two file edges: a/seed.go -> a/helpers.go (dedup of 2 fn edges)
+	// and a/seed.go -> lib/log.go.
+	if len(out.Edges) != 2 {
+		t.Fatalf("expected 2 deduped file edges, got %d (%+v)", len(out.Edges), out.Edges)
+	}
+	type pair struct{ from, to string }
+	seen := make(map[pair]bool)
+	for _, e := range out.Edges {
+		if e.From == e.To {
+			t.Errorf("self-loop survived collapse: %+v", e)
+		}
+		seen[pair{e.From, e.To}] = true
+	}
+	for _, want := range []pair{{"a/seed.go", "a/helpers.go"}, {"a/seed.go", "lib/log.go"}} {
+		if !seen[want] {
+			t.Errorf("missing file edge %s -> %s", want.from, want.to)
+		}
+	}
+
+	if len(out.Seeds) != 1 || out.Seeds[0] != "a/seed.go" {
+		t.Errorf("Seeds: got %v, want [a/seed.go]", out.Seeds)
+	}
+}
+
+// TestCollapseSubgraphToFileLevelMultipleSeedsInSameFile verifies that
+// when several agent seeds resolve to the same file, the file shows up
+// as a seed node exactly once.
+func TestCollapseSubgraphToFileLevelMultipleSeedsInSameFile(t *testing.T) {
+	sg := &codegraph.Subgraph{
+		Seeds: []string{"pkg.SeedA", "pkg.SeedB"},
+		Nodes: []codegraph.SubgraphNode{
+			{Name: "pkg.SeedA", Role: "seed", Depth: 0, FilePath: "a/file.go"},
+			{Name: "pkg.SeedB", Role: "seed", Depth: 0, FilePath: "a/file.go"},
+		},
+	}
+	out := collapseSubgraphToFileLevel(sg, []string{"pkg.SeedA", "pkg.SeedB"})
+	if len(out.Nodes) != 1 || out.Nodes[0].Name != "a/file.go" {
+		t.Errorf("expected one seed file node, got %+v", out.Nodes)
+	}
+	if len(out.Seeds) != 1 || out.Seeds[0] != "a/file.go" {
+		t.Errorf("seeds dedup: got %v", out.Seeds)
+	}
+}
+
+// TestFilterSubgraphByPlanExcludeOnly verifies exclude terms apply even
+// when no must-terms are supplied.
+func TestFilterSubgraphByPlanExcludeOnly(t *testing.T) {
+	sg := &codegraph.Subgraph{
+		Seeds: []string{"S"},
+		Nodes: []codegraph.SubgraphNode{
+			{Name: "S", Role: "seed", Depth: 0},
+			{Name: "AdClickHandler", Role: "callee", Depth: 1, FilePath: "ad/handler.go"},
+			{Name: "ConfigLoader_test", Role: "callee", Depth: 1, FilePath: "config/loader_test.go"},
+		},
+		Edges: []codegraph.SubgraphEdge{
+			{From: "S", To: "AdClickHandler", Type: "CALLS"},
+			{From: "S", To: "ConfigLoader_test", Type: "CALLS"},
+		},
+	}
+	out := filterSubgraphByPlan(sg, QueryPlan{ExcludeTerms: []string{"test"}}, []string{"S"})
+	got := make(map[string]bool, len(out.Nodes))
+	for _, n := range out.Nodes {
+		got[n.Name] = true
+	}
+	if !got["AdClickHandler"] {
+		t.Error("AdClickHandler should be kept")
+	}
+	if got["ConfigLoader_test"] {
+		t.Error("ConfigLoader_test should be excluded by 'test'")
+	}
+}
