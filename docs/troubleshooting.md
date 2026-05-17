@@ -39,3 +39,9 @@ If a query still misbehaves after the table above:
    Older binaries omit `memory_keys` / `memory_recall_count`; their presence
    confirms you're on the post-Phase A/B build.
 3. File an issue with the trace contents attached.
+
+## Related
+
+- [`staleness.md`](staleness.md) — automated git-based staleness
+  detection (memory blob-hash drift, codegraph index commit drift,
+  release-branch scope diff).

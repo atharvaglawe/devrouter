@@ -28,7 +28,9 @@ extractor and structural-edge work that landed on top of the initial
 codegraph implementation (generic API-endpoint extraction across
 Go / Java / Python, provider-tag and config-tag resolution,
 structural IMPLEMENTS detection), see
-[`codegraph-fixes.md`](codegraph-fixes.md).
+[`codegraph-fixes.md`](codegraph-fixes.md). For how index drift,
+memory git-hash drift, and the relevance-decay loop are detected
+and handled across the system, see [`staleness.md`](staleness.md).
 
 ## Where it sits
 
