@@ -145,15 +145,26 @@ func (p Profile) Clip() Profile {
 // applied inside graphBudgetFromMemory and trimCaps. Lives outside the
 // bandit so it doesn't have to relearn that strong primary memory means
 // a tighter prompt is fine.
-func (p Profile) ApplyMemoryShrink(memCount int) Profile {
-	if memCount >= 3 {
+//
+// The input is intentionally *file-pointing* memory count, not the raw
+// memCount: only `file` and `func` memories carry a path the agent (or
+// the bench) can resolve. `flow` and `decision` memories trigger on
+// almost every query in repos seeded with generic process flows (see
+// bench/memories/mall.jsonl) but their primary_context entries have
+// no `file` field, so shrinking the graph budget on their account
+// crushes recall without a corresponding gain in memory-derived
+// confidence. The original heuristic over-counted those types and
+// dropped the bench-visible budget to ≤4 files; the funnel diagnosis
+// is in bench/results/_funnel.stderr.log + canvas methodology notes.
+func (p Profile) ApplyMemoryShrink(filePointingMemCount int) Profile {
+	if filePointingMemCount >= 3 {
 		if p.MaxTrace > 2 {
 			p.MaxTrace = 2
 		}
 		if p.CallerHops > 1 {
 			p.CallerHops = 1
 		}
-	} else if memCount >= 2 {
+	} else if filePointingMemCount >= 2 {
 		if p.MaxTrace > 3 {
 			p.MaxTrace = 3
 		}
@@ -162,7 +173,7 @@ func (p Profile) ApplyMemoryShrink(memCount int) Profile {
 		}
 	}
 
-	if memCount >= 1 {
+	if filePointingMemCount >= 1 {
 		if p.MaxSymbols > 5 {
 			p.MaxSymbols = 5
 		}
@@ -173,7 +184,7 @@ func (p Profile) ApplyMemoryShrink(memCount int) Profile {
 			p.MaxSiblings = 5
 		}
 	}
-	if memCount >= 3 {
+	if filePointingMemCount >= 3 {
 		if p.MaxSnippets > 1 {
 			p.MaxSnippets = 1
 		}

@@ -89,6 +89,20 @@ export type NodeProperties = {
   responseKeys?: string[];
   errorKeys?: string[];
   middleware?: string[];
+  // Route node identity (set on label === 'Route')
+  /** Uppercased HTTP method (`GET`, `POST`, …) or `*` for filesystem-based
+   *  routes (Next.js, Expo, PHP) where the framework does not encode a method. */
+  httpMethod?: string;
+  /** Route path template as registered (`/users/:id` / `/users/{id}`). The
+   *  matcher normalises framework-specific parameter syntax before joining
+   *  to client-side URLs. */
+  pathTemplate?: string;
+  /** Bare name of the handler function/method when the per-language route
+   *  extractor recovered one (e.g. `GetCandidatesController`). Drives
+   *  function-level `HANDLES_ROUTE` attribution. */
+  handlerSymbol?: string;
+  /** Receiver / class owning the handler method when known. */
+  handlerReceiver?: string;
   // Extensible
   [key: string]: unknown;
 };

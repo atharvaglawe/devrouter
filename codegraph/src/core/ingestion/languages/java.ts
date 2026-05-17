@@ -30,6 +30,10 @@ export const javaProvider = defineLanguage({
   namedBindingExtractor: extractJavaNamedBindings,
   interfaceNamePattern: /^I[A-Z]/,
   mroStrategy: 'implements-split',
+  // Java uses explicit `implements`; the heritage processor captures every
+  // real implementation. Structural-only matches collide with CRUD method
+  // names (controllers end up "implementing" every small service interface).
+  structuralImplementsEnabled: false,
   fieldExtractor: createFieldExtractor(javaConfig),
   methodExtractor: createMethodExtractor(javaMethodConfig),
   classExtractor: createClassExtractor({

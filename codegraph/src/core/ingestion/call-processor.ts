@@ -1,4 +1,5 @@
 import { KnowledgeGraph } from '../graph/types.js';
+import type { GraphNode } from '../../_shared/graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import type { SymbolDefinition, SymbolTable } from './symbol-table.js';
 import { CLASS_TYPES, CALLABLE_TYPES } from './symbol-table.js';
@@ -3140,24 +3141,84 @@ export const extractConsumerAccessedKeys = (content: string): string[] => {
   return [...keys];
 };
 
+/** Per-route entry consumed by {@link processNextjsFetchRoutes}.
+ *  `pathTemplate` is what the matcher compares against the recovered
+ *  client URL; `routeKey` is the full registry key (`"POST /x"`)
+ *  used to address the Route node. */
+export interface FetchRouteEntry {
+  routeKey: string;
+  pathTemplate: string;
+  httpMethod: string;
+  filePath: string;
+}
+
 /**
  * Create FETCHES edges from extracted fetch() calls to matching Route nodes.
  * When consumerContents is provided, extracts property access patterns from
  * consumer files and encodes them in the edge reason field.
+ *
+ * Edges are emitted at function granularity when the call's
+ * enclosing function/method can be resolved from the graph; otherwise
+ * we fall back to the file-level edge that the previous shape
+ * always produced.
  */
 export const processNextjsFetchRoutes = (
   graph: KnowledgeGraph,
   fetchCalls: ExtractedFetchCall[],
-  routeRegistry: Map<string, string>, // routeURL → handlerFilePath
+  routes: FetchRouteEntry[],
   consumerContents?: Map<string, string>, // filePath → file content
 ) => {
+  // Build a lazy index of (file → Function/Method nodes ordered by
+  // line) for enclosing-function lookup. Materialised on first use
+  // since most file paths produce zero matches.
+  const fnsByFile = new Map<string, GraphNode[]>();
+  let fnIndexBuilt = false;
+  const buildFnIndex = () => {
+    if (fnIndexBuilt) return;
+    for (const node of graph.iterNodes()) {
+      if (node.label !== 'Function' && node.label !== 'Method') continue;
+      const fp = String(node.properties.filePath ?? '');
+      if (!fp) continue;
+      const list = fnsByFile.get(fp);
+      if (list) list.push(node);
+      else fnsByFile.set(fp, [node]);
+    }
+    for (const list of fnsByFile.values()) {
+      list.sort(
+        (a, b) => Number(a.properties.startLine ?? 0) - Number(b.properties.startLine ?? 0),
+      );
+    }
+    fnIndexBuilt = true;
+  };
+  /** Find the function/method whose [startLine, endLine] tightly
+   *  encloses the given line within the same file. Returns null
+   *  when there is none — caller falls back to the File node. */
+  const findEnclosingFn = (filePath: string, line: number): GraphNode | null => {
+    buildFnIndex();
+    const list = fnsByFile.get(filePath);
+    if (!list || list.length === 0) return null;
+    let chosen: GraphNode | null = null;
+    for (const fn of list) {
+      const start = Number(fn.properties.startLine ?? 0);
+      const end = Number(fn.properties.endLine ?? Number.POSITIVE_INFINITY);
+      if (start <= line && line <= end) {
+        // Pick the most-specific (innermost) match — list is sorted
+        // by startLine, so the last hit at this point is innermost.
+        chosen = fn;
+      } else if (start > line) {
+        break;
+      }
+    }
+    return chosen;
+  };
+
   // Pre-count how many routes each consumer file matches (for confidence attribution)
   const routeCountByFile = new Map<string, number>();
   for (const call of fetchCalls) {
     const normalized = normalizeFetchURL(call.fetchURL);
     if (!normalized) continue;
-    for (const [routeURL] of routeRegistry) {
-      if (routeMatches(normalized, routeURL)) {
+    for (const r of routes) {
+      if (routeMatches(normalized, r.pathTemplate)) {
         routeCountByFile.set(call.filePath, (routeCountByFile.get(call.filePath) ?? 0) + 1);
         break;
       }
@@ -3168,10 +3229,10 @@ export const processNextjsFetchRoutes = (
     const normalized = normalizeFetchURL(call.fetchURL);
     if (!normalized) continue;
 
-    for (const [routeURL] of routeRegistry) {
-      if (routeMatches(normalized, routeURL)) {
-        const sourceId = generateId('File', call.filePath);
-        const routeNodeId = generateId('Route', routeURL);
+    for (const r of routes) {
+      if (routeMatches(normalized, r.pathTemplate)) {
+        const fileSourceId = generateId('File', call.filePath);
+        const routeNodeId = generateId('Route', r.routeKey);
 
         // Extract consumer accessed keys if file content is available
         let reason = 'fetch-url-match';
@@ -3191,18 +3252,172 @@ export const processNextjsFetchRoutes = (
           reason = `${reason}|fetches:${fetchCount}`;
         }
 
+        // File-level edge — always emit as the safe fallback so
+        // existing consumers keep working.
         graph.addRelationship({
-          id: generateId('FETCHES', `${sourceId}->${routeNodeId}`),
-          sourceId,
+          id: generateId('FETCHES', `${fileSourceId}->${routeNodeId}`),
+          sourceId: fileSourceId,
           targetId: routeNodeId,
           type: 'FETCHES',
           confidence: 0.9,
           reason,
         });
+
+        // Function-level edge — emit when we can resolve the
+        // call's enclosing function from line metadata. Cheap
+        // index lookup; falls through silently when no enclosure.
+        const enclosing = findEnclosingFn(call.filePath, call.lineNumber);
+        if (enclosing) {
+          graph.addRelationship({
+            id: generateId('FETCHES', `${enclosing.id}->${routeNodeId}`),
+            sourceId: enclosing.id,
+            targetId: routeNodeId,
+            type: 'FETCHES',
+            confidence: 0.95,
+            reason: `${reason}|fn:${String(enclosing.properties.name ?? '')}`,
+          });
+        }
         break;
       }
     }
   }
+};
+
+/**
+ * Provider-tag join: emits FETCHES edges for client calls whose URL
+ * was *not* statically recoverable but whose `providerTag` was. The
+ * resolver maps the tag to a set of service directories; we then
+ * emit a FETCHES edge from the call (or its enclosing function) to
+ * **every Route node** whose `filePath` lives under one of those
+ * directories.
+ *
+ * Confidence is dampened relative to URL-matched edges since this is
+ * a "this client *probably* talks to anything in service X" join,
+ * not a "this client called *that exact route*" join — matches the
+ * resolver's confidence score.
+ */
+export const processProviderTagFetches = (
+  graph: KnowledgeGraph,
+  fetchCalls: ExtractedFetchCall[],
+  resolveTag: (tag: string) => {
+    serviceDirs: Set<string>;
+    confidence: number;
+  } | null,
+): number => {
+  // Pre-bucket Route nodes by their filePath prefix for O(1) lookup
+  // per call. We materialise the map only when at least one tag-only
+  // call is present, since most repos have none.
+  const tagOnlyCalls = fetchCalls.filter(
+    (c) => c.providerTag && (!c.fetchURL || c.fetchURL === ''),
+  );
+  if (tagOnlyCalls.length === 0) return 0;
+
+  const routesByFile = new Map<string, GraphNode[]>();
+  for (const node of graph.iterNodes()) {
+    if (node.label !== 'Route') continue;
+    const fp = String(node.properties.filePath ?? '');
+    if (!fp) continue;
+    const list = routesByFile.get(fp);
+    if (list) list.push(node);
+    else routesByFile.set(fp, [node]);
+  }
+  if (routesByFile.size === 0) return 0;
+
+  // Index files by sorted prefix so we can find all routes under a
+  // service-dir prefix in O(log n + k).
+  const sortedFiles = [...routesByFile.keys()].sort();
+
+  // Function-resolver mirroring processNextjsFetchRoutes.
+  const fnsByFile = new Map<string, GraphNode[]>();
+  let fnIndexBuilt = false;
+  const buildFnIndex = () => {
+    if (fnIndexBuilt) return;
+    for (const node of graph.iterNodes()) {
+      if (node.label !== 'Function' && node.label !== 'Method') continue;
+      const fp = String(node.properties.filePath ?? '');
+      if (!fp) continue;
+      const list = fnsByFile.get(fp);
+      if (list) list.push(node);
+      else fnsByFile.set(fp, [node]);
+    }
+    for (const list of fnsByFile.values()) {
+      list.sort(
+        (a, b) => Number(a.properties.startLine ?? 0) - Number(b.properties.startLine ?? 0),
+      );
+    }
+    fnIndexBuilt = true;
+  };
+  const findEnclosingFn = (filePath: string, line: number): GraphNode | null => {
+    buildFnIndex();
+    const list = fnsByFile.get(filePath);
+    if (!list || list.length === 0) return null;
+    let chosen: GraphNode | null = null;
+    for (const fn of list) {
+      const start = Number(fn.properties.startLine ?? 0);
+      const end = Number(fn.properties.endLine ?? Number.POSITIVE_INFINITY);
+      if (start <= line && line <= end) chosen = fn;
+      else if (start > line) break;
+    }
+    return chosen;
+  };
+
+  let edgesEmitted = 0;
+  for (const call of tagOnlyCalls) {
+    const tag = call.providerTag!;
+    const resolved = resolveTag(tag);
+    if (!resolved || resolved.serviceDirs.size === 0) continue;
+
+    const fileSourceId = generateId('File', call.filePath);
+    const enclosing = findEnclosingFn(call.filePath, call.lineNumber);
+    const baseConfidence = Math.min(0.85, 0.5 + 0.35 * resolved.confidence);
+
+    for (const dir of resolved.serviceDirs) {
+      const prefix = dir.endsWith('/') ? dir : dir + '/';
+      // Binary-search lower bound for `prefix` in sortedFiles.
+      let lo = 0;
+      let hi = sortedFiles.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (sortedFiles[mid] < prefix) lo = mid + 1;
+        else hi = mid;
+      }
+      for (let i = lo; i < sortedFiles.length; i++) {
+        const fp = sortedFiles[i];
+        if (!fp.startsWith(prefix)) break;
+        const routes = routesByFile.get(fp) ?? [];
+        for (const routeNode of routes) {
+          // Optional method gate: when the call has an HTTP method
+          // and the Route stamps one, require they agree.
+          if (call.httpMethod && call.httpMethod !== '*') {
+            const routeMethod = String(routeNode.properties.httpMethod ?? '*');
+            if (routeMethod !== '*' && routeMethod !== call.httpMethod) continue;
+          }
+          const reason = `provider-tag:${tag}|dir:${dir}`;
+          graph.addRelationship({
+            id: generateId('FETCHES', `${fileSourceId}->${routeNode.id}|${tag}`),
+            sourceId: fileSourceId,
+            targetId: routeNode.id,
+            type: 'FETCHES',
+            confidence: baseConfidence,
+            reason,
+          });
+          edgesEmitted++;
+          if (enclosing) {
+            graph.addRelationship({
+              id: generateId('FETCHES', `${enclosing.id}->${routeNode.id}|${tag}`),
+              sourceId: enclosing.id,
+              targetId: routeNode.id,
+              type: 'FETCHES',
+              confidence: Math.min(0.9, baseConfidence + 0.05),
+              reason: `${reason}|fn:${String(enclosing.properties.name ?? '')}`,
+            });
+            edgesEmitted++;
+          }
+        }
+      }
+    }
+  }
+  return edgesEmitted;
 };
 
 /**

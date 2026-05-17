@@ -518,6 +518,14 @@
   .flow-svg .edge-IMPORTS    { stroke: #5a8c8c; stroke-width: 1; stroke-dasharray: 3 3; }
   .flow-svg .edge-EXTENDS    { stroke: #d4a14b; stroke-width: 1; stroke-dasharray: 4 2; }
   .flow-svg .edge-HAS_METHOD { stroke: #b07cff; stroke-width: 1; stroke-dasharray: 2 2; }
+  /* Wire-cross synthetic edge: a single INVOKES collapses a
+     (caller → FETCHES → Route → HANDLES_ROUTE → handler) chain into
+     one visible hop across a service boundary. Distinct hue + thicker
+     stroke so the boundary reads at a glance. */
+  .flow-svg .edge-INVOKES    { stroke: #f59e0b; stroke-width: 1.6; stroke-dasharray: 6 3; opacity: 0.95; }
+  /* Route-typed nodes (when the snapshot includes them) — hue
+     pairs with edge-INVOKES so a wire visually hangs together. */
+  .flow-svg .node-route      { fill: #2a2418; stroke: #f59e0b; stroke-width: 1.5; }
   .flow-svg .col-label {
     fill: var(--text-dim); font-size: 10px;
     text-anchor: middle; font-weight: 600;
@@ -2283,6 +2291,7 @@
       { role: 'seed',     label: 'entry point' },
       { role: 'caller',   label: 'caller' },
       { role: 'callee',   label: 'callee' },
+      { role: 'route',    label: 'API route' },
       { role: 'method',   label: 'method' },
       { role: 'extends',  label: 'extends' },
       { role: 'importer', label: 'imports' },
@@ -2291,6 +2300,13 @@
     legendItems.forEach(it => {
       legend += `<span><span class="swatch node-${it.role}"></span>${it.label}</span>`;
     });
+    // Edge-type legend — surface wire-cross INVOKES whenever the
+    // snapshot has at least one. Helps users spot service-boundary
+    // jumps without having to mouseover every edge.
+    const hasInvokes = (sg.edges || []).some(e => e.type === 'INVOKES');
+    if (hasInvokes) {
+      legend += `<span><svg class="flow-svg" width="22" height="10" style="vertical-align:middle;margin-right:4px;"><path class="edge-INVOKES" d="M0 5 L 22 5" fill="none"/></svg>cross-service wire (INVOKES)</span>`;
+    }
     // Overlay swatches only show up when the flow has any feedback —
     // keeps the legend honest about whether the ov-* tints can appear.
     if (flow && flow.total_feedback) {

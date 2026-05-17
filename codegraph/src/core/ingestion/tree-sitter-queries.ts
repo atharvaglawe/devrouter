@@ -407,6 +407,12 @@ export const GO_QUERIES = `
 (function_declaration name: (identifier) @name) @definition.function
 (method_declaration name: (field_identifier) @name) @definition.method
 
+; Interface method signatures (abstract methods inside interface_type).
+; method_elem has no receiver — findEnclosingClassInfo walks up to the
+; surrounding type_declaration / interface_type to attribute the HAS_METHOD
+; edge to the right Interface node.
+(method_elem name: (field_identifier) @name) @definition.method
+
 ; Types
 (type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @definition.struct
 (type_declaration (type_spec name: (type_identifier) @name type: (interface_type))) @definition.interface
@@ -428,6 +434,17 @@ export const GO_QUERIES = `
       (field_declaration_list
         (field_declaration
           type: (type_identifier) @heritage.extends))))) @definition.struct
+
+; Interface embedding: type ReadCloser interface { Reader; Closer }
+; The embedded interface's methods are part of this interface's method-set.
+; resolveExtendsType emits IMPLEMENTS when the parent is an Interface, which
+; the structural-implements processor then walks to pull the parent's methods
+; into the child's method-set (transitive closure).
+(type_declaration
+  (type_spec
+    name: (type_identifier) @heritage.class
+    type: (interface_type
+      (type_elem (type_identifier) @heritage.extends)))) @definition.interface
 
 ; Calls
 (call_expression function: (identifier) @call.name) @call

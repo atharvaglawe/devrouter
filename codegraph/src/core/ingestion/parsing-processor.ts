@@ -18,6 +18,24 @@ import {
   type EnclosingClassInfo,
 } from './utils/ast-helpers.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
+import { extractGoApiEndpoints } from './route-extractors/api-endpoint-go.js';
+import { extractJavaApiEndpoints } from './route-extractors/api-endpoint-java.js';
+import { extractPythonApiEndpoints } from './route-extractors/api-endpoint-python.js';
+import type { ExtractedApiEndpoints } from './route-extractors/api-endpoint-types.js';
+import {
+  extractGoConfigTags,
+  extractGoTrivialGetters,
+  type ConfigTagBinding,
+  type TrivialGetterBinding,
+} from './route-extractors/config-tag-resolver.js';
+import {
+  extractJavaConfigTags,
+  extractJavaTrivialGetters,
+} from './route-extractors/config-tag-java.js';
+import {
+  extractPythonConfigTags,
+  extractPythonTrivialGetters,
+} from './route-extractors/config-tag-python.js';
 import { buildTypeEnv } from './type-env.js';
 import type { FieldInfo, FieldExtractorContext } from './field-types.js';
 import type { MethodInfo } from './method-types.js';
@@ -63,6 +81,15 @@ export interface WorkerExtractedData {
   ormQueries: ExtractedORMQuery[];
   constructorBindings: FileConstructorBindings[];
   fileScopeBindings: FileScopeBindings[];
+  /** Struct-tag bindings recovered from struct field declarations.
+   *  Used by Phase 3.4's config-tag resolver to bridge non-literal
+   *  options-bag fields (`config.GetXyzApiConfig().ApiPath`) to a
+   *  YAML key. */
+  configTags: ConfigTagBinding[];
+  /** Trivial getter functions whose body is a chain of `return …`
+   *  statements only. Folded into a getter-name → tag-set map by
+   *  Phase 3.4 to recover providerTag values at non-literal call sites. */
+  trivialGetters: TrivialGetterBinding[];
 }
 
 // ============================================================================
@@ -98,6 +125,8 @@ const processParsingWithWorkers = async (
       ormQueries: [],
       constructorBindings: [],
       fileScopeBindings: [],
+      configTags: [],
+      trivialGetters: [],
     };
 
   const total = files.length;
@@ -123,6 +152,8 @@ const processParsingWithWorkers = async (
   const allORMQueries: ExtractedORMQuery[] = [];
   const allConstructorBindings: FileConstructorBindings[] = [];
   const fileScopeBindingsByFile: FileScopeBindings[] = [];
+  const allConfigTags: ConfigTagBinding[] = [];
+  const allTrivialGetters: TrivialGetterBinding[] = [];
   for (const result of chunkResults) {
     for (const node of result.nodes) {
       graph.addNode({
@@ -161,6 +192,10 @@ const processParsingWithWorkers = async (
     for (const _item of result.constructorBindings) allConstructorBindings.push(_item);
     if (result.fileScopeBindings)
       for (const _item of result.fileScopeBindings) fileScopeBindingsByFile.push(_item);
+    if (result.configTags)
+      for (const _item of result.configTags) allConfigTags.push(_item);
+    if (result.trivialGetters)
+      for (const _item of result.trivialGetters) allTrivialGetters.push(_item);
   }
 
   // Merge and log skipped languages from workers
@@ -192,6 +227,8 @@ const processParsingWithWorkers = async (
     ormQueries: allORMQueries,
     constructorBindings: allConstructorBindings,
     fileScopeBindings: fileScopeBindingsByFile,
+    configTags: allConfigTags,
+    trivialGetters: allTrivialGetters,
   };
 };
 
@@ -281,16 +318,32 @@ function seqGetFieldInfo(
   return cached;
 }
 
+/** Sequential-path-only return shape — only the API-endpoint
+ *  channels are populated, since the rest of {@link WorkerExtractedData}
+ *  is wired into the graph directly inside the loop. */
+export interface SequentialParsingExtras {
+  routes: ExtractedRoute[];
+  fetchCalls: ExtractedFetchCall[];
+  /** Struct-tag bindings extracted in sequential mode (Go only today). */
+  configTags: ConfigTagBinding[];
+  /** Trivial getter functions extracted in sequential mode (Go only today). */
+  trivialGetters: TrivialGetterBinding[];
+}
+
 const processParsingSequential = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
   symbolTable: SymbolTable,
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback,
-) => {
+): Promise<SequentialParsingExtras> => {
   const parser = await loadParser();
   const total = files.length;
   const skippedLanguages = new Map<string, number>();
+  const routes: ExtractedRoute[] = [];
+  const fetchCalls: ExtractedFetchCall[] = [];
+  const configTags: ConfigTagBinding[] = [];
+  const trivialGetters: TrivialGetterBinding[] = [];
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -348,6 +401,74 @@ const processParsingSequential = async (
     }
 
     astCache.set(file.path, tree);
+
+    // API endpoint extraction (sequential mirror of the worker path).
+    // Per-language extractors return {routes, clientCalls} normalised
+    // into the existing ExtractedRoute / ExtractedFetchCall shapes so
+    // pipeline.ts Phase 3.5 can build the route registry without
+    // branching on parsing mode.
+    let apiResult: ExtractedApiEndpoints | null = null;
+    if (language === SupportedLanguages.Go) {
+      apiResult = extractGoApiEndpoints(tree.rootNode, file.path);
+      // Config-tag resolver inputs (Go shape: struct tags + return-only
+      // getters). Phase 3.4 in pipeline.ts folds these across all
+      // parsed files into a getter-name → tag-set map, which the
+      // call-processor consumes when an options-bag field's RHS is
+      // a non-literal call expression like
+      // `config.GetXyzApiConfig().ApiPath`.
+      const cts = extractGoConfigTags(tree.rootNode, file.path);
+      if (cts.length > 0) configTags.push(...cts);
+      const tgs = extractGoTrivialGetters(tree.rootNode, file.path);
+      if (tgs.length > 0) trivialGetters.push(...tgs);
+    } else if (language === SupportedLanguages.Java) {
+      apiResult = extractJavaApiEndpoints(tree.rootNode, file.path);
+      // Java shape: @Value/@ConfigurationProperties annotations +
+      // JavaBean getters (incl. Lombok @Getter synthesis).
+      const cts = extractJavaConfigTags(tree.rootNode, file.path);
+      if (cts.length > 0) configTags.push(...cts);
+      const tgs = extractJavaTrivialGetters(tree.rootNode, file.path);
+      if (tgs.length > 0) trivialGetters.push(...tgs);
+    } else if (language === SupportedLanguages.Python) {
+      apiResult = extractPythonApiEndpoints(tree.rootNode, file.path);
+      // Python shape: os.environ / Pydantic Field(env=) + @property
+      // and `def get_x` accessors.
+      const cts = extractPythonConfigTags(tree.rootNode, file.path);
+      if (cts.length > 0) configTags.push(...cts);
+      const tgs = extractPythonTrivialGetters(tree.rootNode, file.path);
+      if (tgs.length > 0) trivialGetters.push(...tgs);
+    }
+    if (apiResult) {
+      for (const r of apiResult.routes) {
+        routes.push({
+          filePath: r.filePath,
+          httpMethod: r.method,
+          routePath: r.pathTemplate,
+          controllerName: r.handlerReceiver,
+          methodName: r.handlerSymbol,
+          middleware: [],
+          prefix: null,
+          lineNumber: r.lineNumber,
+        });
+      }
+      for (const c of apiResult.clientCalls) {
+        // Calls with no static join key *and* no pending getter
+        // chain to resolve are dropped. The pending-lookup channel
+        // gives Phase 3.4 a final chance to recover a providerTag
+        // from struct tags before edges are emitted.
+        const hasPending = (c.pendingGetterLookups?.length ?? 0) > 0;
+        if (!c.pathLiteral && !c.providerTag && !hasPending) continue;
+        fetchCalls.push({
+          filePath: c.filePath,
+          fetchURL: c.pathLiteral ?? '',
+          lineNumber: c.lineNumber,
+          providerTag: c.providerTag,
+          httpMethod: c.method,
+          callerSymbol: c.callerSymbol,
+          callerReceiver: c.callerReceiver,
+          pendingGetterLookups: c.pendingGetterLookups,
+        });
+      }
+    }
 
     const provider = getProvider(language);
     const queryString = provider.treeSitterQueries;
@@ -647,11 +768,31 @@ const processParsingSequential = async (
       .join(', ');
     console.warn(`  Skipped unsupported languages: ${summary}`);
   }
+  return { routes, fetchCalls, configTags, trivialGetters };
 };
 
 // ============================================================================
 // Public API
 // ============================================================================
+
+/** Result returned by {@link processParsing}.
+ *
+ *  - `data` is the worker-pool's full {@link WorkerExtractedData}
+ *    when the worker pool ran successfully. `null` when the
+ *    sequential fallback ran — pipeline.ts already does its own
+ *    heritage / call / import extraction in that case, so the
+ *    symbol-graph half does not need a stub.
+ *  - `sequentialExtras` is populated when the sequential fallback
+ *    ran AND a per-language API-endpoint extractor produced
+ *    routes/fetch calls. Pipeline.ts merges this into the same
+ *    `allExtractedRoutes` / `allFetchCalls` accumulators it uses
+ *    on the worker path so Phase 3.5 (route registry / Route
+ *    nodes / HANDLES_ROUTE / FETCHES) is unconditional.
+ */
+export interface ProcessParsingResult {
+  data: WorkerExtractedData | null;
+  sequentialExtras?: SequentialParsingExtras;
+}
 
 export const processParsing = async (
   graph: KnowledgeGraph,
@@ -660,10 +801,10 @@ export const processParsing = async (
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback,
   workerPool?: WorkerPool,
-): Promise<WorkerExtractedData | null> => {
+): Promise<ProcessParsingResult> => {
   if (workerPool) {
     try {
-      return await processParsingWithWorkers(
+      const data = await processParsingWithWorkers(
         graph,
         files,
         symbolTable,
@@ -671,6 +812,7 @@ export const processParsing = async (
         workerPool,
         onFileProgress,
       );
+      return { data };
     } catch (err) {
       console.warn(
         'Worker pool parsing failed, falling back to sequential:',
@@ -679,7 +821,12 @@ export const processParsing = async (
     }
   }
 
-  // Fallback: sequential parsing (no pre-extracted data)
-  await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
-  return null;
+  const sequentialExtras = await processParsingSequential(
+    graph,
+    files,
+    symbolTable,
+    astCache,
+    onFileProgress,
+  );
+  return { data: null, sequentialExtras };
 };

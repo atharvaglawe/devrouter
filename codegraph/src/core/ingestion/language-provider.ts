@@ -153,6 +153,32 @@ interface LanguageProviderConfig {
   /** Built-in/stdlib names that should be filtered from the call graph for this language.
    *  Default: undefined (no language-specific filtering). */
   readonly builtInNames?: ReadonlySet<string>;
+
+  // ── Structural-implements detection ───────────────────────────────
+  /** Whether to run the structural-implements processor for this
+   *  language. Languages with an explicit `implements` keyword (Java,
+   *  Kotlin, C#, PHP) get all real implementations captured by the
+   *  heritage processor; structural-only matches in those languages
+   *  collide with shared CRUD method names (`create`, `update`,
+   *  `delete`, `list`) — controllers end up "implementing" every small
+   *  service interface in the codebase — so we disable it.
+   *
+   *  Languages with structural typing (Go, TypeScript, Rust traits,
+   *  Python protocols) need this pass to recover IMPLEMENTS relations
+   *  that the indexer can't see syntactically.
+   *
+   *  Default: true. */
+  readonly structuralImplementsEnabled?: boolean;
+  /** Minimum number of methods an interface must have for the
+   *  structural-implements processor to consider it a candidate.
+   *
+   *  Single-method interfaces are idiomatic in Go (`io.Reader`,
+   *  `fmt.Stringer`) and in TypeScript / Python protocols, so the
+   *  default is 1. Set higher when even multi-method matches cause
+   *  too much noise.
+   *
+   *  Default: 1. */
+  readonly structuralImplementsMinMethods?: number;
 }
 
 /** Runtime type — same as LanguageProviderConfig but with defaults guaranteed present. */
