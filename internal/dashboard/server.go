@@ -103,7 +103,7 @@ func newMux(cfg Config) *http.ServeMux {
 
 	mux.HandleFunc("/api/flows", func(w http.ResponseWriter, r *http.Request) {
 		repo := r.URL.Query().Get("repo")
-		writeJSON(w, LoadFlows(r.Context(), cfg.Memory.RDB(), cfg.Memory, repo))
+		writeJSON(w, LoadFlows(r.Context(), cfg.Memory.RDB(), cfg.Memory, cfg.Heuristics.Store, repo))
 	})
 
 	// /api/flow_signal is the cross-flow aggregate the Heuristics tab

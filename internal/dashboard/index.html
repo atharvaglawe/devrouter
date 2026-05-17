@@ -180,23 +180,246 @@
     grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
     gap: 14px;
   }
-  .knobs {
+  /* -------- Heuristics: color-coded knob bars --------
+     Each knob is rendered as a horizontal track from its hard min to
+     hard max bound (heuristics.Bounds). A fixed identity colour per
+     knob keeps the same knob recognisable across the bar view, the
+     drift chart, and the per-bucket sparkline (KNOB_COLORS in JS).
+     Default is shown as a dashed tick; current as a filled pin. */
+  .knob-list { margin-top: 10px; display: grid; gap: 4px; }
+  .knob-bar {
     display: grid;
-    grid-template-columns: 1fr auto auto;
-    gap: 4px 14px;
-    margin-top: 10px;
-    font-size: 12.5px;
+    grid-template-columns: 128px 1fr 86px;
+    gap: 12px;
+    align-items: center;
+    padding: 6px 0;
+    font-size: 12px;
   }
-  .knobs .k { color: var(--text-dim); }
-  .knobs .v { text-align: right; }
-  .knobs .delta { text-align: right; font-weight: 600; }
+  .knob-bar .name {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    color: var(--text);
+  }
+  .knob-bar .name .swatch {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    flex: 0 0 9px;
+    background: currentColor;
+    box-shadow: 0 0 0 1px var(--border);
+  }
+  .knob-bar .track {
+    position: relative;
+    height: 16px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .knob-bar .track .fill {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    border-radius: 8px 0 0 8px;
+    opacity: 0.55;
+    background: currentColor;
+  }
+  .knob-bar .track .fill.full { border-radius: 8px; }
+  /* Default position tick — dashed vertical accent so it reads as
+     "frozen baseline", distinct from the live current-value pin. */
+  .knob-bar .track .default-tick {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 0;
+    border-left: 1px dashed var(--text-dim);
+  }
+  .knob-bar .track .default-tick::after {
+    content: "def";
+    position: absolute;
+    top: -12px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 9px;
+    color: var(--text-dim);
+    font-family: ui-monospace, monospace;
+    letter-spacing: 0.02em;
+  }
+  .knob-bar .track .current-pin {
+    position: absolute;
+    top: 50%;
+    width: 12px;
+    height: 12px;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 0 2px var(--bg-elev);
+  }
+  .knob-bar .track .value {
+    position: absolute;
+    top: -16px;
+    transform: translateX(-50%);
+    font-family: ui-monospace, monospace;
+    font-size: 10px;
+    color: var(--text);
+    pointer-events: none;
+    white-space: nowrap;
+  }
+  .knob-bar .track .bound-min,
+  .knob-bar .track .bound-max {
+    position: absolute;
+    bottom: -14px;
+    font-size: 9px;
+    color: var(--text-dim);
+    font-family: ui-monospace, monospace;
+    pointer-events: none;
+  }
+  .knob-bar .track .bound-min { left: 0; }
+  .knob-bar .track .bound-max { right: 0; }
+  .knob-bar .meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    line-height: 1.3;
+  }
+  .knob-bar .meta .delta {
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .knob-bar.row-spaced { padding-bottom: 18px; }
   .delta-up { color: var(--good); }
   .delta-down { color: var(--bad); }
   .delta-zero { color: var(--text-dim); }
+
+  /* -------- Heuristics: drift + reward charts -------- */
+  .knob-charts {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .knob-chart {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px 6px;
+  }
+  .knob-chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 4px;
+  }
+  .knob-chart-header h3 {
+    margin: 0;
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+  }
+  .knob-chart-header .hint {
+    color: var(--text-dim);
+    font-size: 11px;
+    font-style: italic;
+  }
+  .knob-chart svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  .knob-chart .axis,
+  .knob-chart .grid line {
+    stroke: var(--border);
+    stroke-width: 1;
+  }
+  .knob-chart .grid line { stroke-dasharray: 2 3; opacity: 0.5; }
+  .knob-chart .axis-label {
+    fill: var(--text-dim);
+    font-size: 9.5px;
+    font-family: ui-monospace, monospace;
+  }
+  .knob-chart .knob-line {
+    fill: none;
+    stroke-width: 1.5;
+    opacity: 0.85;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+  }
+  .knob-chart .knob-point {
+    stroke-width: 1;
+    stroke: var(--bg);
+  }
+  .knob-chart .knob-baseline {
+    stroke: var(--text-dim);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+    opacity: 0.45;
+  }
+  .knob-chart .event-tick {
+    stroke-width: 1.5;
+  }
+  .knob-chart .event-tick.kind-promote  { stroke: var(--good); }
+  .knob-chart .event-tick.kind-rollback { stroke: var(--bad); }
+  .knob-chart .event-tick.kind-discard  { stroke: var(--warn); }
+  .knob-chart .event-tick.kind-seed     { stroke: var(--text-dim); }
+  .knob-chart .reward-bar { fill: var(--accent); opacity: 0.75; }
+  .knob-chart .reward-bar.cold { fill: var(--border); }
+  .knob-chart .reward-mean-line {
+    stroke: var(--accent);
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
+    opacity: 0.45;
+    fill: none;
+  }
+  .knob-chart-empty {
+    color: var(--text-dim);
+    font-style: italic;
+    font-size: 11.5px;
+    padding: 14px 4px;
+    text-align: center;
+  }
+  .knob-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    margin-top: 4px;
+    font-size: 10.5px;
+    color: var(--text-dim);
+  }
+  .knob-legend .item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: ui-monospace, monospace;
+  }
+  .knob-legend .item .swatch {
+    width: 10px;
+    height: 2px;
+    background: currentColor;
+    border-radius: 1px;
+  }
+  .knob-event-legend {
+    display: flex;
+    gap: 10px;
+    margin-top: 4px;
+    font-size: 10.5px;
+    color: var(--text-dim);
+  }
+  .knob-event-legend .item { display: inline-flex; align-items: center; gap: 4px; }
+  .knob-event-legend .item .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+  }
   .history {
-    margin-top: 12px;
+    margin: 12px 0 0;
+    padding: 10px 0 0;
     border-top: 1px solid var(--border);
-    padding-top: 10px;
+    list-style: none;
   }
   .history li { list-style: none; padding: 4px 0; color: var(--text-dim); font-size: 12px; }
   .history li b { color: var(--text); margin-right: 6px; }
@@ -332,6 +555,26 @@
     font-style: italic;
     color: var(--warn, #d4a14b);
   }
+  /* Per-file feedback overlay tints applied to <rect> nodes whose
+     file matches an entry in flow.file_stats / flow.augmented_files.
+     Placed *after* the role rules above so equal-specificity ties
+     resolve in favour of the ov-* override — keeps the role-coloured
+     base while adding a feedback signal ring on top.
+       validated : agents read this file from the flow → green ring
+       dead      : agents finished without reading it → faded + dashed
+       missing   : agent reported needing a file not in the flow,
+                   rendered as a synthetic block to the right of its
+                   most-related band */
+  .flow-svg rect.ov-validated { stroke: #6dd49a; stroke-width: 2; }
+  .flow-svg rect.ov-dead      { stroke: var(--text-dim); stroke-width: 1.5; stroke-dasharray: 3 2; opacity: 0.55; }
+  .flow-svg rect.ov-missing   { fill: #2a1f3a; stroke: #a78bfa; stroke-width: 1.5; stroke-dasharray: 4 2; }
+  .flow-svg .ov-badge         { font-size: 9.5px; font-weight: 600; }
+  .flow-svg .ov-badge.useful  { fill: #6dd49a; }
+  .flow-svg .ov-badge.dead    { fill: var(--text-dim); }
+  .flow-svg .ov-badge.missing { fill: #c9b6ff; }
+  .flow-svg-legend .ov-swatch.validated { background: transparent; border-color: #6dd49a; }
+  .flow-svg-legend .ov-swatch.dead      { background: transparent; border-color: var(--text-dim); border-style: dashed; opacity: 0.55; }
+  .flow-svg-legend .ov-swatch.missing   { background: #2a1f3a; border-color: #a78bfa; border-style: dashed; }
   /* Per-flow feedback overlay (rendered below each flow's SVG).
      Sourced from dev_feedback writes against flow:overlay:{...}; never
      drives the bandit — strictly observational signal for devs. */
@@ -448,12 +691,35 @@
   .bucket-hot { box-shadow: 0 0 0 1px var(--good) inset; }
   .bucket-row {
     display: grid;
-    grid-template-columns: 100px 80px 70px 1fr;
+    grid-template-columns: 100px 80px 70px 1fr 120px;
     gap: 10px;
     align-items: center;
     padding: 6px 0;
     border-top: 1px solid var(--border);
     font-size: 12.5px;
+  }
+  .bucket-row .bucket-spark {
+    height: 26px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .bucket-row .bucket-spark svg { display: block; width: 100%; height: 100%; }
+  .bucket-row .bucket-spark .knob-line { fill: none; stroke-width: 1.2; opacity: 0.9; }
+  .bucket-row .bucket-spark .knob-baseline {
+    stroke: var(--text-dim); stroke-width: 1;
+    stroke-dasharray: 2 3; opacity: 0.5;
+  }
+  .bucket-row .bucket-spark.empty {
+    color: var(--text-dim);
+    font-size: 10px;
+    font-style: italic;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 6px;
+    text-align: center;
   }
   .bucket-row:first-of-type { border-top: none; }
   .bucket-row .label { color: var(--text-dim); font-size: 11px; text-transform: uppercase; }
@@ -591,6 +857,10 @@
         <select id="flows-repo">
           <option value="">all</option>
         </select>
+        <label>Topic:</label>
+        <select id="flows-topic">
+          <option value="">all</option>
+        </select>
         <button id="flows-clear-filters" type="button" class="ghost">clear</button>
       </div>
       <div id="flows-body"></div>
@@ -605,6 +875,12 @@
     decisionsRepo: '',
     decisionsType: '',
     flowsRepo: '',
+    // Topic for the Flows tab. Each flow inherits its topic set from
+    // the queries that referenced it via memory_keys (see LoadFlows
+    // flowTopicIndex). Empty until the topic clustering pipeline
+    // assigns non-* topic_ids to traces — the dropdown stays at just
+    // "all" in that case.
+    flowsTopic: '',
     // Set of "<repo>::<name>" keys for flow cards currently rendered
     // in their expanded (full) form. Persists across auto-refresh so
     // users don't get collapsed every 3s.
@@ -614,6 +890,13 @@
     // default to DEFAULT_EXPANDED_DEPTH when expanded, PREVIEW_DEPTH
     // when collapsed.
     flowDepth: new Map(),
+    // Map of "<repo>::<name>" → horizontal scrollLeft for expanded
+    // flow graph wrappers. Without this, every auto-refresh rebuilds
+    // the DOM and snaps wide graphs back to x=0.
+    flowScroll: new Map(),
+    // Monotonic ticket for renderFlows() to drop stale async responses
+    // when refresh ticks overlap.
+    flowsRenderSeq: 0,
     topicsIntent: '',
     topicsRepo: '',
     heuristicsRepo: '',
@@ -859,11 +1142,289 @@
   }
 
   // ---------- Heuristics ----------
+
+  // Stable identity colour per knob — picked from a high-contrast
+  // dark-mode palette so each line in the drift chart is
+  // distinguishable next to the others. Same colour is used for the
+  // knob bar swatch, the bar's fill, the drift polyline, and the
+  // legend dot so users can track a single knob across all three
+  // surfaces with one glance.
+  const KNOB_COLORS = {
+    max_trace:       '#58a6ff',
+    caller_hops:     '#bc8cff',
+    max_upstream:    '#79c0ff',
+    max_downstream:  '#56d4d4',
+    max_importers:   '#ffa657',
+    max_methods:     '#ff7b72',
+    max_siblings:    '#56d364',
+    max_snippets:    '#7ee787',
+    max_impact:      '#d29922',
+    max_symbols:     '#ff8c42',
+    max_primary_ctx: '#d2a8ff',
+    max_decisions:   '#ffafad',
+  };
+  function knobColor(name) { return KNOB_COLORS[name] || '#8b949e'; }
+
+  // Normalise a knob value (`v` ∈ [min, max]) to [0, 1] for chart
+  // positioning. A degenerate knob with min == max (shouldn't happen
+  // given heuristics.Bounds, but guard anyway) renders at the centre.
+  function knobNorm(v, min, max) {
+    if (max <= min) return 0.5;
+    return Math.max(0, Math.min(1, (v - min) / (max - min)));
+  }
+
   function deltaCell(d) {
-    if (d.delta === 0) return `<span class="delta delta-zero">·</span>`;
+    if (d.delta === 0) return `<span class="delta delta-zero">±0</span>`;
     const cls = d.delta > 0 ? 'delta-up' : 'delta-down';
     const sign = d.delta > 0 ? '+' : '';
-    return `<span class="delta ${cls}">${sign}${d.delta}</span>`;
+    const arrow = d.delta > 0 ? '↑' : '↓';
+    return `<span class="delta ${cls}">${arrow} ${sign}${d.delta}</span>`;
+  }
+
+  // knobBar renders one row in the color-coded knob list: identity
+  // swatch + name on the left, a track from min..max in the middle
+  // (with the bandit's current value as a pin and the seed default
+  // as a dashed tick), and a value/delta column on the right.
+  //
+  // The bar fill uses the knob's identity colour at a reduced opacity
+  // so users get *two* simultaneous reads:
+  //   (1) which knob this is (colour identity), and
+  //   (2) how aggressive the current setting is (fill width inside
+  //       the range).
+  function knobBar(d) {
+    const range = Math.max(0, d.max - d.min);
+    const curPct = range > 0 ? ((d.current - d.min) / range) * 100 : 50;
+    const defPct = range > 0 ? ((d.default - d.min) / range) * 100 : 50;
+    const color = knobColor(d.knob);
+    const fullCls = curPct >= 99.5 ? ' full' : '';
+    return `
+      <div class="knob-bar row-spaced" title="${fmt.escape(d.knob)}: ${d.current} (default ${d.default}, range ${d.min}–${d.max})">
+        <span class="name mono"><span class="swatch" style="color:${color};"></span>${fmt.escape(d.knob)}</span>
+        <div class="track" style="color:${color};">
+          <div class="fill${fullCls}" style="width:${curPct.toFixed(2)}%;"></div>
+          <div class="default-tick" style="left:${defPct.toFixed(2)}%;"></div>
+          <div class="value">${d.current}</div>
+          <div class="current-pin" style="left:${curPct.toFixed(2)}%;"></div>
+          <div class="bound-min">${d.min}</div>
+          <div class="bound-max">${d.max}</div>
+        </div>
+        <div class="meta">
+          ${deltaCell(d)}
+          <span>def ${d.default}</span>
+        </div>
+      </div>`;
+  }
+
+  // Inline <style> tweak: the per-row pin sits at percentage offsets
+  // 0..100, but at exactly 0 / 100 the circle clips against the track
+  // border. The track is overflow: visible by default so this is
+  // visually fine; nothing to do here.
+
+  // knobDriftChart renders the trajectory of every knob through the
+  // recent_history list as a small SVG. Each line plots y = normalised
+  // (current_value − min) / (max − min) per event, x = chronological
+  // event index. We skip knobs that never moved across the window so
+  // the chart isn't drowned in flat baselines.
+  //
+  // Event kind markers (promote / rollback / discard / seed) ride
+  // along the bottom edge so devs can correlate "reward dropped" with
+  // "candidate was rolled back" at a glance.
+  function knobDriftChart(history, deltas) {
+    const events = (history || []).slice().reverse(); // newest-first → chrono
+    if (events.length === 0) {
+      return `<div class="knob-chart-empty">No bandit activity recorded yet. Drift chart appears once the first promote/rollback fires.</div>`;
+    }
+
+    // Build a synthetic seed snapshot from the first event's .from
+    // profile so the chart shows the pre-bandit baseline as well.
+    const seed = events[0].from || {};
+    const snapshots = [{ts: events[0].timestamp - 1, kind: 'seed', profile: seed}];
+    for (const e of events) {
+      snapshots.push({ts: e.timestamp, kind: e.kind || 'promote', profile: e.to || {}, reason: e.reason || ''});
+    }
+
+    const W = 540, H = 140, padL = 28, padR = 14, padT = 12, padB = 26;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const n = snapshots.length;
+    const xAt = i => n <= 1 ? padL + innerW / 2 : padL + (i / (n - 1)) * innerW;
+    const yAt = norm => padT + (1 - norm) * innerH;
+
+    const knobs = (deltas || []).filter(d => d.max > d.min);
+    // Only plot knobs that actually moved across the window so the
+    // chart stays readable for intents with one or two active knobs.
+    const movers = knobs.filter(d => {
+      const values = snapshots.map(s => readKnob(s.profile, d.knob));
+      const first = values[0];
+      return values.some(v => v !== first);
+    });
+    if (movers.length === 0) {
+      return `<div class="knob-chart-empty">${events.length} event${events.length === 1 ? '' : 's'} recorded, but no knob value has changed yet — bandit may still be sampling.</div>`;
+    }
+
+    let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
+    svg += `<g class="grid">`;
+    [0, 0.5, 1].forEach(g => {
+      const y = yAt(g);
+      svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>`;
+    });
+    svg += `</g>`;
+    svg += `<text class="axis-label" x="2" y="${yAt(1) + 3}">max</text>`;
+    svg += `<text class="axis-label" x="2" y="${yAt(0.5) + 3}">mid</text>`;
+    svg += `<text class="axis-label" x="2" y="${yAt(0) + 3}">min</text>`;
+
+    for (const d of movers) {
+      const color = knobColor(d.knob);
+      const pts = snapshots.map((s, i) => {
+        const v = readKnob(s.profile, d.knob);
+        const norm = knobNorm(v, d.min, d.max);
+        return {x: xAt(i), y: yAt(norm), v};
+      });
+      const path = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ' ' + p.y.toFixed(1)).join(' ');
+      svg += `<path class="knob-line" d="${path}" stroke="${color}"/>`;
+      pts.forEach(p => {
+        svg += `<circle class="knob-point" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.4" fill="${color}"><title>${fmt.escape(d.knob)} = ${p.v}</title></circle>`;
+      });
+    }
+
+    snapshots.forEach((s, i) => {
+      const x = xAt(i);
+      const y = H - padB + 4;
+      const kind = s.kind || 'promote';
+      const ts = s.ts ? fmt.time(s.ts) : '';
+      const reason = s.reason ? ` — ${s.reason}` : '';
+      svg += `<line class="event-tick kind-${fmt.escape(kind)}" x1="${x.toFixed(1)}" y1="${y}" x2="${x.toFixed(1)}" y2="${y + 8}"><title>${fmt.escape(kind)}${ts ? ' @ ' + ts : ''}${fmt.escape(reason)}</title></line>`;
+    });
+    if (n >= 2) {
+      svg += `<text class="axis-label" x="${padL}" y="${H - 2}">${fmt.time(snapshots[0].ts)}</text>`;
+      svg += `<text class="axis-label" text-anchor="end" x="${W - padR}" y="${H - 2}">${fmt.time(snapshots[n - 1].ts)}</text>`;
+    }
+    svg += `</svg>`;
+
+    const legend = movers.map(d => `<span class="item" style="color:${knobColor(d.knob)};"><span class="swatch"></span>${fmt.escape(d.knob)}</span>`).join('');
+    const eventLegend = `
+      <div class="knob-event-legend">
+        <span class="item" style="color:var(--good);"><span class="dot"></span>promote</span>
+        <span class="item" style="color:var(--bad);"><span class="dot"></span>rollback</span>
+        <span class="item" style="color:var(--warn);"><span class="dot"></span>discard</span>
+        <span class="item" style="color:var(--text-dim);"><span class="dot"></span>seed</span>
+      </div>`;
+    return svg + `<div class="knob-legend">${legend}</div>${eventLegend}`;
+  }
+
+  // readKnob translates from the JSON profile field names
+  // (snake_case) to the ProfileDelta knob name (also snake_case)
+  // so the chart can index into history snapshots without owning a
+  // second mapping table.
+  function readKnob(profile, knob) {
+    if (!profile) return 0;
+    const v = profile[knob];
+    return typeof v === 'number' ? v : 0;
+  }
+
+  // rewardHistoryChart renders the trailing-24h hourly reward
+  // sparkline as vertical bars. Empty hours render as muted
+  // placeholder bars so the time axis stays evenly spaced.
+  function rewardHistoryChart(buckets) {
+    if (!buckets || !buckets.length) {
+      return `<div class="knob-chart-empty">No reward data in the last 24 hours.</div>`;
+    }
+    const W = 540, H = 80, padL = 24, padR = 8, padT = 8, padB = 18;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const n = buckets.length;
+    const barW = innerW / n;
+    // Pin the y-axis to [0, 1] — adjusted_reward is bounded on that
+    // range in the router, and forcing a fixed scale makes successive
+    // refreshes visually comparable (no axis rescale jitter).
+    const yMax = 1;
+    const yMin = 0;
+    const yAt = v => padT + (1 - (v - yMin) / (yMax - yMin)) * innerH;
+
+    let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
+    svg += `<g class="grid">`;
+    [0, 0.5, 1].forEach(g => {
+      const y = yAt(g);
+      svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>`;
+    });
+    svg += `</g>`;
+    svg += `<text class="axis-label" x="2" y="${yAt(1) + 3}">1.0</text>`;
+    svg += `<text class="axis-label" x="2" y="${yAt(0.5) + 3}">0.5</text>`;
+    svg += `<text class="axis-label" x="2" y="${yAt(0) + 3}">0</text>`;
+
+    buckets.forEach((b, i) => {
+      const x = padL + i * barW + 1;
+      const w = Math.max(1, barW - 2);
+      if (!b.n) {
+        const h = 2;
+        const y = yAt(0) - h;
+        svg += `<rect class="reward-bar cold" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h}"><title>${fmt.time(b.ts)} · no samples</title></rect>`;
+        return;
+      }
+      const m = Math.max(0, Math.min(1, b.mean || 0));
+      const y = yAt(m);
+      const h = yAt(0) - y;
+      svg += `<rect class="reward-bar" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}"><title>${fmt.time(b.ts)} · μ ${m.toFixed(2)} · n=${b.n}</title></rect>`;
+    });
+
+    // Rolling mean reference line so a single hot bucket doesn't
+    // mislead — same value the panel header already shows.
+    let totalCount = 0, totalSum = 0;
+    buckets.forEach(b => {
+      if (!b.n) return;
+      totalCount += b.n;
+      totalSum += (b.mean || 0) * b.n;
+    });
+    if (totalCount > 0) {
+      const mean = totalSum / totalCount;
+      const y = yAt(Math.max(0, Math.min(1, mean)));
+      svg += `<line class="reward-mean-line" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"><title>24h μ ${mean.toFixed(2)} across ${totalCount} sample${totalCount === 1 ? '' : 's'}</title></line>`;
+    }
+
+    if (n >= 2) {
+      svg += `<text class="axis-label" x="${padL}" y="${H - 2}">${fmt.time(buckets[0].ts)}</text>`;
+      svg += `<text class="axis-label" text-anchor="end" x="${W - padR}" y="${H - 2}">${fmt.time(buckets[n - 1].ts)}</text>`;
+    }
+    svg += `</svg>`;
+    return svg;
+  }
+
+  // bucketSparkline is a compact (single-row) version of the drift
+  // chart for the per-(repo, topic) bucket table. Plots only the
+  // knobs that actually moved inside this bucket's recent_history.
+  function bucketSparkline(history, deltas) {
+    const events = (history || []).slice().reverse();
+    if (events.length === 0) {
+      return `<div class="bucket-spark empty">no drift</div>`;
+    }
+    const snapshots = [{profile: events[0].from || {}}];
+    for (const e of events) snapshots.push({profile: e.to || {}});
+    const movers = (deltas || []).filter(d => d.max > d.min).filter(d => {
+      const vs = snapshots.map(s => readKnob(s.profile, d.knob));
+      return vs.some(v => v !== vs[0]);
+    });
+    if (movers.length === 0) {
+      return `<div class="bucket-spark empty">no drift</div>`;
+    }
+    const W = 120, H = 26, pad = 2;
+    const innerW = W - pad * 2;
+    const innerH = H - pad * 2;
+    const n = snapshots.length;
+    const xAt = i => n <= 1 ? pad + innerW / 2 : pad + (i / (n - 1)) * innerW;
+    const yAt = norm => pad + (1 - norm) * innerH;
+    let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
+    svg += `<line class="knob-baseline" x1="${pad}" y1="${yAt(0.5).toFixed(1)}" x2="${W - pad}" y2="${yAt(0.5).toFixed(1)}"/>`;
+    movers.forEach(d => {
+      const color = knobColor(d.knob);
+      const path = snapshots.map((s, i) => {
+        const v = readKnob(s.profile, d.knob);
+        const norm = knobNorm(v, d.min, d.max);
+        return (i === 0 ? 'M' : 'L') + xAt(i).toFixed(1) + ' ' + yAt(norm).toFixed(1);
+      }).join(' ');
+      svg += `<path class="knob-line" d="${path}" stroke="${color}"/>`;
+    });
+    svg += `</svg>`;
+    return `<div class="bucket-spark" title="${movers.map(m => m.knob).join(', ')}">${svg}</div>`;
   }
 
   function bucketDeltasHtml(deltas) {
@@ -872,7 +1433,8 @@
     return interesting.map(d => {
       const cls = d.delta > 0 ? 'up' : 'down';
       const sign = d.delta > 0 ? '+' : '';
-      return `<span class="pill ${cls}">${fmt.escape(d.knob)} ${d.current} (${sign}${d.delta})</span>`;
+      const color = knobColor(d.knob);
+      return `<span class="pill ${cls}" style="border-color:${color};color:${color};" title="${fmt.escape(d.knob)} ${d.current} (default ${d.default}, range ${d.min}–${d.max})">${fmt.escape(d.knob)} ${d.current} (${sign}${d.delta})</span>`;
     }).join('');
   }
 
@@ -904,6 +1466,7 @@
           </div>
           <div class="bucket-deltas">${bucketDeltasHtml(b.deltas)}</div>
         </div>
+        ${bucketSparkline(b.recent_history, b.deltas)}
       </div>`;
   }
 
@@ -972,34 +1535,46 @@
         return;
       }
 
-      $('#heuristics-grid').innerHTML = visible.map(it => `
+      $('#heuristics-grid').innerHTML = visible.map(it => {
+        // Only show the most-recent few history events as a text
+        // list — the chart already covers the broader trajectory.
+        const recentText = (it.recent_history || []).slice(0, 4);
+        return `
         <div class="panel">
           <div class="panel-header">
             <h2>${fmt.escape(it.intent)} <span class="badge intent" style="margin-left:6px;">${fmt.escape(it.current_profile_id)}</span></h2>
             <div class="sub">${it.samples_7d} samples · μ ${it.mean_raw_reward_7d.toFixed(2)} · p50 ${it.p50_raw_reward_7d.toFixed(2)}</div>
           </div>
           <div style="padding: 12px 16px;">
-            <div class="knobs">
-              <span class="k">knob</span><span class="v">value</span><span class="delta">Δ default</span>
-              ${(it.deltas || []).map(d => `
-                <span class="k mono">${fmt.escape(d.knob)}</span>
-                <span class="v mono">${d.current}</span>
-                ${deltaCell(d)}
-              `).join('')}
+            <div class="knob-list">
+              ${(it.deltas || []).map(d => knobBar(d)).join('')}
             </div>
-            <div class="history">
-              ${(it.recent_history || []).length === 0
+            <div class="knob-charts">
+              <div class="knob-chart">
+                <div class="knob-chart-header">
+                  <h3>Knob drift · last ${(it.recent_history || []).length} event${(it.recent_history || []).length === 1 ? '' : 's'}</h3>
+                  <span class="hint">y = normalised position in min..max</span>
+                </div>
+                ${knobDriftChart(it.recent_history, it.deltas)}
+              </div>
+              <div class="knob-chart">
+                <div class="knob-chart-header">
+                  <h3>Reward · trailing 24h (hourly μ)</h3>
+                  <span class="hint">today: ${it.samples_today} · explicit ${fmt.pct(it.explicit_fraction_7d || 0)} · implicit ${fmt.pct(it.implicit_fraction_7d || 0)}</span>
+                </div>
+                ${rewardHistoryChart(it.reward_history)}
+              </div>
+            </div>
+            <ul class="history">
+              ${recentText.length === 0
                 ? '<li>no profile changes recorded</li>'
-                : (it.recent_history || []).map(h => `
+                : recentText.map(h => `
                   <li class="kind-${fmt.escape(h.kind)}">
                     <b>${fmt.escape(h.kind)}</b>
                     ${fmt.time(h.timestamp)}
                     <span style="color:var(--text-dim);">${fmt.escape(h.reason || '')}</span>
                   </li>`).join('')}
-            </div>
-            <div class="sub" style="margin-top:8px;color:var(--text-dim);font-size:11.5px;">
-              today: ${it.samples_today} · explicit ${fmt.pct(it.explicit_fraction_7d || 0)} · implicit ${fmt.pct(it.implicit_fraction_7d || 0)}
-            </div>
+            </ul>
             ${(it.buckets && it.buckets.length) ? `
               <div class="bucket-list">
                 <div class="sub" style="margin: 4px 0 6px 0; font-size:11.5px;">Per-(repo, topic) buckets · floor ${floor} samples${repo ? ` · repo=${fmt.escape(repo)}` : ''}</div>
@@ -1007,7 +1582,7 @@
               </div>` : ''}
           </div>
         </div>
-      `).join('');
+      `; }).join('');
 
       let status;
       if (v.frozen) status = 'frozen (read-only)';
@@ -1285,7 +1860,7 @@
   function renderFlowSVG(flow, {preview, maxDepth} = {preview: true, maxDepth: 1}) {
     if (flow.subgraph && (flow.subgraph.nodes || []).length > 0) {
       const depth = preview ? PREVIEW_DEPTH : Math.max(1, Math.min(MAX_DEPTH, maxDepth || 1));
-      return renderCallGraph(flow.subgraph, {preview, maxDepth: depth});
+      return renderCallGraph(flow.subgraph, {preview, maxDepth: depth, flow});
     }
     return renderBipartiteSVG(flow, {preview});
   }
@@ -1451,7 +2026,13 @@
   // The layout is fully deterministic so the same flow renders
   // identically on every reload (no force simulation, alphabetical
   // sort within each depth bucket).
-  function renderCallGraph(sg, {preview, maxDepth} = {preview: true, maxDepth: 1}) {
+  function renderCallGraph(sg, {preview, maxDepth, flow} = {preview: true, maxDepth: 1, flow: null}) {
+    // Feedback overlay classification (file -> {state, useful, dead}).
+    // Pulled in here so the band/node renderers can stamp ov-validated
+    // / ov-dead onto the right <rect>s as they emit them. classify()
+    // returns null when there's no signal for a path, in which case
+    // we fall through to the base role styling unchanged.
+    const overlay = flow ? buildFileClassification(flow) : { classify: () => null, missing: [] };
     const depth = Math.max(1, Math.min(MAX_DEPTH, maxDepth));
     const groupsAll = bandGroups(sg);
     if (!groupsAll.length) return '';
@@ -1552,7 +2133,15 @@
         col.nodes.forEach((n, i) => visiblePos.set(n.name,
           {x: colX[`c${col.depth}`], y: cursorY + i * rowH, col: `c${col.depth}`}));
       });
-      visiblePos.set(b.seed.name, {x: colX.s, y: seedY, col: 's'});
+      // The trailing orphans band has seed=null by design — it gathers
+      // nodes whose chain didn't terminate at any seed in the snapshot.
+      // Skipping its seed-position write lets the orphan-band columns
+      // still place correctly (the same forEach blocks above and below
+      // populate them); the matching renderNode call at the bottom is
+      // already `if (b.seed)`-guarded so the missing seed rect is fine.
+      if (b.seed) {
+        visiblePos.set(b.seed.name, {x: colX.s, y: seedY, col: 's'});
+      }
       b.calleeCols.forEach(col => {
         col.nodes.forEach((n, i) => visiblePos.set(n.name,
           {x: colX[`e${col.depth}`], y: cursorY + i * rowH, col: `e${col.depth}`}));
@@ -1605,7 +2194,10 @@
       svg += `<path class="edge-${e.type || 'CALLS'}" d="${d}" fill="none"/>`;
     });
 
-    // Nodes are two-line: symbol on top, file basename below.
+    // Nodes are two-line: primary on top, secondary below. For
+    // function-level nodes that's "symbol" / "file basename"; for
+    // file-level nodes (post-collapse, where n.name is the full path
+    // and equals n.file) it's "basename" / "dirname/".
     const labelCap = preview ? 32 : 60;
     const fileCap  = preview ? 28 : 50;
     const renderNode = (n, p) => {
@@ -1613,16 +2205,43 @@
                   : n.role === 'caller' ? '↑'
                   : n.role === 'callee' ? '↓'
                   : '·';
-      const cls = 'node-' + (n.role || 'callee');
+      const baseCls = 'node-' + (n.role || 'callee');
       const fileFull = n.file || '';
+      // File-level nodes have name === full path. Detect that here so
+      // the renderer keeps a single code path for both granularities.
+      const isFileNode = !!fileFull && n.name === fileFull && fileFull.indexOf('/') >= 0;
       const fileBase = fileFull ? (fileFull.split('/').pop() || fileFull) : '';
-      const title = fileFull ? `${n.name} — ${fileFull}` : n.name;
-      const symbolY = fileBase ? p.y + 16 : p.y + 23;
+      const fileDir = isFileNode
+        ? fileFull.slice(0, fileFull.length - fileBase.length).replace(/\/$/, '') + '/'
+        : '';
+      const primaryText = isFileNode ? fileBase : n.name;
+      const secondaryText = isFileNode ? fileDir : fileBase;
+      // Overlay tint + badge. Seeds skip the tint because the seed
+      // colour is the strongest visual signal in the graph — wrapping
+      // it in a green/grey ring fights for attention with the seed's
+      // own role. For callers / callees / aux nodes the tint is the
+      // whole point.
+      const ov = (n.role !== 'seed') ? overlay.classify(fileFull) : null;
+      const cls  = ov ? `${baseCls} ov-${ov.state}` : baseCls;
+      const ovTitle = ov ? ` · ${ov.useful}✓/${ov.dead}✗` : '';
+      const title = fileFull && !isFileNode
+        ? `${n.name} — ${fileFull}${ovTitle}`
+        : `${n.name}${ovTitle}`;
+      const symbolY = secondaryText ? p.y + 16 : p.y + 23;
       let out = `<g><title>${fmt.escape(title)}</title>`;
       out += `<rect class="${cls}" x="${p.x}" y="${p.y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
-      out += `<text class="node-text" x="${p.x + 8}" y="${symbolY}">${glyph} ${fmt.escape(fmt.truncate(n.name, labelCap))}</text>`;
-      if (fileBase) {
-        out += `<text class="node-file-text" x="${p.x + 16}" y="${p.y + 30}">${fmt.escape(fmt.truncate(fileBase, fileCap))}</text>`;
+      out += `<text class="node-text" x="${p.x + 8}" y="${symbolY}">${glyph} ${fmt.escape(fmt.truncate(primaryText, labelCap))}</text>`;
+      if (secondaryText) {
+        out += `<text class="node-file-text" x="${p.x + 16}" y="${p.y + 30}">${fmt.escape(fmt.truncate(secondaryText, fileCap))}</text>`;
+      }
+      if (ov) {
+        // Tiny corner badge: "+N✓" for validated, "−N✗" for dead.
+        // Rendered top-right of the rect so it doesn't overlap with
+        // the file basename baseline.
+        const badgeText = ov.state === 'validated'
+          ? `${ov.useful}✓` + (ov.dead ? ` / ${ov.dead}✗` : '')
+          : `${ov.dead}✗` + (ov.useful ? ` / ${ov.useful}✓` : '');
+        out += `<text class="ov-badge ${ov.state === 'validated' ? 'useful' : 'dead'}" x="${p.x + nodeW - 6}" y="${p.y + 12}" text-anchor="end">${badgeText}</text>`;
       }
       out += `</g>`;
       return out;
@@ -1672,14 +2291,26 @@
     legendItems.forEach(it => {
       legend += `<span><span class="swatch node-${it.role}"></span>${it.label}</span>`;
     });
+    // Overlay swatches only show up when the flow has any feedback —
+    // keeps the legend honest about whether the ov-* tints can appear.
+    if (flow && flow.total_feedback) {
+      legend += `<span><span class="swatch ov-swatch validated"></span>validated (agent read it)</span>`;
+      legend += `<span><span class="swatch ov-swatch dead"></span>dead-weight (agent finished w/o it)</span>`;
+      if ((flow.augmented_files || []).length) {
+        legend += `<span><span class="swatch ov-swatch missing"></span>missing (reported below)</span>`;
+      }
+    }
     if (sg.truncated && !preview) {
       legend += `<span class="truncated">codegraph snapshot was capped at save time — some neighbours weren't recorded</span>`;
     }
     legend += `</div>`;
 
+    const keyAttr = (!preview && flow && flow.repo != null && flow.name != null)
+      ? ` data-flow-scroll="${fmt.escape((flow.repo || '') + '::' + flow.name)}"`
+      : '';
     return preview
       ? svg + legend
-      : `<div class="flow-full-wrap">${svg}</div>${legend}`;
+      : `<div class="flow-full-wrap"${keyAttr}>${svg}</div>${legend}`;
   }
 
   // renderBipartiteSVG is the legacy renderer kept around for flows
@@ -1713,10 +2344,19 @@
       svg += `<rect class="node-entry" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
       svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">▸ ${fmt.escape(fmt.truncate(e, preview ? 30 : 60))}</text>`;
     });
+    const overlay = buildFileClassification(flow);
     files.forEach((f, i) => {
       const x = padX + nodeW + colGap - nodeW, y = padY + i * rowH;
-      svg += `<rect class="node-file" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
+      const ov = overlay.classify(f);
+      const cls = ov ? `node-file ov-${ov.state}` : 'node-file';
+      svg += `<rect class="${cls}" x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="4"/>`;
       svg += `<text class="node-text" x="${x + 8}" y="${y + 15}">${fmt.escape(fmt.truncate(f, preview ? 30 : 60))}</text>`;
+      if (ov) {
+        const badgeText = ov.state === 'validated'
+          ? `${ov.useful}✓` + (ov.dead ? ` / ${ov.dead}✗` : '')
+          : `${ov.dead}✗` + (ov.useful ? ` / ${ov.useful}✓` : '');
+        svg += `<text class="ov-badge ${ov.state === 'validated' ? 'useful' : 'dead'}" x="${x + nodeW - 6}" y="${y + 12}" text-anchor="end">${badgeText}</text>`;
+      }
     });
     const ex = padX + nodeW, fx = padX + colGap;
     for (let i = 0; i < entries.length; i++) {
@@ -1734,7 +2374,47 @@
       svg += `<text class="col-more" x="${padX + colGap + nodeW/2}" y="${padY + files.length * rowH + 14}">+${hiddenF} more</text>`;
     }
     svg += '</svg>';
-    return preview ? svg : `<div class="flow-full-wrap">${svg}</div>`;
+    const keyAttr = (!preview && flow && flow.repo != null && flow.name != null)
+      ? ` data-flow-scroll="${fmt.escape((flow.repo || '') + '::' + flow.name)}"`
+      : '';
+    return preview ? svg : `<div class="flow-full-wrap"${keyAttr}>${svg}</div>`;
+  }
+
+  // buildFileClassification turns a flow's overlay arrays into a
+  // lookup callable from the SVG renderers. classify(file) returns
+  // either null (no overlay match / abstain) or
+  // {state, useful, dead} so the caller can stamp a CSS class and a
+  // small badge on the node.
+  //
+  // Matching is case-insensitive substring-in-either-direction so a
+  // codegraph node's `file` like "cmpkg/x/internal/foo/bar.go" still
+  // matches an agent-reported overlay path like "internal/foo/bar.go"
+  // (and vice versa). Ties (useful == dead) abstain — better to show
+  // no signal than a misleading one.
+  //
+  // When several overlay rows match the same file we pick the one
+  // with the highest total event count so a noisy substring collision
+  // with a rarely-seen path can't outvote the dominant signal.
+  function buildFileClassification(flow) {
+    const stats = (flow.file_stats || []).map(s => ({ ...s, lc: (s.path || '').toLowerCase() }));
+    const missing = (flow.augmented_files || []).map(a => ({ ...a, lc: (a.path || '').toLowerCase() }));
+    function classify(file) {
+      if (!file || !stats.length) return null;
+      const f = file.toLowerCase();
+      let best = null;
+      for (const s of stats) {
+        if (!s.lc) continue;
+        const match = s.lc === f || s.lc.includes(f) || f.includes(s.lc);
+        if (!match) continue;
+        const total = (s.useful || 0) + (s.dead || 0);
+        if (!best || total > best._total) { best = { ...s, _total: total }; }
+      }
+      if (!best) return null;
+      if (best.useful > best.dead) return { state: 'validated', useful: best.useful, dead: best.dead };
+      if (best.dead > best.useful) return { state: 'dead',      useful: best.useful, dead: best.dead };
+      return null;
+    }
+    return { classify, missing };
   }
 
   // renderFlowMeta surfaces overlay aggregates as chips below the
@@ -1768,25 +2448,65 @@
   }
 
   async function renderFlows() {
+    const seq = ++state.flowsRenderSeq;
     try {
       // Empty repo → server returns flows across every indexed repo.
       // We rely on the per-row `repo` field (populated by LoadFlows
       // from the FT.SEARCH hit) to render a repo badge per card when
       // in the all-repos view.
       const repo = state.flowsRepo || '';
-      const flows = await fetchJSON(`/api/flows?repo=${encodeURIComponent(repo)}`);
+      const allFlows = await fetchJSON(`/api/flows?repo=${encodeURIComponent(repo)}`);
+      // A newer render started while this request was in-flight.
+      if (seq !== state.flowsRenderSeq) return;
 
-      // Repo dropdown sourced from the global list, not the response,
-      // so the user can still navigate to a repo that has zero flows
-      // (which would otherwise vanish from the dropdown the moment
-      // the response went empty).
+      // Cascading facets: Topic options come from flows that satisfy
+      // the *other* filter (repo) so picking a repo narrows the topic
+      // dropdown, and vice-versa. Topic is multi-valued per flow (one
+      // flow can be pulled in by queries under different topics) so
+      // the "matches" check is membership, not equality. Mirrors the
+      // matches/refillFilter pattern used by renderQueries.
+      const matches = (fl, {repo, topic}) =>
+        (repo  === '' || (fl.repo || '') === repo) &&
+        (topic === '' || (Array.isArray(fl.topics) && fl.topics.includes(topic)));
+
+      // Repo dropdown: still sourced from the global repo list so a
+      // repo with zero flows stays selectable (matches existing UX).
+      // Topic dropdown: sourced from the data because there's no
+      // global "all topics that flows could possibly carry" list —
+      // it's whatever queries have produced. Empty until topic
+      // clustering kicks in; dropdown gracefully shows just "all".
       state.flowsRepo = refillFilter('#flows-repo', state.repos, repo);
+      const topicCandidates = allFlows
+        .filter(fl => matches(fl, {repo: state.flowsRepo, topic: ''}))
+        .flatMap(fl => Array.isArray(fl.topics) ? fl.topics : []);
+      state.flowsTopic = refillFilter('#flows-topic', topicCandidates, state.flowsTopic);
+
+      const topic = state.flowsTopic;
+      const flows = allFlows.filter(fl => matches(fl, {repo: state.flowsRepo, topic}));
 
       if (!flows.length) {
         const target = state.flowsRepo || 'any repo';
-        $('#flows-body').innerHTML = `<div class="empty">No flows saved for ${fmt.escape(target)} yet.</div>`;
+        const topicSuffix = topic ? ` under topic "${fmt.escape(topic)}"` : '';
+        const msg = allFlows.length
+          ? `No flows match the current filters${topicSuffix}. <a href="#" id="flows-reset-inline">clear filters</a>`
+          : `No flows saved for ${fmt.escape(target)} yet.`;
+        $('#flows-body').innerHTML = `<div class="empty">${msg}</div>`;
+        const reset = $('#flows-reset-inline');
+        if (reset) reset.addEventListener('click', e => {
+          e.preventDefault();
+          state.flowsRepo = state.flowsTopic = '';
+          renderFlows();
+        });
         return;
       }
+      // Snapshot *right before* replacing DOM. Doing this after the
+      // async fetch captures the latest user scroll position rather
+      // than whatever it was when the request started.
+      $$('#flows-body .flow-full-wrap[data-flow-scroll]').forEach(wrap => {
+        const key = wrap.dataset.flowScroll;
+        if (!key) return;
+        state.flowScroll.set(key, wrap.scrollLeft);
+      });
       const showRepo = !state.flowsRepo;
       $('#flows-body').innerHTML = flows.map(f => {
         const repoBadge = showRepo && f.repo
@@ -1839,6 +2559,32 @@
           </div>
         </div>`;
       }).join('');
+      // Restore horizontal scroll after DOM replacement. Use rAF so the
+      // browser has applied layout/overflow metrics before setting left.
+      requestAnimationFrame(() => {
+        if (seq !== state.flowsRenderSeq) return;
+        $$('#flows-body .flow-full-wrap[data-flow-scroll]').forEach(wrap => {
+          const key = wrap.dataset.flowScroll;
+          if (!key) return;
+          const x = state.flowScroll.get(key);
+          if (typeof x === 'number' && x > 0) wrap.scrollLeft = x;
+        });
+      });
+      // Some browsers apply intrinsic SVG sizing one frame later; do a
+      // second pass to avoid occasional snap-back-to-zero on wide graphs.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (seq !== state.flowsRenderSeq) return;
+          $$('#flows-body .flow-full-wrap[data-flow-scroll]').forEach(wrap => {
+            const key = wrap.dataset.flowScroll;
+            if (!key) return;
+            const x = state.flowScroll.get(key);
+            if (typeof x === 'number' && x > 0 && wrap.scrollLeft !== x) {
+              wrap.scrollLeft = x;
+            }
+          });
+        });
+      });
     } catch (e) {
       $('#flows-body').innerHTML = `<div class="empty">error: ${fmt.escape(e.message)}</div>`;
     }
@@ -1927,8 +2673,9 @@
     renderDecisions();
   });
   $('#flows-repo').addEventListener('change', e => { state.flowsRepo = e.target.value; renderFlows(); });
+  $('#flows-topic').addEventListener('change', e => { state.flowsTopic = e.target.value; renderFlows(); });
   $('#flows-clear-filters').addEventListener('click', () => {
-    state.flowsRepo = '';
+    state.flowsRepo = state.flowsTopic = '';
     renderFlows();
   });
   // Delegate the expand/collapse toggle off the flows pane root so we
@@ -1952,6 +2699,14 @@
     state.flowDepth.set(key, Number(slider.value));
     renderFlows();
   });
+  // Preserve per-flow horizontal scroll across auto-refresh rerenders.
+  $('#flows-body').addEventListener('scroll', e => {
+    const wrap = e.target.closest('.flow-full-wrap[data-flow-scroll]');
+    if (!wrap) return;
+    const key = wrap.dataset.flowScroll;
+    if (!key) return;
+    state.flowScroll.set(key, wrap.scrollLeft);
+  }, true);
   $('#topics-intent').addEventListener('change', e => { state.topicsIntent = e.target.value; renderTopics(); });
   $('#topics-repo').addEventListener('change', e => { state.topicsRepo = e.target.value; renderTopics(); });
   $('#topics-clear-filters').addEventListener('click', () => {

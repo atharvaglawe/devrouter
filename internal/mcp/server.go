@@ -194,6 +194,7 @@ func (s *Server) toolDefinitions() []map[string]any {
 					"purpose":      map[string]any{"type": "string", "description": "Step-by-step description of the flow: what triggers it, what happens, which files, where data flows"},
 					"files":        map[string]any{"type": "string", "description": "Key file paths involved (comma-separated)"},
 					"entry_points": map[string]any{"type": "string", "description": "Entry point functions that kick off this flow (comma-separated)"},
+					"query_id":     map[string]any{"type": "string", "description": "Optional query_id from dev_context. When supplied, devrouter reuses the stored query plan to filter noisy graph edges before snapshotting the flow graph."},
 					"scope":        map[string]any{"type": "string", "description": "Scope override. Use \"global\" to share across all branches. Omit to auto-detect: if any file differs from the release branch, scope is set to the current branch; otherwise \"global\"."},
 				},
 				"required": []string{"repo", "name", "purpose"},
@@ -490,12 +491,13 @@ func (s *Server) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
 			Purpose     string `json:"purpose"`
 			Files       string `json:"files"`
 			EntryPoints string `json:"entry_points"`
+			QueryID     string `json:"query_id"`
 			Scope       string `json:"scope"`
 		}
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return s.errResp(req.ID, -32602, "invalid arguments: "+err.Error())
 		}
-		if err := s.router.SaveFlowMemory(args.Repo, args.Name, args.Purpose, args.Files, args.EntryPoints, args.Scope); err != nil {
+		if err := s.router.SaveFlowMemory(args.Repo, args.Name, args.Purpose, args.Files, args.EntryPoints, args.Scope, args.QueryID); err != nil {
 			return s.errResp(req.ID, -32000, err.Error())
 		}
 		return s.success(req.ID, map[string]any{

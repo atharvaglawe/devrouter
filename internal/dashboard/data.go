@@ -128,12 +128,37 @@ func traceFieldsToRow(id string, f map[string]string) QueryRow {
 // ProfileDelta is the per-knob diff between the live profile and the
 // frozen default. Surfacing this is the single most-asked observability
 // question for the heuristics layer: "what has the bandit changed?"
+//
+// Min/Max mirror heuristics.Bounds so the dashboard can render each
+// knob's current value as a position inside its valid range (no need
+// to round-trip back to Go for bounds metadata).
 type ProfileDelta struct {
 	Knob    string `json:"knob"`
 	Current int    `json:"current"`
 	Default int    `json:"default"`
 	Delta   int    `json:"delta"`
+	Min     int    `json:"min"`
+	Max     int    `json:"max"`
 }
+
+// RewardBucket is one downsampled cell on the per-intent reward
+// time-series surfaced under HeuristicIntentView.RewardHistory. The
+// dashboard renders the slice as an hourly sparkline so devs can spot
+// regressions (mean dropping) without tailing logs.
+//
+// Buckets cover the trailing RewardHistoryHours hours, oldest first.
+// A bucket with Count==0 is still emitted so the chart preserves
+// chronological spacing — the UI just renders it as a gap.
+type RewardBucket struct {
+	TimestampMs int64   `json:"ts"`
+	Count       int     `json:"n"`
+	Mean        float64 `json:"mean,omitempty"`
+}
+
+// RewardHistoryHours is the rolling window the reward sparkline covers.
+// 24 hourly buckets gives a "last day" view that lines up cleanly with
+// the SamplesToday counter already on the panel header.
+const RewardHistoryHours = 24
 
 // HeuristicIntentView aggregates everything the dashboard wants to
 // show for a single intent: live + default profile, the per-knob deltas
@@ -154,7 +179,13 @@ type HeuristicIntentView struct {
 	ExplicitFraction7d float64                   `json:"explicit_fraction_7d"`
 	ImplicitFraction7d float64                   `json:"implicit_fraction_7d"`
 	RecentHistory      []heuristics.HistoryEntry `json:"recent_history"`
-	Buckets            []HeuristicBucketView     `json:"buckets,omitempty"`
+	// RewardHistory is a 24-bucket hourly time-series of mean
+	// raw_reward, oldest first. Lets the dashboard render a sparkline
+	// next to the knob drift chart so users can correlate "bandit
+	// changed X" with "reward shifted Y". Empty when the intent has
+	// no reward rows in the window.
+	RewardHistory []RewardBucket        `json:"reward_history,omitempty"`
+	Buckets       []HeuristicBucketView `json:"buckets,omitempty"`
 }
 
 // HeuristicBucketView is the per-(repo, topic) row in the nested
@@ -238,6 +269,14 @@ func LoadHeuristics(ctx context.Context, picker *heuristics.Picker) HeuristicsVi
 				RecentHistory:    b.RecentHistory,
 			})
 		}
+		// picker.Stats() caps history at 5 to keep its payload tight
+		// for non-dashboard callers. For the drift chart we want
+		// enough events to actually show a trajectory — re-fetch
+		// directly from the store with a deeper window.
+		history := picker.Store.History(ctx, is.Intent, 30)
+		if len(history) == 0 {
+			history = is.RecentHistory
+		}
 		view.Intents = append(view.Intents, HeuristicIntentView{
 			Intent:             is.Intent,
 			Current:            is.CurrentProfile,
@@ -251,11 +290,69 @@ func LoadHeuristics(ctx context.Context, picker *heuristics.Picker) HeuristicsVi
 			P95RawReward7d:     is.P95RawReward7d,
 			ExplicitFraction7d: is.ExplicitFraction7d,
 			ImplicitFraction7d: is.ImplicitFraction7d,
-			RecentHistory:      is.RecentHistory,
+			RecentHistory:      history,
+			RewardHistory:      buildRewardHistory(picker.Store.RecentRewards(ctx, is.Intent, 2, 5000), RewardHistoryHours),
 			Buckets:            buckets,
 		})
 	}
 	return view
+}
+
+// buildRewardHistory downsamples raw reward rows into a fixed-width
+// hourly time-series, oldest-first. Empty buckets are kept so the
+// dashboard's SVG sparkline can render time spacing correctly (a 4h
+// gap looks like 4 zero-count bars, not a single thin bar).
+//
+// Returns nil when no rewards fall inside the window so the JSON
+// payload omits the field entirely for cold intents.
+func buildRewardHistory(rows []heuristics.RewardRow, hours int) []RewardBucket {
+	if hours <= 0 {
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	bucketMs := int64(60 * 60 * 1000)
+	now := nowMs()
+	// Align the right edge to the current hour boundary so successive
+	// dashboard refreshes don't shift the entire chart horizontally
+	// every second.
+	endMs := (now/bucketMs + 1) * bucketMs
+	startMs := endMs - int64(hours)*bucketMs
+
+	type acc struct {
+		sum   float64
+		count int
+	}
+	buckets := make([]acc, hours)
+	any := false
+	for _, r := range rows {
+		if r.Timestamp < startMs || r.Timestamp >= endMs {
+			continue
+		}
+		idx := int((r.Timestamp - startMs) / bucketMs)
+		if idx < 0 || idx >= hours {
+			continue
+		}
+		buckets[idx].sum += r.RawReward
+		buckets[idx].count++
+		any = true
+	}
+	if !any {
+		return nil
+	}
+	out := make([]RewardBucket, hours)
+	for i := 0; i < hours; i++ {
+		b := RewardBucket{
+			TimestampMs: startMs + int64(i)*bucketMs,
+			Count:       buckets[i].count,
+		}
+		if buckets[i].count > 0 {
+			b.Mean = buckets[i].sum / float64(buckets[i].count)
+		}
+		out[i] = b
+	}
+	return out
 }
 
 // LoadTopics returns every centroid registry entry across all known
@@ -300,22 +397,24 @@ func LoadTopics(ctx context.Context, picker *heuristics.Picker) []TopicView {
 // knobs are included too so the UI can render the full grid; the
 // caller filters when it wants only the interesting ones.
 func computeDeltas(cur, def heuristics.Profile) []ProfileDelta {
+	b := heuristics.Bounds
 	pairs := []struct {
-		name string
-		c, d int
+		name      string
+		c, d      int
+		min, maxv int
 	}{
-		{"max_trace", cur.MaxTrace, def.MaxTrace},
-		{"caller_hops", cur.CallerHops, def.CallerHops},
-		{"max_upstream", cur.MaxUpstream, def.MaxUpstream},
-		{"max_downstream", cur.MaxDownstream, def.MaxDownstream},
-		{"max_importers", cur.MaxImporters, def.MaxImporters},
-		{"max_methods", cur.MaxMethods, def.MaxMethods},
-		{"max_siblings", cur.MaxSiblings, def.MaxSiblings},
-		{"max_snippets", cur.MaxSnippets, def.MaxSnippets},
-		{"max_impact", cur.MaxImpact, def.MaxImpact},
-		{"max_symbols", cur.MaxSymbols, def.MaxSymbols},
-		{"max_primary_ctx", cur.MaxPrimaryCtx, def.MaxPrimaryCtx},
-		{"max_decisions", cur.MaxDecisions, def.MaxDecisions},
+		{"max_trace", cur.MaxTrace, def.MaxTrace, b.MaxTrace[0], b.MaxTrace[1]},
+		{"caller_hops", cur.CallerHops, def.CallerHops, b.CallerHops[0], b.CallerHops[1]},
+		{"max_upstream", cur.MaxUpstream, def.MaxUpstream, b.MaxUpstream[0], b.MaxUpstream[1]},
+		{"max_downstream", cur.MaxDownstream, def.MaxDownstream, b.MaxDownstream[0], b.MaxDownstream[1]},
+		{"max_importers", cur.MaxImporters, def.MaxImporters, b.MaxImporters[0], b.MaxImporters[1]},
+		{"max_methods", cur.MaxMethods, def.MaxMethods, b.MaxMethods[0], b.MaxMethods[1]},
+		{"max_siblings", cur.MaxSiblings, def.MaxSiblings, b.MaxSiblings[0], b.MaxSiblings[1]},
+		{"max_snippets", cur.MaxSnippets, def.MaxSnippets, b.MaxSnippets[0], b.MaxSnippets[1]},
+		{"max_impact", cur.MaxImpact, def.MaxImpact, b.MaxImpact[0], b.MaxImpact[1]},
+		{"max_symbols", cur.MaxSymbols, def.MaxSymbols, b.MaxSymbols[0], b.MaxSymbols[1]},
+		{"max_primary_ctx", cur.MaxPrimaryCtx, def.MaxPrimaryCtx, b.MaxPrimaryCtx[0], b.MaxPrimaryCtx[1]},
+		{"max_decisions", cur.MaxDecisions, def.MaxDecisions, b.MaxDecisions[0], b.MaxDecisions[1]},
 	}
 	out := make([]ProfileDelta, 0, len(pairs))
 	for _, p := range pairs {
@@ -324,6 +423,8 @@ func computeDeltas(cur, def heuristics.Profile) []ProfileDelta {
 			Current: p.c,
 			Default: p.d,
 			Delta:   p.c - p.d,
+			Min:     p.min,
+			Max:     p.maxv,
 		})
 	}
 	return out
@@ -429,6 +530,15 @@ type FlowNode struct {
 	AugmentedFiles []FileFeedbackStat `json:"augmented_files,omitempty"` // slice 2: agent-reported missing
 	TotalFeedback  int                `json:"total_feedback,omitempty"`
 	LastFeedbackAt int64              `json:"last_feedback_at,omitempty"`
+
+	// Topics is the set of distinct topic labels of queries that have
+	// historically pulled this flow in via memory_keys. Empty when no
+	// query has referenced the flow under a non-* topic — a flow that
+	// only ever gets retrieved on the intent-global fallback won't
+	// appear under any topic filter. Built per /api/flows call by
+	// scanning the bounded feedback:trace:index ZSET (capped at
+	// TraceIndexCap=500), so cost stays flat regardless of fan-out.
+	Topics []string `json:"topics,omitempty"`
 }
 
 // FlowSubgraph is the JSON shape the dashboard renders. It mirrors
@@ -483,7 +593,13 @@ type FileFeedbackStat struct {
 // FlowNodes so /api/flows is still ~constant round-trips. store may
 // safely be nil in tests that pass only a redis client; overlay fields
 // just stay empty.
-func LoadFlows(ctx context.Context, rdb *redis.Client, store *memory.Store, repo string) []FlowNode {
+//
+// hStore (the heuristics store, holding the bounded
+// feedback:trace:index ZSET) is used to derive each flow's Topics
+// array from the queries that historically referenced it via
+// memory_keys. May be nil — Topics just stays empty in that case, the
+// rest of the response renders unchanged.
+func LoadFlows(ctx context.Context, rdb *redis.Client, store *memory.Store, hStore *heuristics.Store, repo string) []FlowNode {
 	if rdb == nil {
 		return nil
 	}
@@ -602,9 +718,76 @@ func LoadFlows(ctx context.Context, rdb *redis.Client, store *memory.Store, repo
 		}
 	}
 
+	// Topic join: each flow inherits the distinct topic labels of the
+	// queries that historically referenced it via memory_keys. Bounded
+	// by TraceIndexCap (=500) traces, so cost is flat and decoupled
+	// from how many flows we're rendering. When no query has ever
+	// landed under a real topic (today: topic clustering disabled or
+	// no centroids yet), Topics stays nil and the Flows-tab Topic
+	// dropdown shows just "all" — degrades gracefully.
+	if hStore != nil && len(out) > 0 {
+		flowTopics := flowTopicIndex(ctx, hStore, rdb)
+		for i := range out {
+			key := "mem:" + out[i].Repo + ":flow:" + out[i].Name
+			if topics, ok := flowTopics[key]; ok && len(topics) > 0 {
+				out[i].Topics = topics
+			}
+		}
+	}
+
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].UpdatedAt > out[j].UpdatedAt
 	})
+	return out
+}
+
+// flowTopicIndex scans the bounded feedback:trace:index ZSET once and
+// returns flowMemoryKey -> sorted distinct topic labels. Reuses
+// LoadRecentQueries' pipelined HGETALL so we do exactly one batched
+// Redis round-trip regardless of trace count.
+//
+// We key on `mem:{repo}:flow:{name}` (the literal memory_keys CSV
+// element) rather than {repo,name} so the lookup in LoadFlows is a
+// single string concat + map probe per flow. Topic preference is
+// label-then-id, mirroring the Queries tab; an empty/"*" topic
+// (intent-global fallback) is intentionally dropped so flows that
+// only ever fall back never pollute the Topic dropdown.
+func flowTopicIndex(ctx context.Context, hStore *heuristics.Store, rdb *redis.Client) map[string][]string {
+	rows := LoadRecentQueries(ctx, hStore, rdb, heuristics.TraceIndexCap)
+	if len(rows) == 0 {
+		return nil
+	}
+	tmp := make(map[string]map[string]struct{}, 64)
+	for _, q := range rows {
+		topic := q.TopicLabel
+		if topic == "" {
+			topic = q.TopicID
+		}
+		if topic == "" || topic == "*" {
+			continue
+		}
+		for _, mk := range q.MemoryKeys {
+			if !strings.Contains(mk, ":flow:") {
+				continue
+			}
+			if tmp[mk] == nil {
+				tmp[mk] = make(map[string]struct{}, 2)
+			}
+			tmp[mk][topic] = struct{}{}
+		}
+	}
+	if len(tmp) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(tmp))
+	for k, set := range tmp {
+		topics := make([]string, 0, len(set))
+		for t := range set {
+			topics = append(topics, t)
+		}
+		sort.Strings(topics)
+		out[k] = topics
+	}
 	return out
 }
 

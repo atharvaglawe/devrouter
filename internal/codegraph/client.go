@@ -701,8 +701,20 @@ func (c *Client) Subgraph(repo string, seeds []string) (*Subgraph, error) {
 		// dot ("health.ServeRequest" → "ServeRequest"). The tail is
 		// also registered as a seed so it sits in the same band as
 		// the qualified form in the UI.
+		//
+		// Reject common short tails (Init, Run, New, Get, Set, …) and
+		// any tail that resolves to many symbols across the repo —
+		// otherwise a single qualified seed that didn't resolve pulls
+		// in the union of every Init() in the codebase, drowning the
+		// flow graph in unrelated callers/callees.
 		tail := bareTail(seed)
 		if tail == "" || tail == seed {
+			continue
+		}
+		if isCommonShortSymbol(tail) {
+			continue
+		}
+		if hits, err := c.NameHitCount(tail, repo); err == nil && hits > bareTailRarityCeiling {
 			continue
 		}
 		upsertNode(tail, "", "seed", 0)
@@ -738,6 +750,40 @@ func (c *Client) Subgraph(repo string, seeds []string) (*Subgraph, error) {
 		return sg.Edges[i].To < sg.Edges[j].To
 	})
 	return sg, nil
+}
+
+// bareTailRarityCeiling is the maximum NameHitCount(tail) we'll tolerate
+// before suppressing the qualified-name fallback. The ceiling is a
+// conservative anti-noise threshold: real domain symbols rarely have
+// more than ~30 namesakes in a single repo, while generic verbs like
+// Init/Run/New routinely hit 200–1000. Bumped high enough to not block
+// legitimate "MyType.Process" → "Process" (where Process is a domain
+// concept), low enough to block "X.Init" → "Init".
+const bareTailRarityCeiling = 30
+
+// commonShortSymbols are method names so generic that any bare-tail
+// fallback to them would always swamp the snapshot. Hardcoded because
+// they're cheaper than a Cypher round-trip and unambiguous in any Go
+// codebase. Add to this list when you see a new one anchoring noise.
+var commonShortSymbols = map[string]bool{
+	"init":  true,
+	"new":   true,
+	"run":   true,
+	"start": true,
+	"stop":  true,
+	"close": true,
+	"open":  true,
+	"read":  true,
+	"write": true,
+	"get":   true,
+	"set":   true,
+	"add":   true,
+	"do":    true,
+	"main":  true,
+}
+
+func isCommonShortSymbol(tail string) bool {
+	return commonShortSymbols[strings.ToLower(tail)]
 }
 
 // bareTail returns the substring after the last "." in name, or "" if

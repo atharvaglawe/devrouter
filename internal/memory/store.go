@@ -86,6 +86,7 @@ type FlowMemory struct {
 	EntryPoints  string `json:"entry_points,omitempty"`
 	Source       string `json:"source"`
 	Scope        string `json:"scope,omitempty"` // "global" or branch name
+	QueryID      string `json:"query_id,omitempty"`
 	SubgraphJSON string `json:"subgraph_json,omitempty"`
 }
 
@@ -545,6 +546,9 @@ func (s *Store) SaveFlow(m FlowMemory) error {
 		"scope":        m.Scope,
 		"updated_at":   time.Now().UnixMilli(),
 		"embedding":    Float32ToBytes(vec),
+	}
+	if m.QueryID != "" {
+		fields["query_id"] = m.QueryID
 	}
 	// SubgraphJSON is only written when non-empty so flows that were
 	// saved without an entry-point seed (or before this field existed)
