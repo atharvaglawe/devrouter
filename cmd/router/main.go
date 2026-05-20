@@ -169,6 +169,7 @@ Environment:
   DEVROUTER_REDIS                Redis address (default localhost:6379)
   DEVROUTER_EMBEDDING_URL        Embedding endpoint (default http://localhost:11435/api/embed — bundled ONNX embedder)
   DEVROUTER_EMBEDDING_MODEL      Model name sent in /api/embed requests (default nomic-embed-text-v1.5; advisory only on the ONNX embedder)
+  DEVROUTER_RELEASE_BRANCH       Git ref the save-time scope detector diffs against (default origin/release; try origin/main / origin/master)
   CODEGRAPH_URL                  Codegraph HTTP base URL (default http://localhost:4747)
   GITNEXUS_URL                   Legacy alias for CODEGRAPH_URL (deprecated)
   DEVROUTER_CODEGRAPH_CLI        Override path to codegraph dist/cli/index.js

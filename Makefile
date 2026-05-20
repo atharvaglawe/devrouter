@@ -246,6 +246,20 @@ list-memories:
 		echo ""; \
 	done
 
+# NOTE: the README dashboard demo gif/mp4 used to live behind a
+# `make demo-gif` target here. The recorder + encoder pipeline has
+# been extracted into a sibling project so it can be reused for any
+# dashboard:
+#
+#   https://github.com/<your-org>/devrouter-demo-recorder
+#   (or locally: ../devrouter-demo-recorder)
+#
+# To rebuild docs/assets/devrouter-goserving.{gif,mp4} after a UI tweak:
+#
+#   1. Make sure the dashboard is running:        make run
+#   2. (Optional) populate realistic data:        python3 bench/runner.py --repo goserving --adapters devrouter
+#   3. From the demo-recorder repo:               make demo && make publish PUBLISH_DIR=$(CURDIR)/docs/assets
+
 list-memories-repo:
 	@if [ -z "$(REPO)" ]; then echo "Usage: make list-memories-repo REPO=goserving"; exit 1; fi
 	@echo "=== $(REPO) ==="
@@ -287,6 +301,10 @@ help:
 	@echo "  make flush-memories                Drop all stored memories from Redis"
 	@echo "  make list-memories                 List all memory keys (all repos)"
 	@echo "  make list-memories-repo REPO=name  List memories for a specific repo"
+	@echo ""
+	@echo "Docs:"
+	@echo "  README dashboard gif: rebuild via the sibling devrouter-demo-recorder project"
+	@echo "    (../devrouter-demo-recorder: make demo && make publish PUBLISH_DIR=\$$(pwd)/docs/assets)"
 	@echo ""
 	@echo "Environment:"
 	@echo "  REDIS_ADDR         (default: localhost:6379)"

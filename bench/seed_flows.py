@@ -332,12 +332,14 @@ def seed_repo(proc: subprocess.Popen, repo: str, flows: list[dict], dry_run: boo
             "name":    f["name"],
             "purpose": f["purpose"],
             # Pin scope to "global" so DevRouter's SaveFlowMemory skips
-            # the per-file `git diff origin/release -- <file>` walk in
-            # memory.ScopeForFiles. Without this each save shells out
-            # to git once per listed file (and once more for
-            # fetchRelease), which dominates wall-clock for seed data
-            # — turning a 100ms save into a 5-15s one. Synthetic seed
-            # corpora are never branch-specific anyway.
+            # the per-file `git diff <release-ref> -- <file>` walk in
+            # memory.ScopeForFiles (where <release-ref> defaults to
+            # `origin/release`, configurable via DEVROUTER_RELEASE_BRANCH).
+            # Without this each save shells out to git once per listed
+            # file (and once more for fetchRelease), which dominates
+            # wall-clock for seed data — turning a 100ms save into a
+            # 5-15s one. Synthetic seed corpora are never branch-specific
+            # anyway.
             "scope":   "global",
         }
         for opt in ("files", "entry_points"):
