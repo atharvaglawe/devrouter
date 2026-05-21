@@ -277,6 +277,101 @@ func TestScopeForFiles(t *testing.T) {
 	}
 }
 
+// setupTestGitRepoCustomBaseline creates a test git setup whose baseline
+// branch on origin is named `baselineRef` (e.g. "main") rather than
+// "release". Used to exercise DEVROUTER_RELEASE_BRANCH overrides.
+func setupTestGitRepoCustomBaseline(t *testing.T, baselineBranch string) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	originDir := filepath.Join(tmpDir, "origin.git")
+	workDir := filepath.Join(tmpDir, "working")
+
+	mustGit(t, "", "init", "--bare", originDir)
+
+	mustGit(t, "", "init", workDir)
+	mustGit(t, workDir, "config", "user.email", "test@test.com")
+	mustGit(t, workDir, "config", "user.name", "Test User")
+	mustGit(t, workDir, "remote", "add", "origin", originDir)
+
+	writeFile(t, workDir, "stable.go", "package main\n")
+	mustGit(t, workDir, "add", ".")
+	mustGit(t, workDir, "commit", "-m", "initial commit")
+
+	// Push to origin under the caller-chosen baseline name (e.g. "main").
+	mustGit(t, workDir, "push", "origin", "HEAD:"+baselineBranch)
+
+	mustGit(t, workDir, "checkout", "-b", "feature-xyz")
+	writeFile(t, workDir, "new_file.go", "package main\n")
+	mustGit(t, workDir, "add", ".")
+	mustGit(t, workDir, "commit", "-m", "add feature file")
+
+	return workDir
+}
+
+// TestReleaseRef verifies the env-var override and default fallback.
+func TestReleaseRef(t *testing.T) {
+	t.Setenv("DEVROUTER_RELEASE_BRANCH", "")
+	if got := ReleaseRef(); got != DefaultReleaseRef {
+		t.Errorf("ReleaseRef() with unset env = %q, want %q", got, DefaultReleaseRef)
+	}
+
+	t.Setenv("DEVROUTER_RELEASE_BRANCH", "origin/main")
+	if got := ReleaseRef(); got != "origin/main" {
+		t.Errorf("ReleaseRef() = %q, want %q", got, "origin/main")
+	}
+
+	// Whitespace should be trimmed.
+	t.Setenv("DEVROUTER_RELEASE_BRANCH", "  upstream/trunk  ")
+	if got := ReleaseRef(); got != "upstream/trunk" {
+		t.Errorf("ReleaseRef() trimmed = %q, want %q", got, "upstream/trunk")
+	}
+}
+
+// TestScopeForFile_CustomReleaseRef exercises DEVROUTER_RELEASE_BRANCH.
+// The repo's baseline branch on origin is `main`, not `release`, so the
+// default ref ("origin/release") wouldn't exist — the override is what
+// makes scope detection work.
+func TestScopeForFile_CustomReleaseRef(t *testing.T) {
+	checkGitAvailable(t)
+	t.Setenv("DEVROUTER_RELEASE_BRANCH", "origin/main")
+	repoPath := setupTestGitRepoCustomBaseline(t, "main")
+
+	if got := ScopeForFile(repoPath, "stable.go"); got != "global" {
+		t.Errorf("ScopeForFile(stable.go) with origin/main baseline = %q, want %q", got, "global")
+	}
+	if got := ScopeForFile(repoPath, "new_file.go"); got != "feature-xyz" {
+		t.Errorf("ScopeForFile(new_file.go) with origin/main baseline = %q, want %q", got, "feature-xyz")
+	}
+}
+
+// TestScopeForFiles_CustomReleaseRef mirrors the file-set scope check
+// against a non-default release ref.
+func TestScopeForFiles_CustomReleaseRef(t *testing.T) {
+	checkGitAvailable(t)
+	t.Setenv("DEVROUTER_RELEASE_BRANCH", "origin/main")
+	repoPath := setupTestGitRepoCustomBaseline(t, "main")
+
+	if got := ScopeForFiles(repoPath, "stable.go"); got != "global" {
+		t.Errorf("ScopeForFiles(stable.go) with origin/main baseline = %q, want %q", got, "global")
+	}
+	if got := ScopeForFiles(repoPath, "stable.go,new_file.go"); got != "feature-xyz" {
+		t.Errorf("ScopeForFiles(mixed) with origin/main baseline = %q, want %q", got, "feature-xyz")
+	}
+}
+
+// TestScopeForDecision_CustomReleaseRef exercises the no-files path,
+// which uses `git rev-list --count <ref>..HEAD` and is the most
+// sensitive consumer of the configured ref.
+func TestScopeForDecision_CustomReleaseRef(t *testing.T) {
+	checkGitAvailable(t)
+	t.Setenv("DEVROUTER_RELEASE_BRANCH", "origin/main")
+	repoPath := setupTestGitRepoCustomBaseline(t, "main")
+
+	if got := ScopeForDecision(repoPath, ""); got != "feature-xyz" {
+		t.Errorf("ScopeForDecision(no files) with origin/main baseline = %q, want %q", got, "feature-xyz")
+	}
+}
+
 // TestScopeForDecision tests the ScopeForDecision function.
 func TestScopeForDecision(t *testing.T) {
 	checkGitAvailable(t)

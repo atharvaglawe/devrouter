@@ -347,6 +347,7 @@ func recordStage(trace *prompt.RetrievalTrace, stageName string) func(*prompt.St
 //  4. Graph — budgeted traversal (depth/breadth controlled by memory strength + intent)
 //  5. Merge — build unified ContextNodes grouping memories + graph data by file
 //  6. Trim — adaptive caps based on intent
+//
 // HandleQuery is the back-compat entry point: no caller-supplied plan,
 // retrieval falls back to deterministic tokenization + auto-anchoring.
 // New callers should use HandleQueryWithPlan and pass the structured
@@ -3655,7 +3656,7 @@ func collapseSubgraphToFileLevel(sg *codegraph.Subgraph, agentSeeds []string) *c
 
 // SaveDecisionMemory persists a developer decision.
 // Returns a list of conflict warnings (save is not blocked by conflicts).
-// The scope parameter is auto-detected if empty: "global" if files are unchanged vs origin/release, else current branch.
+// The scope parameter is auto-detected if empty: "global" if files are unchanged vs the configured release ref (see memory.ReleaseRef / DEVROUTER_RELEASE_BRANCH), else current branch.
 func (r *Router) SaveDecisionMemory(repo, name, decisionType, decision, rationale, alternatives, constraint, decScope, files, scope string) ([]string, error) {
 	if repo == "" || name == "" || decisionType == "" || decision == "" || rationale == "" {
 		return nil, fmt.Errorf("repo, name, decision_type, decision, and rationale are required")

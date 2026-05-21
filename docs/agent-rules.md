@@ -149,9 +149,11 @@ dev_feedback
 ---
 
 **Scope is auto-detected:** All save tools have an optional `scope` parameter.
-Omit it (or pass empty string) to auto-detect: files unchanged vs the `release`
-branch are saved globally; changed files are scoped to your current branch.
-This prevents experimental branch work from polluting shared memory.
+Omit it (or pass empty string) to auto-detect: files unchanged vs the
+configured release ref (default `origin/release`, configurable per-deployment
+via `DEVROUTER_RELEASE_BRANCH` — see [`staleness.md`](staleness.md)) are saved
+globally; changed files are scoped to your current branch. This prevents
+experimental branch work from polluting shared memory.
 
 ## How to use the response
 

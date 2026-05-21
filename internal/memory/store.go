@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -50,9 +51,9 @@ type FileMemory struct {
 	Path       string `json:"path"`
 	Purpose    string `json:"purpose"`
 	KeySymbols string `json:"key_symbols,omitempty"`
-	Source     string `json:"source"` // "auto" or "agent"
+	Source     string `json:"source"`          // "auto" or "agent"
 	Scope      string `json:"scope,omitempty"` // "global" or branch name
-	RepoPath   string `json:"-"`      // filesystem path of the repo (for git hash; not stored)
+	RepoPath   string `json:"-"`               // filesystem path of the repo (for git hash; not stored)
 }
 
 // FuncMemory describes what a function does and its call relationships.
@@ -581,13 +582,13 @@ type FlowOverlayUpdate struct {
 // to the dashboard. Counts are monotonic; the dashboard derives ratios
 // at render time.
 type FlowOverlay struct {
-	Repo             string                       `json:"repo"`
-	Name             string                       `json:"name"`
-	Files            map[string]FlowFileStat      `json:"files,omitempty"`
-	Missing          map[string]int               `json:"missing,omitempty"`
-	TotalFeedback    int                          `json:"total_feedback"`
-	LastFeedbackAt   int64                        `json:"last_feedback_at,omitempty"`
-	LastQueryID      string                       `json:"last_query_id,omitempty"`
+	Repo           string                  `json:"repo"`
+	Name           string                  `json:"name"`
+	Files          map[string]FlowFileStat `json:"files,omitempty"`
+	Missing        map[string]int          `json:"missing,omitempty"`
+	TotalFeedback  int                     `json:"total_feedback"`
+	LastFeedbackAt int64                   `json:"last_feedback_at,omitempty"`
+	LastQueryID    string                  `json:"last_query_id,omitempty"`
 }
 
 // FlowFileStat is the per-file useful/dead pair. Both counters can be
@@ -855,22 +856,22 @@ func (s *Store) SaveDecision(m DecisionMemory) ([]string, error) {
 	}
 
 	err = s.rdb.HSet(context.Background(), key, map[string]interface{}{
-		"mem_type":       "decision",
-		"repo":           m.Repo,
-		"decision_type":  m.DecisionType,
-		"name":           m.Name,
-		"decision":       m.Decision,
-		"rationale":      m.Rationale,
-		"alternatives":   m.Alternatives,
-		"constraint":     m.Constraint,
-		"scope":          m.Scope,
-		"files":          m.Files,
-		"status":         m.Status,
-		"supersedes":     m.Supersedes,
-		"superseded_by":  m.SupersededBy,
-		"source":         m.Source,
-		"updated_at":     time.Now().UnixMilli(),
-		"embedding":      Float32ToBytes(vec),
+		"mem_type":      "decision",
+		"repo":          m.Repo,
+		"decision_type": m.DecisionType,
+		"name":          m.Name,
+		"decision":      m.Decision,
+		"rationale":     m.Rationale,
+		"alternatives":  m.Alternatives,
+		"constraint":    m.Constraint,
+		"scope":         m.Scope,
+		"files":         m.Files,
+		"status":        m.Status,
+		"supersedes":    m.Supersedes,
+		"superseded_by": m.SupersededBy,
+		"source":        m.Source,
+		"updated_at":    time.Now().UnixMilli(),
+		"embedding":     Float32ToBytes(vec),
 	}).Err()
 	if err != nil {
 		return nil, err
@@ -897,7 +898,7 @@ func (s *Store) SupersedeDecision(repo, oldName, newName string) error {
 
 	// Mark old decision as superseded
 	if err := s.rdb.HSet(ctx, oldKey, map[string]interface{}{
-		"status":       "superseded",
+		"status":        "superseded",
 		"superseded_by": newName,
 	}).Err(); err != nil {
 		return fmt.Errorf("mark old decision superseded: %w", err)
@@ -921,8 +922,17 @@ func (s *Store) Save(e Entry) error {
 // Scope detection helpers
 // ---------------------------------------------------------------------------
 
-// CurrentBranch returns the current git branch name, or "global" if unable to determine.
+// CurrentBranch returns the current git branch name, or "global" if
+// unable to determine. An empty repoPath short-circuits to "global"
+// because `git -C ""` is treated by git as "no chdir" and falls through
+// to the caller's cwd — which silently returns whatever branch the
+// surrounding process happens to be on (e.g. the devrouter checkout
+// itself when running tests). Mirrors the empty-path guard the
+// ScopeFor* helpers already have.
 func CurrentBranch(repoPath string) string {
+	if repoPath == "" {
+		return "global"
+	}
 	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
 		return "global"
@@ -934,37 +944,68 @@ func CurrentBranch(repoPath string) string {
 	return b
 }
 
-// fetchRelease ensures origin/release is up-to-date. Errors are silently ignored.
-func fetchRelease(repoPath string) {
-	exec.Command("git", "-C", repoPath, "fetch", "origin", "release").Run()
+// DefaultReleaseRef is the baseline ref the scope-detection helpers
+// compare against when DEVROUTER_RELEASE_BRANCH is unset. Exposed so
+// callers (docs, dashboards, tests) can refer to it without rebuilding
+// the literal.
+const DefaultReleaseRef = "origin/release"
+
+// ReleaseRef returns the configured "shipped truth" ref to diff against
+// for save-time scope detection. Reads DEVROUTER_RELEASE_BRANCH on every
+// call (cheap, and lets test runs override per-process); falls back to
+// DefaultReleaseRef. Typical values: "origin/release", "origin/main",
+// "upstream/master", or a local ref like "main".
+func ReleaseRef() string {
+	if v := strings.TrimSpace(os.Getenv("DEVROUTER_RELEASE_BRANCH")); v != "" {
+		return v
+	}
+	return DefaultReleaseRef
 }
 
-// ScopeForFile returns "global" if the file is unchanged vs origin/release, else current branch.
+// fetchRelease ensures the configured release ref is up-to-date. Errors
+// are silently ignored — best-effort refresh so the diff runs against
+// the latest baseline. For refs of the form "<remote>/<branch>" it runs
+// `git fetch <remote> <branch>`; for refs without a "/" (e.g. a local
+// "main") it's a no-op since there's nothing to fetch.
+func fetchRelease(repoPath string) {
+	ref := ReleaseRef()
+	remote, branch, ok := strings.Cut(ref, "/")
+	if !ok || remote == "" || branch == "" {
+		return
+	}
+	exec.Command("git", "-C", repoPath, "fetch", remote, branch).Run()
+}
+
+// ScopeForFile returns "global" if the file is unchanged vs the
+// configured release ref (see ReleaseRef), else the current branch.
 func ScopeForFile(repoPath, filePath string) string {
 	if repoPath == "" || filePath == "" {
 		return "global"
 	}
 	fetchRelease(repoPath)
-	err := exec.Command("git", "-C", repoPath, "diff", "--quiet", "origin/release", "--", filePath).Run()
+	ref := ReleaseRef()
+	err := exec.Command("git", "-C", repoPath, "diff", "--quiet", ref, "--", filePath).Run()
 	if err != nil {
-		// exit 1 = file differs from origin/release
+		// exit 1 = file differs from release ref
 		return CurrentBranch(repoPath)
 	}
 	return "global"
 }
 
-// ScopeForFiles returns "global" if all files are unchanged vs origin/release, else current branch.
+// ScopeForFiles returns "global" if all files are unchanged vs the
+// configured release ref, else the current branch.
 func ScopeForFiles(repoPath, filesCSV string) string {
 	if repoPath == "" {
 		return "global"
 	}
 	fetchRelease(repoPath)
+	ref := ReleaseRef()
 	for _, f := range strings.Split(filesCSV, ",") {
 		f = strings.TrimSpace(f)
 		if f == "" {
 			continue
 		}
-		err := exec.Command("git", "-C", repoPath, "diff", "--quiet", "origin/release", "--", f).Run()
+		err := exec.Command("git", "-C", repoPath, "diff", "--quiet", ref, "--", f).Run()
 		if err != nil {
 			return CurrentBranch(repoPath)
 		}
@@ -972,15 +1013,17 @@ func ScopeForFiles(repoPath, filesCSV string) string {
 	return "global"
 }
 
-// ScopeForDecision returns scope for a decision: if files provided, use ScopeForFiles;
-// else return "global" if no commits ahead of origin/release, else current branch.
+// ScopeForDecision returns scope for a decision: if files provided, use
+// ScopeForFiles; else return "global" if no commits ahead of the
+// configured release ref, else the current branch.
 func ScopeForDecision(repoPath, filesCSV string) string {
 	if filesCSV != "" {
 		return ScopeForFiles(repoPath, filesCSV)
 	}
-	// No files → check if branch has any commits ahead of origin/release
+	// No files → check if branch has any commits ahead of the release ref.
 	fetchRelease(repoPath)
-	out, err := exec.Command("git", "-C", repoPath, "rev-list", "--count", "origin/release..HEAD").Output()
+	ref := ReleaseRef()
+	out, err := exec.Command("git", "-C", repoPath, "rev-list", "--count", ref+"..HEAD").Output()
 	if err != nil {
 		return "global"
 	}
