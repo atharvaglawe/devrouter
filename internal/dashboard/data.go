@@ -42,6 +42,17 @@ type QueryRow struct {
 	BudgetUsed       float64  `json:"budget_used_fraction"`
 	MemoryKeys       []string `json:"memory_keys,omitempty"`
 
+	// SearchFiles / GraphFiles are the codegraph file paths the
+	// router persisted on the trace hash (search_files /
+	// graph_files CSVs, capped at router.codegraphFileFieldCap).
+	// SearchFiles is the post-dedupe output of /api/search; GraphFiles
+	// is the union of snippet files + callers/callees/importers/
+	// extends/methods/siblings discovered during graph traversal.
+	// Empty when codegraph returned nothing (degraded path) or when
+	// the trace pre-dates this field's introduction.
+	SearchFiles []string `json:"search_files,omitempty"`
+	GraphFiles  []string `json:"graph_files,omitempty"`
+
 	// TopicID identifies the per-(intent, repo, topic) heuristics
 	// bucket this query was scored against. "*" or empty means the
 	// query landed on the intent-global fallback (topics disabled,
@@ -120,6 +131,12 @@ func traceFieldsToRow(id string, f map[string]string) QueryRow {
 	}
 	if mk := f["memory_keys"]; mk != "" {
 		row.MemoryKeys = splitCSV(mk)
+	}
+	if sf := f["search_files"]; sf != "" {
+		row.SearchFiles = splitCSV(sf)
+	}
+	if gf := f["graph_files"]; gf != "" {
+		row.GraphFiles = splitCSV(gf)
 	}
 	row.HasFeedback = row.FeedbackAt > 0 || row.FeedbackSource != ""
 	return row

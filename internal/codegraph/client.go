@@ -14,11 +14,62 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/atharva-ag/devrouter/internal/prompt"
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
+
+// instrumentedDo wraps an outbound codegraph HTTP request with Prometheus
+// instrumentation. endpoint is the static label fed to the metric (one of
+// "search", "query", "file", "repos") so cardinality stays bounded
+// regardless of how query strings or repo names vary.
+//
+// Errors at the transport layer are tagged status="error"; non-2xx
+// responses are tagged with their status-class bucket ("4xx", "5xx").
+// The caller still owns response-body parsing and the higher-level
+// error wrapping — this helper only times the request and records the
+// outcome.
+func (c *Client) instrumentedDo(endpoint string, req *http.Request) (*http.Response, error) {
+	telemetry.CodegraphInflight.WithLabelValues(endpoint).Inc()
+	defer telemetry.CodegraphInflight.WithLabelValues(endpoint).Dec()
+
+	start := time.Now()
+	resp, err := c.httpClient.Do(req)
+	telemetry.CodegraphRequestDuration.WithLabelValues(endpoint).Observe(time.Since(start).Seconds())
+
+	status := "error"
+	if err == nil && resp != nil {
+		status = strconv.Itoa(resp.StatusCode/100) + "xx"
+	}
+	telemetry.CodegraphRequests.WithLabelValues(endpoint, status).Inc()
+	return resp, err
+}
+
+// postJSON is the instrumented POST helper for the JSON-body codegraph
+// endpoints (/api/search, /api/query).
+func (c *Client) postJSON(endpoint, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, c.BaseURL+path, bytes.NewReader(body))
+	if err != nil {
+		telemetry.CodegraphRequests.WithLabelValues(endpoint, "error").Inc()
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.instrumentedDo(endpoint, req)
+}
+
+// getURL is the instrumented GET helper for the codegraph endpoints
+// that take query-string parameters (/api/file, /api/repos).
+func (c *Client) getURL(endpoint, fullURL string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
+	if err != nil {
+		telemetry.CodegraphRequests.WithLabelValues(endpoint, "error").Inc()
+		return nil, err
+	}
+	return c.instrumentedDo(endpoint, req)
+}
 
 type Client struct {
 	BaseURL    string
@@ -139,7 +190,7 @@ func (c *Client) SearchWithMode(
 	}
 
 	payload, _ := json.Marshal(body)
-	resp, err := c.httpClient.Post(c.BaseURL+"/api/search", "application/json", bytes.NewReader(payload))
+	resp, err := c.postJSON("search", "/api/search", payload)
 	if err != nil {
 		return nil, fmt.Errorf("codegraph search: %w", err)
 	}
@@ -204,7 +255,7 @@ func (c *Client) Cypher(cypher string, repo string) ([]map[string]any, error) {
 		body["repo"] = repo
 	}
 	payload, _ := json.Marshal(body)
-	resp, err := c.httpClient.Post(c.BaseURL+"/api/query", "application/json", bytes.NewReader(payload))
+	resp, err := c.postJSON("query", "/api/query", payload)
 	if err != nil {
 		return nil, fmt.Errorf("codegraph cypher: %w", err)
 	}
@@ -958,7 +1009,7 @@ func (c *Client) ReadFile(filePath string, repo string) (*FileResult, error) {
 	if repo != "" {
 		u += "&repo=" + url.QueryEscape(repo)
 	}
-	resp, err := c.httpClient.Get(u)
+	resp, err := c.getURL("file", u)
 	if err != nil {
 		return nil, fmt.Errorf("codegraph file: %w", err)
 	}
@@ -1046,7 +1097,7 @@ func (c *Client) RepoPath(repoName string) string {
 
 // ListRepos returns all indexed repositories.
 func (c *Client) ListRepos() ([]RepoInfo, error) {
-	resp, err := c.httpClient.Get(c.BaseURL + "/api/repos")
+	resp, err := c.getURL("repos", c.BaseURL+"/api/repos")
 	if err != nil {
 		return nil, fmt.Errorf("codegraph repos: %w", err)
 	}

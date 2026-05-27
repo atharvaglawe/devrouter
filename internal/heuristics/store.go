@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 const (
@@ -169,7 +171,22 @@ func (s *Store) AppendReward(ctx context.Context, intent string, row RewardRow) 
 	pipe.RPush(ctx, key, data)
 	pipe.Expire(ctx, key, rewardTTL)
 	_, err := pipe.Exec(ctx)
+	if err == nil {
+		recordRewardSample(intent, row.Source)
+	}
 	return err
+}
+
+// recordRewardSample is the single chokepoint that increments the
+// Prometheus reward-samples counter on every Append* path. Centralised
+// here (rather than at the dozens of call sites) so the label scheme
+// stays consistent regardless of which bucket or fallback path the
+// reward came from.
+func recordRewardSample(intent, source string) {
+	if source == "" {
+		source = "unknown"
+	}
+	telemetry.HeuristicsRewardSamples.WithLabelValues(intent, source).Inc()
 }
 
 // RecentRewards returns up to 'limit' most recent reward rows for an intent
@@ -471,6 +488,9 @@ func (s *Store) AppendRewardFor(ctx context.Context, intent, repo, topic string,
 	pipe.RPush(ctx, key, data)
 	pipe.Expire(ctx, key, rewardTTL)
 	_, err := pipe.Exec(ctx)
+	if err == nil {
+		recordRewardSample(intent, row.Source)
+	}
 	return err
 }
 

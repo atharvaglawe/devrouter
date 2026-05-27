@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 // Picker is the per-process handle for selecting a profile per query
@@ -80,6 +82,9 @@ func NewPicker(rdb *redis.Client) *Picker {
 
 	if frozen {
 		log.Printf("[heuristics] frozen mode: bandit updates disabled")
+		telemetry.HeuristicsFrozen.Set(1)
+	} else {
+		telemetry.HeuristicsFrozen.Set(0)
 	}
 	return p
 }

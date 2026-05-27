@@ -19,6 +19,7 @@ import (
 	"github.com/atharva-ag/devrouter/internal/heuristics"
 	"github.com/atharva-ag/devrouter/internal/memory"
 	"github.com/atharva-ag/devrouter/internal/prompt"
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 // funnelDebug toggles the verbose `[funnel] files=[...]` logs that list
@@ -63,7 +64,16 @@ func (p *codegraphProbe) FileExists(_ context.Context, repo, path string) bool {
 		return false
 	}
 	fr, err := p.g.ReadFile(path, repo)
-	return err == nil && fr != nil && fr.Content != ""
+	if err != nil {
+		// Distinguishes a real codegraph error from "file legitimately
+		// absent" (the empty-content branch below). Both return false
+		// to the caller, but only the error case bumps the failure
+		// counter — repo paths that simply don't exist are normal
+		// pattern-probe outcomes, not health signals.
+		telemetry.AnchorProbeFailures.Inc()
+		return false
+	}
+	return fr != nil && fr.Content != ""
 }
 
 func New(graph *codegraph.Client, mem *memory.Store) *Router {
@@ -505,6 +515,7 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	if r.Heuristics != nil && repeatHit.Sim >= heuristics.RepeatSimThreshold {
 		raw, fired := heuristics.ComputeImplicit(repeatHit.Sim)
 		if fired {
+			telemetry.RepeatQueryTotal.WithLabelValues(repeatHit.PrevIntent).Inc()
 			trace.RepeatedExplorationOf = repeatHit.PrevQueryID
 			rollingMean := r.Heuristics.Store.RollingMeanFor(ctx,
 				repeatHit.PrevIntent, repeatHit.PrevRepo, repeatHit.PrevTopicID, 50)
@@ -589,6 +600,18 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	plan.MustTerms = ensureMustAnchor(r.Graph, query, plan.MustTerms, repo)
 	autoAnchored := preAnchorMust == 0 && len(plan.MustTerms) > 0
 	plan.MustAutoAnchored = autoAnchored
+	if preAnchorMust == 0 {
+		// The caller didn't supply must_terms at all — record whether
+		// auto-anchoring rescued the query. This is the single highest-
+		// signal proxy for "agents stopped sending plans"; a sudden
+		// shift in the ratio indicates a regression in the calling
+		// agent, not in devrouter.
+		if autoAnchored {
+			telemetry.AutoAnchorTotal.WithLabelValues("anchored").Inc()
+		} else {
+			telemetry.AutoAnchorTotal.WithLabelValues("none").Inc()
+		}
+	}
 
 	if !planIsEmpty(plan) {
 		log.Printf("[router] plan(%s): must=%v should=%v exclude=%v hints=%v phrases=%v",
@@ -611,11 +634,13 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	maxDist := memoryMaxDistance()
 	flooredHits := dropBelowFloor(rawHits, maxDist)
 	if floored := beforeFilter - len(flooredHits); floored > 0 {
+		telemetry.RelevanceGateDrops.WithLabelValues("floor").Add(float64(floored))
 		log.Printf("[router] memory floor dropped %d/%d hits (max_distance=%.2f)",
 			floored, beforeFilter, maxDist)
 	}
 	filteredHits := filterMemoriesByPlan(flooredHits, plan)
 	if dropped := len(flooredHits) - len(filteredHits); dropped > 0 {
+		telemetry.RelevanceGateDrops.WithLabelValues("must").Add(float64(dropped))
 		log.Printf("[router] memory plan-filter dropped %d/%d hits (must=%v exclude=%v)",
 			dropped, len(flooredHits), plan.MustTerms, plan.ExcludeTerms)
 	}
@@ -627,7 +652,11 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	// it from consideration entirely.
 	demoted := applyFPPenalties(ctx, r.Memory, filteredHits, queryEmbed)
 	if demoted > 0 {
+		preFP := len(filteredHits)
 		filteredHits = dropBelowFloor(filteredHits, maxDist)
+		if dropped := preFP - len(filteredHits); dropped > 0 {
+			telemetry.RelevanceGateDrops.WithLabelValues("fp").Add(float64(dropped))
+		}
 		log.Printf("[router] memory FP demoted=%d post-demotion=%d", demoted, len(filteredHits))
 	}
 	rerankedHits := rankByPlan(filteredHits, plan)
@@ -697,20 +726,32 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	// Logs the symbol count, the unique file count, and the file paths so
 	// we can see exactly what enters the pipeline. Bounded at 10 candidates
 	// today; the funnel diagnosis lives in bench/results FINDINGS.
+	//
+	// codegraphSearchFiles is the deduplicated list of file paths the
+	// initial /api/search call produced. We surface it on the trace so the
+	// dashboard's Live Queries detail panel can answer "which files did
+	// codegraph hand us at the seed stage?" without forcing operators to
+	// re-run with DEVROUTER_FUNNEL_LOG=1.
+	var codegraphSearchFiles []string
 	{
 		seen := map[string]bool{}
-		var paths []string
 		for _, sr := range searchResults {
 			if sr.FilePath == "" || seen[sr.FilePath] {
 				continue
 			}
 			seen[sr.FilePath] = true
-			paths = append(paths, sr.FilePath)
+			codegraphSearchFiles = append(codegraphSearchFiles, sr.FilePath)
 		}
 		if funnelDebug {
 			log.Printf("[funnel] qid=%s stage=search symbols=%d unique_files=%d files=%v",
-				trace.QueryID, len(searchResults), len(paths), paths)
+				trace.QueryID, len(searchResults), len(codegraphSearchFiles), codegraphSearchFiles)
 		}
+	}
+	if trace.SearchStage != nil {
+		if trace.SearchStage.Details == nil {
+			trace.SearchStage.Details = map[string]interface{}{}
+		}
+		trace.SearchStage.Details["codegraph_files"] = codegraphSearchFiles
 	}
 
 	if pkgPath != "" {
@@ -1088,10 +1129,18 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	// candidate pool we ever build internally.
 	{
 		seen := map[string]bool{}
+		// orderedPaths preserves first-seen order so the dashboard
+		// renders files in the same sequence the traversal produced
+		// them (snippets, then upstream, downstream, importers, …).
+		// A simple map alone would scramble that ordering between
+		// renders.
+		var orderedPaths []string
 		add := func(p string) {
-			if p != "" {
-				seen[p] = true
+			if p == "" || seen[p] {
+				return
 			}
+			seen[p] = true
+			orderedPaths = append(orderedPaths, p)
 		}
 		for _, s := range snippets {
 			add(s.File)
@@ -1132,6 +1181,18 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 		if funnelDebug {
 			log.Printf("[funnel] qid=%s stage=traversal snippets=%d chain_up=%d chain_down=%d graph_imp=%d graph_ext=%d graph_meth=%d graph_sib=%d unique_files=%d",
 				trace.QueryID, len(snippets), chU, chD, gI, gE, gM, gS, len(seen))
+		}
+		// Stash on the trace so the dashboard / retrieve_debug can
+		// surface the post-traversal file set. Includes everything
+		// downstream of the seed search: snippet bodies, call-chain
+		// edges, importer / extends / method neighbours, and
+		// sibling files. The seed search file set is recorded
+		// separately on SearchStage.Details["codegraph_files"].
+		if trace.GraphStage != nil {
+			if trace.GraphStage.Details == nil {
+				trace.GraphStage.Details = map[string]interface{}{}
+			}
+			trace.GraphStage.Details["codegraph_files"] = orderedPaths
 		}
 	}
 
@@ -1442,6 +1503,30 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	dp.QueryID = trace.QueryID
 	dp.RetrievalTrace = trace
 
+	// --- TELEMETRY (process-level aggregates) ---
+	// All labels are bounded: intent is the 5-element KnownIntents set,
+	// plan_source is two values. query_id and profile_id are emitted
+	// as slog fields via the dashboard trace path, never as Prom labels.
+	intentLabel := string(intent)
+	telemetry.QueryTotal.WithLabelValues(intentLabel, planSource).Inc()
+	telemetry.QueryDuration.WithLabelValues(intentLabel).Observe(time.Duration(trace.TotalLatencyMs * int64(time.Millisecond)).Seconds())
+	telemetry.PromptTokens.WithLabelValues(intentLabel).Observe(float64(finalTokens))
+	telemetry.BudgetUsedFraction.WithLabelValues(intentLabel).Observe(budgetUsed)
+	telemetry.FilesReturned.WithLabelValues(intentLabel).Observe(float64(filesReturned))
+	telemetry.TrimmedFiles.WithLabelValues(intentLabel).Observe(float64(trimmed))
+	if trace.PlannerStage != nil {
+		telemetry.StageDuration.WithLabelValues("planner", intentLabel).Observe(float64(trace.PlannerStage.LatencyMs) / 1000.0)
+	}
+	if trace.SearchStage != nil {
+		telemetry.StageDuration.WithLabelValues("search", intentLabel).Observe(float64(trace.SearchStage.LatencyMs) / 1000.0)
+	}
+	if trace.GraphStage != nil {
+		telemetry.StageDuration.WithLabelValues("graph", intentLabel).Observe(float64(trace.GraphStage.LatencyMs) / 1000.0)
+	}
+	if trace.PackingStage != nil {
+		telemetry.StageDuration.WithLabelValues("packing", intentLabel).Observe(float64(trace.PackingStage.LatencyMs) / 1000.0)
+	}
+
 	// --- PERSIST TRACE for dev_feedback join ---
 	// HSET (not JSON blob) so dev_feedback can patch only the feedback-side
 	// fields without rewriting the whole record. Best-effort: a Redis blip
@@ -1469,6 +1554,16 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	return dp, nil
 }
 
+// codegraphFileFieldCap bounds how many file paths we persist per
+// stage on the Redis trace hash. The dashboard renders these in the
+// detail-panel grid; an enthusiastic traversal could legitimately
+// touch hundreds of files (a "show me everything that imports X"
+// query, for example), and stuffing that into the hash bloats every
+// HGETALL the dashboard does on its 3s refresh. 50 captures the
+// useful 99% — beyond that the value tips into noise, and the
+// per-query dashboard expansion truncates with a "+N more" label.
+const codegraphFileFieldCap = 50
+
 // traceHashFields flattens the decision-side trace + outcome into a Redis
 // hash. Only string-formatted fields are stored; feedback-side numeric
 // fields are written later by dev_feedback as separate HSETs.
@@ -1476,6 +1571,12 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 // memory_keys (CSV) is added when this trace returned at least one
 // agent-written memory. dev_feedback uses it to attribute false
 // positives back to specific memory records.
+//
+// search_files / graph_files (CSV, capped at codegraphFileFieldCap) record
+// which files codegraph handed us at each retrieval stage. They are
+// pure observability fields — nothing reads them back into the
+// pipeline — but they're the answer to "what did codegraph give this
+// query?" on the dashboard's Live Queries tab.
 func traceHashFields(t *prompt.RetrievalTrace, repo, query, intent, profileID string, p heuristics.Profile, planSource string, plan QueryPlan, memKeys []string) map[string]interface{} {
 	fields := map[string]interface{}{
 		"query_id":             t.QueryID,
@@ -1498,6 +1599,12 @@ func traceHashFields(t *prompt.RetrievalTrace, repo, query, intent, profileID st
 	}
 	if len(memKeys) > 0 {
 		fields["memory_keys"] = strings.Join(memKeys, ",")
+	}
+	if sf := stageFiles(t.SearchStage); len(sf) > 0 {
+		fields["search_files"] = strings.Join(capPaths(sf, codegraphFileFieldCap), ",")
+	}
+	if gf := stageFiles(t.GraphStage); len(gf) > 0 {
+		fields["graph_files"] = strings.Join(capPaths(gf, codegraphFileFieldCap), ",")
 	}
 	if t.RepeatedExplorationOf != "" {
 		fields["repeated_exploration_of"] = t.RepeatedExplorationOf
@@ -1529,6 +1636,35 @@ func encodeStringSlice(in []string) string {
 		return "[]"
 	}
 	return string(b)
+}
+
+// stageFiles extracts the codegraph_files slice we stash on each
+// StageTrace.Details map. Returns nil for nil stages, missing keys,
+// or non-slice values so the caller can branch on len()>0 the same
+// way it does for memory_keys.
+func stageFiles(st *prompt.StageTrace) []string {
+	if st == nil || st.Details == nil {
+		return nil
+	}
+	raw, ok := st.Details["codegraph_files"]
+	if !ok {
+		return nil
+	}
+	files, ok := raw.([]string)
+	if !ok {
+		return nil
+	}
+	return files
+}
+
+// capPaths returns the input list truncated to n entries. Used to
+// bound how many file paths we persist on the Redis hash so the
+// dashboard's pipelined HGETALL stays predictable in size.
+func capPaths(in []string, n int) []string {
+	if n <= 0 || len(in) <= n {
+		return in
+	}
+	return in[:n]
 }
 
 func modelHint(memCount int) *prompt.ModelHint {

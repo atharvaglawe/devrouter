@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 // Policy hyperparameters. Calibrated to be conservative — aggressive
@@ -111,6 +113,7 @@ func epsilonGreedyShuffle(
 	if rng.Float64() >= epsilon {
 		return ranked
 	}
+	telemetry.AnchorExplorations.Inc()
 
 	// Find unproven patterns from the full pool. We re-score by
 	// FiredCount so the most-untried patterns float to the top of

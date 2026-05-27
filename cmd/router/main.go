@@ -13,7 +13,13 @@ import (
 	"github.com/atharva-ag/devrouter/internal/mcp"
 	"github.com/atharva-ag/devrouter/internal/memory"
 	"github.com/atharva-ag/devrouter/internal/router"
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
+
+// Build info populated at link time via -ldflags="-X main.Version=...".
+// When unset (e.g. `go run`) the value falls back to the dev sentinel so
+// telemetry build_info still emits a non-empty label.
+var Version = "dev"
 
 func main() {
 	log.SetOutput(os.Stderr)
@@ -23,6 +29,14 @@ func main() {
 	// captures stderr, so this is free signal during profiling
 	// runs and harmless in production.
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	// telemetry.Setup must run before any package emits metrics or
+	// log records: it (1) materialises the Prometheus registry the
+	// dashboard /metrics handler reads, and (2) optionally redirects
+	// stdlib log through slog when DEVROUTER_LOG_FORMAT=json. Setup
+	// is idempotent so subcommand passthroughs below can safely
+	// re-enter it via init paths.
+	telemetry.Setup()
 
 	// Subcommand passthrough to the in-tree codegraph Node CLI. Three forms:
 	//
@@ -94,6 +108,12 @@ func main() {
 	if r.Heuristics != nil {
 		log.Printf("heuristics: picker initialized (frozen=%v)", r.Heuristics.Frozen())
 	}
+
+	// build_info is a static gauge always set to 1; the label vector
+	// surfaces version + the external dependencies this process talks
+	// to. Lets a dashboard answer "which devrouter binaries are out
+	// there, and where are they pointing?" without scraping logs.
+	telemetry.BuildInfo.WithLabelValues(Version, cgURL, redisAddr).Set(1)
 
 	// Read-only observability dashboard. Enabled by default on
 	// 127.0.0.1:8088 (localhost-only, no auth required). Surfaces live
@@ -170,6 +190,10 @@ Environment:
   DEVROUTER_EMBEDDING_URL        Embedding endpoint (default http://localhost:11435/api/embed — bundled ONNX embedder)
   DEVROUTER_EMBEDDING_MODEL      Model name sent in /api/embed requests (default nomic-embed-text-v1.5; advisory only on the ONNX embedder)
   DEVROUTER_RELEASE_BRANCH       Git ref the save-time scope detector diffs against (default origin/release; try origin/main / origin/master)
+  DEVROUTER_DASHBOARD_ADDR       Bind address for the read-only dashboard (default 127.0.0.1:8088; set off/none/disabled to disable)
+  DEVROUTER_METRICS_ADDR         Prometheus /metrics control (default: mounted on dashboard; set off to disable)
+  DEVROUTER_LOG_FORMAT           Log output format (default text; set json for structured slog records)
+  DEVROUTER_LOG_LEVEL            Minimum log level (default info; debug/info/warn/error)
   CODEGRAPH_URL                  Codegraph HTTP base URL (default http://localhost:4747)
   GITNEXUS_URL                   Legacy alias for CODEGRAPH_URL (deprecated)
   DEVROUTER_CODEGRAPH_CLI        Override path to codegraph dist/cli/index.js

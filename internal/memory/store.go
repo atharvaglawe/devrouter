@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 const (
@@ -222,6 +224,11 @@ func NewStoreWithKeyspace(redisAddr, keyspace string) (*Store, error) {
 		Addr:        redisAddr,
 		DialTimeout: 3 * time.Second,
 	})
+	// Per-command Prometheus instrumentation. Installed unconditionally
+	// — observation cost is a few nanoseconds per command, and the
+	// metrics surface is the only way an operator can tell Redis
+	// slowness apart from codegraph slowness in dev_context p95.
+	rdb.AddHook(telemetry.NewRedisHook())
 
 	ctx := context.Background()
 	if err := rdb.Ping(ctx).Err(); err != nil {

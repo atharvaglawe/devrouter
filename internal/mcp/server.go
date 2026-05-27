@@ -8,8 +8,10 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/atharva-ag/devrouter/internal/router"
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 type jsonRPCRequest struct {
@@ -43,6 +45,19 @@ func (s *Server) Run() error {
 	reader := bufio.NewReader(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
 
+	// Session lifecycle: every MCP host spawn of devrouter is one
+	// session. The active-gauge is a sanity check (one process should
+	// own exactly one session at a time); the histogram captures how
+	// long Cursor / Claude keep the subprocess alive. EOF here means
+	// the host closed stdin — the normal exit path.
+	telemetry.MCPSessionsTotal.Inc()
+	telemetry.MCPSessionsActive.Inc()
+	sessionStart := time.Now()
+	defer func() {
+		telemetry.MCPSessionsActive.Dec()
+		telemetry.MCPSessionDuration.Observe(time.Since(sessionStart).Seconds())
+	}()
+
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -54,17 +69,44 @@ func (s *Server) Run() error {
 
 		var req jsonRPCRequest
 		if err := json.Unmarshal(line, &req); err != nil {
+			telemetry.MCPRequests.WithLabelValues("invalid", "", "parse_error").Inc()
 			log.Printf("[mcp] invalid json: %v", err)
 			continue
 		}
 
+		start := time.Now()
 		resp := s.handle(req)
+		tool := toolNameFromParams(req)
+		status := "ok"
+		if resp != nil && resp.Error != nil {
+			status = "error"
+		}
+		telemetry.MCPRequestDuration.WithLabelValues(req.Method, tool).Observe(time.Since(start).Seconds())
+		telemetry.MCPRequests.WithLabelValues(req.Method, tool, status).Inc()
+
 		if resp != nil {
 			if err := encoder.Encode(resp); err != nil {
 				log.Printf("[mcp] write error: %v", err)
 			}
 		}
 	}
+}
+
+// toolNameFromParams pulls the MCP tool name off a tools/call request
+// so MCPRequests can label the counter with the specific tool ("",
+// for non-tool methods). Best-effort: malformed params just produce
+// the empty label.
+func toolNameFromParams(req jsonRPCRequest) string {
+	if req.Method != "tools/call" || len(req.Params) == 0 {
+		return ""
+	}
+	var p struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		return ""
+	}
+	return p.Name
 }
 
 func (s *Server) handle(req jsonRPCRequest) *jsonRPCResponse {

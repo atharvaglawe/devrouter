@@ -10,6 +10,7 @@ import (
 
 	"github.com/atharva-ag/devrouter/internal/heuristics"
 	"github.com/atharva-ag/devrouter/internal/memory"
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 // FeedbackInput is the payload for SubmitFeedback (mapped 1:1 to the
@@ -173,6 +174,7 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 	}
 
 	if queryID == "" || intent == "" {
+		telemetry.FeedbackTotal.WithLabelValues("unknown", "dropped").Inc()
 		log.Printf("[feedback] dropped: no join (query_id=%q intent=%q)", in.QueryID, intent)
 		return FeedbackResult{JoinedVia: "dropped", Note: "no matching trace; Path 2 (implicit repeat) remains the safety net"}
 	}
@@ -254,6 +256,14 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 	// and addressed by memory-relevance learning (or human pruning),
 	// not by shifting the bandit.
 	flowResult := r.applyFlowOverlay(ctx, in, queryID)
+
+	telemetry.FeedbackTotal.WithLabelValues(intent, joinedVia).Inc()
+	telemetry.FeedbackRawReward.WithLabelValues(intent).Observe(raw)
+	telemetry.FeedbackAdjustedReward.WithLabelValues(intent).Observe(adjusted)
+	telemetry.FeedbackAdditionalFiles.WithLabelValues(intent).Observe(float64(in.AdditionalFiles))
+	if fpRecorded > 0 {
+		telemetry.FeedbackFPRecorded.WithLabelValues(intent).Add(float64(fpRecorded))
+	}
 
 	log.Printf("[feedback] joined=%s queryID=%s intent=%s additional=%d revisits=%d raw=%.2f adjusted=%.2f fp_recorded=%d",
 		joinedVia, queryID, intent, in.AdditionalFiles, in.RevisitedFiles, raw, adjusted, fpRecorded)
