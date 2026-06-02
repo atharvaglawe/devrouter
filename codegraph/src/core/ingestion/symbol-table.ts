@@ -130,6 +130,24 @@ export interface SymbolTable {
   ) => SymbolDefinition | undefined;
 
   /**
+   * Directory-scoped owner lookup: find a method by its owning type's NAME and
+   * package DIRECTORY rather than the type's exact node id. This recovers
+   * methods declared in a different file than their type (idiomatic Go, where
+   * a struct's methods are spread across the package's files) — cases the
+   * strict {@link lookupMethodByOwner} misses because the parse-worker keys the
+   * method's `ownerId` to the method's own file, not the type's file.
+   *
+   * Intended as a FALLBACK after the strict owner lookup returns nothing.
+   * Applies the same arity narrowing + returnType dedup as lookupMethodByOwner.
+   */
+  lookupMethodByOwnerInDir: (
+    typeName: string,
+    dir: string,
+    methodName: string,
+    argCount?: number,
+  ) => SymbolDefinition | undefined;
+
+  /**
    * Look up class-like definitions (Class, Struct, Interface, Enum, Record) by name.
    * O(1) via dedicated eagerly-populated index keyed by symbol name.
    * Returns all matching definitions across files (e.g. partial classes).
@@ -174,6 +192,22 @@ export interface SymbolTable {
   clear: () => void;
 }
 
+/** Directory portion of a (forward-slash-normalized) file path. Returns '' for
+ *  a bare filename. Used to scope the cross-file owner index to a package dir. */
+const dirOfPath = (filePath: string): string => {
+  const normalized = filePath.replace(/\\/g, '/');
+  const idx = normalized.lastIndexOf('/');
+  return idx >= 0 ? normalized.slice(0, idx) : '';
+};
+
+/** Extract the type name from an ownerId of the form `Label:filePath:Name`.
+ *  The name is the segment after the final ':' (file paths use '/' internally,
+ *  so the last ':' reliably precedes the symbol name). Returns '' when absent. */
+const typeNameFromOwnerId = (ownerId: string): string => {
+  const idx = ownerId.lastIndexOf(':');
+  return idx >= 0 ? ownerId.slice(idx + 1) : '';
+};
+
 export const createSymbolTable = (): SymbolTable => {
   // 1. File-Specific Index — stores full SymbolDefinition(s) for O(1) lookup.
   // Structure: FilePath -> (SymbolName -> SymbolDefinition[])
@@ -192,6 +226,18 @@ export const createSymbolTable = (): SymbolTable => {
   // 4. Eagerly-populated Method Index — keyed by "ownerNodeId\0methodName".
   // Method symbols with ownerId are indexed. Supports overloads (array values).
   const methodByOwner = new Map<string, SymbolDefinition[]>();
+
+  // 4b. Directory-scoped owner index — keyed by "dir\0typeName\0methodName".
+  // Go (and other languages) routinely declare a type in one file and spread
+  // its methods across sibling files in the same package/directory. The
+  // parse-worker keys each method's `ownerId` to the METHOD's own filePath
+  // (it cannot know where the type is declared), so the strict
+  // `methodByOwner` lookup — which is keyed by the TYPE node's real id
+  // (`Label:<typeFile>:<Name>`) — misses every method that lives in a
+  // different file than its type. This index lets owner-scoped resolution
+  // recover those cross-file methods by (package directory + type name),
+  // which is unambiguous for Go's one-package-per-directory model.
+  const methodByOwnerTypeDir = new Map<string, SymbolDefinition[]>();
 
   // 5. Eagerly-populated Class-type Index — keyed by symbol name.
   // Only Class, Struct, Interface, Enum, Record symbols are indexed.
@@ -280,6 +326,20 @@ export const createSymbolTable = (): SymbolTable => {
         existing.push(def);
       } else {
         methodByOwner.set(key, [def]);
+      }
+
+      // Directory-scoped fallback key (see methodByOwnerTypeDir docs): allows
+      // owner-scoped resolution to find methods declared in a different file
+      // than their type, as long as they share the package directory.
+      const ownerTypeName = typeNameFromOwnerId(metadata.ownerId);
+      if (ownerTypeName) {
+        const dirKey = `${dirOfPath(filePath)}\0${ownerTypeName}\0${name}`;
+        const dirExisting = methodByOwnerTypeDir.get(dirKey);
+        if (dirExisting) {
+          dirExisting.push(def);
+        } else {
+          methodByOwnerTypeDir.set(dirKey, [def]);
+        }
       }
     }
 
@@ -389,6 +449,40 @@ export const createSymbolTable = (): SymbolTable => {
     return pool[0];
   };
 
+  const lookupMethodByOwnerInDir = (
+    typeName: string,
+    dir: string,
+    methodName: string,
+    argCount?: number,
+  ): SymbolDefinition | undefined => {
+    const defs = methodByOwnerTypeDir.get(`${dir}\0${typeName}\0${methodName}`);
+    if (!defs || defs.length === 0) return undefined;
+
+    // Mirror lookupMethodByOwner's arity narrowing + returnType dedup so the
+    // cross-file fallback disambiguates overloads identically.
+    let pool = defs;
+    if (argCount !== undefined && defs.length > 1) {
+      const arityMatched = defs.filter((d) => {
+        if (d.parameterCount === undefined) return true;
+        const min = d.requiredParameterCount ?? d.parameterCount;
+        return argCount >= min && argCount <= d.parameterCount;
+      });
+      if (arityMatched.length > 0) pool = arityMatched;
+    }
+
+    if (pool.length === 1) return pool[0];
+    // Collapse to first only when every survivor is the same node (methods
+    // re-indexed under the same dir key) or shares a defined return type.
+    const firstNodeId = pool[0].nodeId;
+    if (pool.every((d) => d.nodeId === firstNodeId)) return pool[0];
+    const firstReturnType = pool[0].returnType;
+    if (firstReturnType === undefined) return undefined;
+    for (let i = 1; i < pool.length; i++) {
+      if (pool[i].returnType !== firstReturnType) return undefined;
+    }
+    return pool[0];
+  };
+
   const lookupClassByName = (name: string): SymbolDefinition[] => {
     return classByName.get(name) ?? [];
   };
@@ -416,6 +510,7 @@ export const createSymbolTable = (): SymbolTable => {
     callableByName.clear();
     fieldByOwner.clear();
     methodByOwner.clear();
+    methodByOwnerTypeDir.clear();
     classByName.clear();
     classByQualifiedName.clear();
     implByName.clear();
@@ -429,6 +524,7 @@ export const createSymbolTable = (): SymbolTable => {
     lookupCallableByName,
     lookupFieldByOwner,
     lookupMethodByOwner,
+    lookupMethodByOwnerInDir,
     lookupClassByName,
     lookupClassByQualifiedName,
     lookupImplByName,

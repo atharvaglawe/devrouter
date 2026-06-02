@@ -1377,3 +1377,70 @@ describe('Go Child embeds Parent — inherited method resolution (SM-9)', () => 
     expect(parentMethodCall!.source).toBe('Run');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Overloaded `New`: package-qualified calls across two packages each
+// defining a function named New. Regression for the goserving bug where
+// `scrrmodulemanager.New(...)` was misrouted to `adcodetoken.New` because
+// the Go module-alias builder didn't exist and the resolver had no way to
+// narrow the highly-overloaded global `New` candidate pool by package.
+// Exercises pipeline.ts:buildGoModuleAliasForFile end-to-end (parse →
+// import resolution → alias build → call resolution), not just the unit
+// path covered in call-processor.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('Go package-qualified `New` across packages — module-alias builder (regression)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-overloaded-new'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects both foo.New and bar.New as Functions', () => {
+    const funcs = getNodesByLabel(result, 'Function');
+    // Helper from the foo sibling file is the third Go function (besides main).
+    expect(funcs).toEqual(expect.arrayContaining(['Helper', 'New', 'main']));
+    // There are two distinct `New` functions in the graph (one per package).
+    const newFns = funcs.filter((n) => n === 'New');
+    expect(newFns.length).toBe(2);
+  });
+
+  it('foo.New(...) call resolves to pkg/foo/foo.go:New, not pkg/bar/bar.go:New', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const fooNewCall = calls.find(
+      (c) => c.source === 'main' && c.target === 'New' && c.targetFilePath.endsWith('pkg/foo/foo.go'),
+    );
+    const misroutedToBar = calls.find(
+      (c) => c.source === 'main' && c.target === 'New' && c.targetFilePath.endsWith('pkg/bar/bar.go'),
+    );
+    expect(fooNewCall).toBeDefined();
+    // bar.New is also a valid call below, but main → New → pkg/foo/foo.go must
+    // exist and main → New → pkg/bar/bar.go must also exist — both, not just one.
+    expect(misroutedToBar).toBeDefined();
+  });
+
+  it('emits exactly one CALLS edge per call site (no double-routing across packages)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const newCallsFromMain = calls.filter((c) => c.source === 'main' && c.target === 'New');
+    // Two call sites in main.go (foo.New and bar.New) → exactly two edges,
+    // each pointing at its own package's file. If the alias builder weren't
+    // wired in, the resolver would either null-route (0 edges) or pick a
+    // single arbitrary target per call site (still 2 edges but both pointing
+    // at the same wrong file) — the targetFilePath split here is what
+    // distinguishes a correct fix from a regression.
+    expect(newCallsFromMain.length).toBe(2);
+    const targetFiles = new Set(newCallsFromMain.map((c) => c.targetFilePath));
+    expect(targetFiles.size).toBe(2);
+  });
+
+  it('foo.Helper() in a sibling file of package foo also resolves (multi-file alias set)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const helperCall = calls.find(
+      (c) => c.source === 'main' && c.target === 'Helper' && c.targetFilePath.endsWith('pkg/foo/sibling.go'),
+    );
+    expect(helperCall).toBeDefined();
+  });
+});

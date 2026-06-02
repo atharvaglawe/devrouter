@@ -388,6 +388,177 @@ function pickTagValues(tags: Record<string, string>): string[] {
   return out;
 }
 
+/** Pick a single canonical tag value for a field — the first hit in
+ *  `TAG_PREFERENCE`. Used by the alias-to-keypath translator where a
+ *  field must map to *one* YAML/JSON segment. */
+function pickPrimaryTagValue(tags: Record<string, string>): string | null {
+  for (const key of TAG_PREFERENCE) {
+    if (tags[key]) return tags[key];
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// URL-via-alias resolver — joins struct-field chains to YAML key
+// paths, then to literal URL values in `byKeyPath`.
+// ─────────────────────────────────────────────────────────────────
+
+/** Flat `(owner|"*")::field → primary tag value` map used by the
+ *  alias-chain → YAML key path translator. Primary tag follows the
+ *  same `TAG_PREFERENCE` order the rest of the resolver uses, so
+ *  Go `yaml:` tags win over `json:`, etc. */
+export type FieldTagMap = ReadonlyMap<string, string>;
+
+/** Build a {@link FieldTagMap} from `ConfigTagBinding`s. Each binding
+ *  contributes both a specific `(owner, field)` entry and a wildcard
+ *  `(*, field)` fallback. The wildcard never overwrites a specific
+ *  entry — the per-type binding wins. */
+export function buildFieldTagMap(
+  configTags: ReadonlyArray<ConfigTagBinding>,
+): FieldTagMap {
+  const out = new Map<string, string>();
+  for (const ct of configTags) {
+    const tag = pickPrimaryTagValue(ct.tags);
+    if (!tag) continue;
+    const specific = `${ct.owner}::${ct.field}`;
+    if (!out.has(specific)) out.set(specific, tag);
+    const wildcard = `*::${ct.field}`;
+    if (!out.has(wildcard)) out.set(wildcard, tag);
+  }
+  return out;
+}
+
+/** Translate a struct-field alias chain (left-to-right: the first
+ *  element names the *root* receiver/identifier, subsequent ones are
+ *  field accessors) into a dotted YAML/JSON key path by joining
+ *  consecutive elements through {@link FieldTagMap}.
+ *
+ *  The root element is NOT translated — it's typically a local var
+ *  or a package name and has no field-tag. We start from index 1.
+ *
+ *  Example:
+ *    `["selected", "Origins", "CmServing", "Renderer"]` with
+ *    `Origins:"origins"`, `CmServing:"cmserving"`, `Renderer:"renderer"`
+ *    → `"origins.cmserving.renderer"`.
+ *
+ *  Returns `null` when any link can't be mapped or the resulting
+ *  path is empty.
+ */
+export function aliasToKeyPath(
+  alias: ReadonlyArray<string>,
+  fieldTagMap: FieldTagMap,
+): string | null {
+  if (alias.length < 2) return null;
+  const parts: string[] = [];
+  for (let i = 1; i < alias.length; i++) {
+    const owner = alias[i - 1];
+    const field = alias[i];
+    const tag =
+      fieldTagMap.get(`${owner}::${field}`) ?? fieldTagMap.get(`*::${field}`);
+    if (!tag) return null;
+    parts.push(tag.toLowerCase());
+  }
+  return parts.length > 0 ? parts.join('.') : null;
+}
+
+/** Resolved getter → URL-literal map. Folds:
+ *
+ *  - Trivial getters whose return alias translates to a YAML key
+ *    path that {@link byKeyPath} indexes as a URL leaf — i.e. the
+ *    getter itself returns a URL-typed field.
+ *  - Direct field bindings: a field whose primary tag is also a
+ *    top-level YAML key holding a URL literal (mirrors the
+ *    receiver-agnostic `getterKey(null, field)` fallback that
+ *    {@link buildResolvedGetters} emits for tags).
+ *
+ *  Per-call-site cases that need a *tail* accessor on top of a
+ *  getter (the common `originConfig.Renderer` shape) are handled by
+ *  {@link resolveGetterTailURL} called from the pipeline — kept
+ *  separate so this map stays a clean static fold.
+ */
+export function buildResolvedGetterURLs(
+  configTags: ReadonlyArray<ConfigTagBinding>,
+  trivialGetters: ReadonlyArray<TrivialGetterBinding>,
+  byKeyPath: ReadonlyMap<string, ReadonlySet<string>>,
+): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  if (byKeyPath.size === 0) return out;
+
+  const fieldTagMap = buildFieldTagMap(configTags);
+
+  const merge = (key: string, urls: Iterable<string>) => {
+    let cur = out.get(key);
+    if (!cur) {
+      cur = new Set<string>();
+      out.set(key, cur);
+    }
+    for (const u of urls) cur.add(u);
+  };
+
+  // Direct field bindings (top-level YAML keys whose tag matches a
+  // field's primary tag). e.g., a field `Renderer yaml:"renderer"`
+  // and a top-level YAML `renderer: "/x"` → emit at
+  // (null, "Renderer") and (owner, "Renderer").
+  for (const ct of configTags) {
+    const tag = pickPrimaryTagValue(ct.tags);
+    if (!tag) continue;
+    const urls = byKeyPath.get(tag.toLowerCase());
+    if (!urls || urls.size === 0) continue;
+    merge(getterKey(null, ct.field), urls);
+    if (ct.owner !== '*') {
+      merge(getterKey(ct.owner, ct.field), urls);
+    }
+  }
+
+  // Trivial getters: translate the return alias chain to a YAML
+  // key path via field-tag fragments, then look up in byKeyPath.
+  // Yields URLs for getters whose return value is itself a leaf
+  // string at a tagged-key path.
+  for (const g of trivialGetters) {
+    for (const alias of g.returnAliases) {
+      const keyPath = aliasToKeyPath(alias, fieldTagMap);
+      if (!keyPath) continue;
+      const urls = byKeyPath.get(keyPath);
+      if (!urls || urls.size === 0) continue;
+      merge(getterKey(g.receiver, g.name), urls);
+      merge(getterKey(null, g.name), urls);
+    }
+  }
+
+  return out;
+}
+
+/** Per-call-site extension: given a trivial getter known to point
+ *  at a YAML key-path prefix (via its return alias) and a `tail`
+ *  field accessor observed at the call site (e.g.
+ *  `originConfig.Renderer` where `originConfig := GetOriginConfig()`
+ *  and `tail = "Renderer"`), compute the URL(s) at the extended key
+ *  path.
+ *
+ *  Returns an empty set when no link can be made.
+ */
+export function resolveGetterTailURL(
+  getter: TrivialGetterBinding,
+  tail: string,
+  fieldTagMap: FieldTagMap,
+  byKeyPath: ReadonlyMap<string, ReadonlySet<string>>,
+): Set<string> {
+  const out = new Set<string>();
+  for (const alias of getter.returnAliases) {
+    const prefix = aliasToKeyPath(alias, fieldTagMap);
+    if (!prefix) continue;
+    const tailOwner = alias[alias.length - 1];
+    const tailTag =
+      fieldTagMap.get(`${tailOwner}::${tail}`) ?? fieldTagMap.get(`*::${tail}`);
+    if (!tailTag) continue;
+    const fullKey = `${prefix}.${tailTag.toLowerCase()}`;
+    const urls = byKeyPath.get(fullKey);
+    if (!urls) continue;
+    for (const u of urls) out.add(u);
+  }
+  return out;
+}
+
 /** Resolve every getter's return alias chain into a set of tag values
  *  by chasing through:
  *    - struct field tags (terminal — emits the tag values)

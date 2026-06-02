@@ -37,13 +37,29 @@ import {
 } from './route-extractors/provider-resolver.js';
 import {
   buildResolvedGetters,
+  buildResolvedGetterURLs,
+  buildFieldTagMap,
+  resolveGetterTailURL,
   getterKey,
   type ConfigTagBinding,
   type TrivialGetterBinding,
   type ResolvedGetterMap,
 } from './route-extractors/config-tag-resolver.js';
+import {
+  buildResolvedGetterConstURLs,
+  type GoStringConst,
+} from './route-extractors/url-const-resolver.js';
+import {
+  buildStartupTaskEdges,
+  type StartupTaskRegistration,
+} from './route-extractors/startup-task-extractor.js';
 import { expoFileToRouteURL } from './route-extractors/expo.js';
 import { phpFileToRouteURL } from './route-extractors/php.js';
+import { buildHtaccessIndex } from './route-extractors/htaccess-parser.js';
+import {
+  fileToPathTemplate as phpFileToPathTemplate,
+  fileToBasenameTemplate as phpFileToBasenameTemplate,
+} from './route-extractors/api-endpoint-php.js';
 import {
   extractResponseShapes,
   extractPHPResponseShapes,
@@ -73,7 +89,10 @@ import {
   extractExtractedHeritageFromFiles,
 } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
-import { processStructuralImplements } from './structural-implements-processor.js';
+import {
+  processStructuralImplements,
+  buildStructuralImplementorFiles,
+} from './structural-implements-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
 import { createResolutionContext } from './resolution-context.js';
@@ -305,8 +324,10 @@ function synthesizeWildcardImportBindings(
   }
 
   // Build module alias map for Python namespace imports.
-  // `import models` in app.py → ctx.moduleAliasMap['app.py']['models'] = 'models.py'
+  // `import models` in app.py → ctx.moduleAliasMap['app.py']['models'] = {'models.py'}
   // Enables `models.User()` to resolve to models.py:User without ambiguous symbol expansion.
+  // The value is a single-element set so it matches the Set<string> shape used
+  // by the multi-file Go path below — see ModuleAliasMap doc.
   const buildPythonModuleAliasForFile = (callerFile: string, importedFiles: Iterable<string>) => {
     let aliasMap = ctx.moduleAliasMap.get(callerFile);
     for (const importedFile of importedFiles) {
@@ -320,7 +341,7 @@ function synthesizeWildcardImportBindings(
         aliasMap = new Map();
         ctx.moduleAliasMap.set(callerFile, aliasMap);
       }
-      aliasMap.set(stem, importedFile);
+      aliasMap.set(stem, new Set([importedFile]));
     }
   };
 
@@ -328,6 +349,84 @@ function synthesizeWildcardImportBindings(
     const provider = getProviderForFile(filePath);
     if (!provider || provider.importSemantics !== 'namespace') continue;
     buildPythonModuleAliasForFile(filePath, importedFiles);
+  }
+
+  // Build module alias map for Go package-qualified calls.
+  //
+  // Background. Go is classified as 'wildcard' (whole-package import) by the
+  // provider system, but its CALL semantics are namespace-style: every
+  // exported symbol must be referenced as `<pkg>.<Name>` from outside the
+  // declaring package. Without an alias map, resolveModuleAliasedCall has
+  // nothing to narrow with, so package-qualified calls fall through to
+  // singleCandidate(tiered). For names that are unique across the repo
+  // (`EnableModules`, `GetFinalJS`) that lands the right edge by accident;
+  // for highly overloaded names like Go's `New` (~1k+ definitions in a
+  // typical service monorepo) the resolver picks an arbitrary candidate
+  // and the CALLS edge ends up on the wrong package's `New`.
+  //
+  // The alias name we derive is the imported package's directory basename —
+  // Go's de-facto convention is that `package foo` lives in directory
+  // `…/foo/`, and the call-site receiver is `foo.Symbol()`. Renamed imports
+  // (`alias "path"`) are uncommon and out of scope here; they still resolve
+  // via the existing global tier (no regression vs today).
+  //
+  // The value is the set of every imported `.go` file under that directory,
+  // which lets resolveModuleAliasedCall filter the tiered candidate pool
+  // with `aliasFiles.has(c.filePath)` — turning a 1000-candidate name lookup
+  // into the 1-10 candidate set that the alias actually refers to.
+  const buildGoModuleAliasForFile = (callerFile: string, importedFiles: Iterable<string>) => {
+    // Group imported files by their parent directory. Each (alias, dir)
+    // collapses into one set of files. Last-segment collisions across two
+    // different imported packages are merged: in practice this is rare
+    // (Go style avoids identically-named packages in the same file's
+    // import block), and a merged set is strictly better than dropping
+    // one of them — the resolver's per-symbol filter still picks the
+    // single correct definition.
+    const byAlias = new Map<string, Set<string>>();
+    for (const importedFile of importedFiles) {
+      const lastSlash = importedFile.lastIndexOf('/');
+      if (lastSlash <= 0) continue;
+      const dir = importedFile.slice(0, lastSlash);
+      const aliasStart = dir.lastIndexOf('/') + 1;
+      const alias = dir.slice(aliasStart);
+      if (!alias || alias === '.') continue;
+      let set = byAlias.get(alias);
+      if (!set) {
+        set = new Set();
+        byAlias.set(alias, set);
+      }
+      set.add(importedFile);
+    }
+    if (byAlias.size === 0) return;
+    let aliasMap = ctx.moduleAliasMap.get(callerFile);
+    if (!aliasMap) {
+      aliasMap = new Map();
+      ctx.moduleAliasMap.set(callerFile, aliasMap);
+    }
+    for (const [alias, files] of byAlias) {
+      // Don't clobber an existing alias entry — Python's namespace builder
+      // ran first and its single-file Python alias is more authoritative
+      // for a Python file. In a polyglot repo this should never collide
+      // (the loop above only runs on Go callerFiles), but the guard makes
+      // the merge order-independent.
+      if (aliasMap.has(alias)) continue;
+      aliasMap.set(alias, files);
+    }
+  };
+
+  // Go imports live in graphImports (computed above from graph IMPORTS
+  // edges) because Go's wildcard-bucket bypasses ctx.importMap. Iterate
+  // both sources so any future language that lands in importMap with Go
+  // semantics gets aliased too.
+  for (const [filePath, importedFiles] of graphImports) {
+    const lang = getLanguageFromFilename(filePath);
+    if (lang !== 'go') continue;
+    buildGoModuleAliasForFile(filePath, importedFiles);
+  }
+  for (const [filePath, importedFiles] of ctx.importMap) {
+    const lang = getLanguageFromFilename(filePath);
+    if (lang !== 'go') continue;
+    buildGoModuleAliasForFile(filePath, importedFiles);
   }
 
   return totalSynthesized;
@@ -676,6 +775,10 @@ async function runChunkedParseAndResolve(
   allConfigTags: ConfigTagBinding[];
   /** Trivial getter functions collected from Go files for Phase 3.4. */
   allTrivialGetters: TrivialGetterBinding[];
+  /** Package-level string constants collected from Go files for Phase 3.4c. */
+  allStringConsts: GoStringConst[];
+  /** Startup/cron task registration sites collected from Go files. */
+  allStartupTaskRegistrations: StartupTaskRegistration[];
 }> {
   const symbolTable = ctx.symbols;
 
@@ -824,6 +927,8 @@ async function runChunkedParseAndResolve(
   // of the same shape. Both feed the same per-chunk merge.
   const allConfigTags: ConfigTagBinding[] = [];
   const allTrivialGetters: TrivialGetterBinding[] = [];
+  const allStringConsts: GoStringConst[] = [];
+  const allStartupTaskRegistrations: StartupTaskRegistration[] = [];
   const deferredWorkerCalls: ExtractedCall[] = [];
   const deferredWorkerHeritage: ExtractedHeritage[] = [];
   const deferredConstructorBindings: FileConstructorBindings[] = [];
@@ -881,6 +986,14 @@ async function runChunkedParseAndResolve(
         if (chunkParseResult.sequentialExtras.trivialGetters) {
           for (const g of chunkParseResult.sequentialExtras.trivialGetters)
             allTrivialGetters.push(g);
+        }
+        if (chunkParseResult.sequentialExtras.stringConsts) {
+          for (const sc of chunkParseResult.sequentialExtras.stringConsts)
+            allStringConsts.push(sc);
+        }
+        if (chunkParseResult.sequentialExtras.startupTaskRegistrations) {
+          for (const str of chunkParseResult.sequentialExtras.startupTaskRegistrations)
+            allStartupTaskRegistrations.push(str);
         }
       }
 
@@ -1020,6 +1133,13 @@ async function runChunkedParseAndResolve(
         if (chunkWorkerData.trivialGetters?.length) {
           for (const _item of chunkWorkerData.trivialGetters) allTrivialGetters.push(_item);
         }
+        if (chunkWorkerData.stringConsts?.length) {
+          for (const _item of chunkWorkerData.stringConsts) allStringConsts.push(_item);
+        }
+        if (chunkWorkerData.startupTaskRegistrations?.length) {
+          for (const _item of chunkWorkerData.startupTaskRegistrations)
+            allStartupTaskRegistrations.push(_item);
+        }
       } else {
         await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
         sequentialChunkPaths.push(chunkPaths);
@@ -1033,8 +1153,14 @@ async function runChunkedParseAndResolve(
     }
 
     // Build unified HeritageMap (parent lookup + implementor index) after all chunks.
+    // Seed the implementor index with structural (duck-typed) matches so Go
+    // interface dispatch — which produces no `implements` heritage — can fan
+    // out interface-typed calls to concrete methods during call resolution.
+    const workerStructuralImplementors = buildStructuralImplementorFiles(graph);
     const fullWorkerHeritageMap =
-      deferredWorkerHeritage.length > 0 ? buildHeritageMap(deferredWorkerHeritage, ctx) : undefined;
+      deferredWorkerHeritage.length > 0 || workerStructuralImplementors.size > 0
+        ? buildHeritageMap(deferredWorkerHeritage, ctx, workerStructuralImplementors)
+        : undefined;
 
     if (deferredWorkerCalls.length > 0) {
       await processCallsFromExtracted(
@@ -1117,8 +1243,13 @@ async function runChunkedParseAndResolve(
     astCache.clear();
   }
   // Build unified HeritageMap from all sequential heritage (parent lookup + implementor index).
+  // Seed structural implementors (see worker-path rationale above) so Go
+  // interface dispatch works on the sequential path too.
+  const sequentialStructuralImplementors = buildStructuralImplementorFiles(graph);
   const sequentialHeritageMap =
-    allSequentialHeritage.length > 0 ? buildHeritageMap(allSequentialHeritage, ctx) : undefined;
+    allSequentialHeritage.length > 0 || sequentialStructuralImplementors.size > 0
+      ? buildHeritageMap(allSequentialHeritage, ctx, sequentialStructuralImplementors)
+      : undefined;
 
   // Pass 2: Process calls, heritage edges, fetch calls, and ORM queries per chunk.
   // Reuse the file contents cached in Pass 1 instead of re-reading from disk.
@@ -1213,6 +1344,89 @@ async function runChunkedParseAndResolve(
   importCtx.index = EMPTY_INDEX; // Release suffix index memory (~30MB for large repos)
   importCtx.normalizedFileList = [];
 
+  // ── Plain-PHP htaccess route layer ──────────────────────────────
+  // Scan the repo's `.htaccess*` files for `RewriteRule` directives
+  // and emit them as Route registrations. This runs ONCE per analyze
+  // (independent of the per-file parse path) because:
+  //   - the source isn't a `.php` file the per-file extractor sees,
+  //   - the URL mapping is authoritative and should override any
+  //     AST file-based guess for the same handler file.
+  //
+  // After appending htaccess routes, we drop AST-derived file-based
+  // PHP routes (framework="php.fileBased" / produced by
+  // `extractPhpApiEndpoints`) whose handler file is already covered
+  // by htaccess — htaccess is the public URL contract and the file
+  // path is just an implementation detail of where Apache dispatches
+  // to. Repos without htaccess keep their AST fallback routes
+  // untouched.
+  try {
+    const htaccessIndex = await buildHtaccessIndex(repoPath);
+    if (htaccessIndex.size > 0) {
+      // Step 1 — drop AST file-based PHP fallback routes for files the
+      // htaccess registry already covers. We do this BEFORE appending
+      // htaccess routes so we don't accidentally compare an htaccess
+      // route against itself (the htaccess pattern can equal the
+      // file-derived path template for trivial cases like
+      // `/foo` ←→ `foo.php`).
+      let dropped = 0;
+      const filtered: ExtractedRoute[] = [];
+      for (const r of allExtractedRoutes) {
+        const isPhp = r.filePath.toLowerCase().endsWith('.php');
+        if (isPhp && htaccessIndex.has(r.filePath)) {
+          // Both the path-stripped form (`/cmadserving/scrr`) and the
+          // basename-preserving form (`/scrr.php`) are dropped when
+          // htaccess covers the file — htaccess is the public URL
+          // contract; the file-derived paths are implementation
+          // details the AST extractor produces as a fallback.
+          const basenameTemplate = phpFileToBasenameTemplate(r.filePath);
+          if (
+            r.routePath === phpFileToPathTemplate(r.filePath) ||
+            (basenameTemplate !== null && r.routePath === basenameTemplate)
+          ) {
+            dropped++;
+            continue;
+          }
+        }
+        filtered.push(r);
+      }
+      allExtractedRoutes.length = 0;
+      allExtractedRoutes.push(...filtered);
+
+      // Step 2 — emit one ExtractedRoute per htaccess rule. Multiple
+      // RewriteRules can point at the same `.php` handler (different
+      // public URLs); each becomes its own Route node so the matcher
+      // can join clients by whichever URL they used.
+      let added = 0;
+      for (const [targetFile, rules] of htaccessIndex) {
+        for (const rule of rules) {
+          allExtractedRoutes.push({
+            filePath: targetFile,
+            httpMethod: '*',
+            routePath: rule.urlPattern,
+            controllerName: null,
+            // Handler symbol = file basename minus extension. This is
+            // what the downstream HANDLES_ROUTE matcher uses to bind
+            // the Route to a File / Function node.
+            methodName: targetFile.split('/').pop()?.replace(/\.php$/i, '') ?? null,
+            middleware: [],
+            prefix: null,
+            lineNumber: rule.ruleLine,
+          });
+          added++;
+        }
+      }
+
+      if (isDev) {
+        console.log(
+          `🔗 PHP htaccess: ${added} routes from ${htaccessIndex.size} target files; ` +
+            `dropped ${dropped} AST fallback route(s) for covered files`,
+        );
+      }
+    }
+  } catch (err) {
+    if (isDev) console.warn(`htaccess scan failed: ${(err as Error).message}`);
+  }
+
   return {
     exportedTypeMap,
     allFetchCalls,
@@ -1223,6 +1437,8 @@ async function runChunkedParseAndResolve(
     bindingAccumulator,
     allConfigTags,
     allTrivialGetters,
+    allStringConsts,
+    allStartupTaskRegistrations,
   };
 }
 
@@ -1509,6 +1725,8 @@ export const runPipelineFromRepo = async (
       bindingAccumulator,
       allConfigTags,
       allTrivialGetters,
+      allStringConsts,
+      allStartupTaskRegistrations,
     } = await runChunkedParseAndResolve(
       graph,
       ctx,
@@ -1610,10 +1828,26 @@ export const runPipelineFromRepo = async (
 
     const ensureSlash = (path: string) => (path.startsWith('/') ? path : '/' + path);
     let duplicateRoutes = 0;
+    // Additional handler files registered against URLs that already
+    // have a primary RouteEntry. The Route NODE stays singular per
+    // URL (Routes are keyed by URL in the graph), but in a polyglot
+    // mega-index the SAME URL can have a Go handler in one repo and
+    // a PHP handler in another — both deserve HANDLES_ROUTE edges so
+    // cross-repo flow surfaces correctly. The secondary loop below
+    // walks this list and emits the extra edges against the
+    // already-created Route node.
+    const additionalHandlers: Array<{ url: string; entry: RouteEntry }> = [];
     const addRoute = (entry: RouteEntry) => {
       const k = entry.pathTemplate;
       if (routeRegistry.has(k)) {
         duplicateRoutes++;
+        // Different filePath for the same URL → preserve as an extra
+        // handler. Same-file duplicates (re-registrations) are noise
+        // and stay dropped.
+        const primary = routeRegistry.get(k)!;
+        if (primary.filePath !== entry.filePath) {
+          additionalHandlers.push({ url: k, entry });
+        }
         return;
       }
       routeRegistry.set(k, entry);
@@ -1760,9 +1994,67 @@ export const runPipelineFromRepo = async (
         }
       }
 
+      // Secondary HANDLES_ROUTE pass: emit edges for additional
+      // handlers (different filePath, same URL — e.g. polyglot
+      // cross-repo handlers). The Route node already exists from
+      // the primary pass; we only need fresh file/function edges.
+      let extraHandlerEdges = 0;
+      const extraHandlerPaths = [
+        ...new Set(additionalHandlers.map((a) => a.entry.filePath)),
+      ];
+      let extraContents: Map<string, string> | undefined;
+      if (extraHandlerPaths.length > 0) {
+        extraContents = await readFileContents(repoPath, extraHandlerPaths);
+      }
+      for (const { url, entry } of additionalHandlers) {
+        const routeNodeId = generateId('Route', url);
+        const handlerFileId = generateId('File', entry.filePath);
+        graph.addRelationship({
+          id: generateId('HANDLES_ROUTE', `${handlerFileId}->${routeNodeId}`),
+          sourceId: handlerFileId,
+          targetId: routeNodeId,
+          type: 'HANDLES_ROUTE',
+          confidence: 1.0,
+          reason: `${entry.source}|secondary`,
+        });
+        extraHandlerEdges += 1;
+
+        // Try to resolve a Function/Method symbol just like the
+        // primary loop does, so cross-repo handlers get function
+        // granularity too.
+        if (entry.handlerSymbol) {
+          const idx = buildHandlerIndex();
+          const candidates = idx.get(entry.handlerSymbol) ?? [];
+          let chosen: GraphNode | null = null;
+          if (candidates.length === 1) {
+            chosen = candidates[0];
+          } else if (candidates.length > 1) {
+            const sameFile = candidates.find(
+              (c) => c.properties.filePath === entry.filePath,
+            );
+            if (sameFile) chosen = sameFile;
+          }
+          if (chosen) {
+            graph.addRelationship({
+              id: generateId('HANDLES_ROUTE', `${chosen.id}->${routeNodeId}`),
+              sourceId: chosen.id,
+              targetId: routeNodeId,
+              type: 'HANDLES_ROUTE',
+              confidence: candidates.length === 1 ? 1.0 : 0.85,
+              reason: `${entry.source}|secondary|symbol:${entry.handlerSymbol}`,
+            });
+          }
+        }
+      }
+      // Silence unused-variable warning when extraContents isn't
+      // consumed (response-shape extraction for secondary handlers
+      // is intentionally skipped — the primary handler's shapes are
+      // attached to the Route node).
+      void extraContents;
+
       if (isDev) {
         console.log(
-          `🗺️ Route registry: ${routeRegistry.size} routes${duplicateRoutes > 0 ? ` (${duplicateRoutes} duplicate keys skipped)` : ''}${functionLevelHandlerEdges > 0 ? `, ${functionLevelHandlerEdges} function-level HANDLES_ROUTE` : ''}`,
+          `🗺️ Route registry: ${routeRegistry.size} routes${duplicateRoutes > 0 ? ` (${duplicateRoutes} duplicate URL keys — ${additionalHandlers.length} kept as extra handlers, ${extraHandlerEdges} extra HANDLES_ROUTE emitted)` : ''}${functionLevelHandlerEdges > 0 ? `, ${functionLevelHandlerEdges} function-level HANDLES_ROUTE` : ''}`,
         );
       }
     }
@@ -1963,6 +2255,168 @@ export const runPipelineFromRepo = async (
             }
           }
 
+          // ── Phase 3.4b: URL-via-getter resolver ──
+          // Recover literal URL paths for calls whose value is a
+          // struct-field chain rooted in a YAML-bound trivial getter
+          // (e.g. `Path: originConfig.Renderer`). When found, stamp
+          // c.fetchURL so the call flows through the existing URL
+          // matcher (precise file-grounded edges), not the broad
+          // tag-fanout path.
+          let urlBackfilled = 0;
+          if (
+            pendingCalls.length > 0 &&
+            providerIdx.byKeyPath.size > 0 &&
+            (allConfigTags.length > 0 || allTrivialGetters.length > 0)
+          ) {
+            const resolvedURLs = buildResolvedGetterURLs(
+              allConfigTags,
+              allTrivialGetters,
+              providerIdx.byKeyPath,
+            );
+            const fieldTagMap = buildFieldTagMap(allConfigTags);
+            // Index getters by getterKey for tail-extension lookups.
+            const gettersByKey = new Map<string, TrivialGetterBinding[]>();
+            for (const g of allTrivialGetters) {
+              for (const k of [getterKey(g.receiver, g.name), getterKey(null, g.name)]) {
+                const list = gettersByKey.get(k);
+                if (list) list.push(g);
+                else gettersByKey.set(k, [g]);
+              }
+            }
+            for (const c of pendingCalls) {
+              if (c.fetchURL) continue; // already resolved
+              if (!c.pendingGetterLookups) continue;
+              let chosen: string | null = null;
+              for (const lk of c.pendingGetterLookups) {
+                // Try direct getter→URL lookup first (for shapes like
+                // `Path: GetXyz().Url` where `name` is the getter).
+                const urls =
+                  resolvedURLs.get(getterKey(lk.receiver, lk.name)) ??
+                  resolvedURLs.get(getterKey(null, lk.name));
+                if (urls && urls.size > 0) {
+                  chosen = urls.values().next().value ?? null;
+                  if (chosen) break;
+                }
+                // Bare-selector shape: lk.tail set → substitute the
+                // receiver via localAssignments back to a getter call,
+                // then apply tail as the field accessor on the getter
+                // return alias.
+                if (lk.tail && lk.receiver && c.localAssignments) {
+                  const la = c.localAssignments[lk.receiver];
+                  if (la?.call) {
+                    const getters =
+                      gettersByKey.get(getterKey(la.call.receiver, la.call.name)) ??
+                      gettersByKey.get(getterKey(null, la.call.name)) ??
+                      [];
+                    for (const g of getters) {
+                      const out = resolveGetterTailURL(
+                        g,
+                        lk.tail,
+                        fieldTagMap,
+                        providerIdx.byKeyPath,
+                      );
+                      if (out.size > 0) {
+                        chosen = out.values().next().value ?? null;
+                        if (chosen) break;
+                      }
+                    }
+                    if (chosen) break;
+                  }
+                }
+              }
+              if (chosen) {
+                c.fetchURL = chosen;
+                urlBackfilled++;
+              }
+            }
+            if (isDev) {
+              console.log(
+                `🔗 URL-via-getter resolver: ${pendingCalls.length} pending calls, ` +
+                  `${urlBackfilled} backfilled fetchURL ` +
+                  `(byKeyPath=${providerIdx.byKeyPath.size}, gettersByKey=${gettersByKey.size})`,
+              );
+            }
+          }
+
+          // ── Phase 3.4c: URL-via-getter resolver (in-code constants) ──
+          // Like 3.4b, but resolves getter chains to in-code string
+          // constants (e.g. `GetPath()` → `return constant.DefaultPath`
+          // → `"/trf"`) rather than YAML-bound config keys. Links
+          // dynamically-built URLs (e.g. oscar `ClickUrl.getUrl` whose
+          // path comes from `adClickRouteService.GetPath()`) to their
+          // Route node. The secondary matcher below self-filters: a
+          // recovered literal only yields a FETCHES edge when it
+          // matches a registered route, so non-route constants and
+          // coincidental same-named getters never create edges.
+          if (
+            pendingCalls.length > 0 &&
+            allStringConsts.length > 0 &&
+            allTrivialGetters.length > 0
+          ) {
+            const resolvedConstURLs = buildResolvedGetterConstURLs(
+              allStringConsts,
+              allTrivialGetters,
+            );
+            let constBackfilled = 0;
+            for (const c of pendingCalls) {
+              if (c.fetchURL) continue; // already resolved by 3.4/3.4b
+              if (!c.pendingGetterLookups) continue;
+              // Gather every absolute-path candidate this call's getter
+              // chains resolve to. A generic method name (`GetPath`) can
+              // resolve to several constants across the repo; prefer one
+              // that names a registered route so a coincidental
+              // non-route constant can't shadow the real edge. Falls
+              // back to the first absolute path (harmless — a non-route
+              // value simply produces no edge at the matcher).
+              const candidates: string[] = [];
+              for (const lk of c.pendingGetterLookups) {
+                const urls =
+                  resolvedConstURLs.get(getterKey(lk.receiver, lk.name)) ??
+                  resolvedConstURLs.get(getterKey(null, lk.name));
+                if (!urls) continue;
+                for (const u of urls) if (u.startsWith('/')) candidates.push(u);
+              }
+              if (candidates.length === 0) continue;
+              const chosen = candidates.find((u) => routeRegistry.has(u)) ?? candidates[0];
+              c.fetchURL = chosen;
+              urlBackfilled++;
+              constBackfilled++;
+            }
+            if (isDev) {
+              console.log(
+                `🔗 URL-const resolver: ${pendingCalls.length} pending calls, ` +
+                  `${constBackfilled} backfilled fetchURL ` +
+                  `(consts=${allStringConsts.length}, getters=${allTrivialGetters.length})`,
+              );
+            }
+          }
+
+          // If we recovered literal URLs above, run the URL matcher
+          // against the route registry once more so those calls hit
+          // Route nodes via the precise `fetch-url-match` path. Only
+          // run when at least one URL was backfilled; otherwise the
+          // first invocation above already covered everything.
+          if (urlBackfilled > 0 && routeRegistry.size > 0) {
+            const fetchRoutes = [...routeRegistry.entries()].map(([routeURL, entry]) => ({
+              routeKey: routeURL,
+              pathTemplate: entry.pathTemplate,
+              httpMethod: entry.httpMethod,
+              filePath: entry.filePath,
+            }));
+            const newlyResolved = pendingCalls.filter((c) => c.fetchURL);
+            if (newlyResolved.length > 0) {
+              const consumerPaths = [...new Set(newlyResolved.map((c) => c.filePath))];
+              const consumerContents = await readFileContents(repoPath, consumerPaths);
+              processNextjsFetchRoutes(graph, newlyResolved, fetchRoutes, consumerContents);
+              if (isDev) {
+                console.log(
+                  `🔗 URL-via-getter secondary match: ${newlyResolved.length} calls matched against ` +
+                    `${fetchRoutes.length} routes`,
+                );
+              }
+            }
+          }
+
           const tagOnlyAfter = allFetchCalls.filter(
             (c) => c.providerTag && (!c.fetchURL || c.fetchURL === ''),
           ).length;
@@ -1978,6 +2432,31 @@ export const runPipelineFromRepo = async (
         } catch (err) {
           if (isDev) console.warn('Provider-tag resolver failed:', err);
         }
+      }
+    }
+
+    // ── Phase 3.5d: Startup/cron background-task lifecycle edges ──────
+    // Go's task framework invokes StartupRun/PeriodicRun through the
+    // StartupTaskInterface — an interface-dispatch hop the CALLS graph
+    // misses, orphaning cron/cache-warmer work (and any cross-repo
+    // fetches it issues) from the binary `main`. Recover the missing
+    // link by synthesizing CALLS edges from each
+    // `[]startup.StartupTaskInterface{ pkg.GetTask(...) }` registration
+    // function to the lifecycle methods co-located in the task package.
+    if (allStartupTaskRegistrations.length > 0) {
+      const taskEdges = buildStartupTaskEdges(allStartupTaskRegistrations, ctx.symbols);
+      let emittedTaskEdges = 0;
+      for (const edge of taskEdges) {
+        // Guard: only link to targets that materialized as graph nodes.
+        if (!graph.getNode(edge.targetId)) continue;
+        graph.addRelationship(edge);
+        emittedTaskEdges += 1;
+      }
+      if (isDev) {
+        console.log(
+          `🔗 Startup-task resolver: ${allStartupTaskRegistrations.length} registration site(s) → ` +
+            `${emittedTaskEdges} lifecycle CALLS edge(s)`,
+        );
       }
     }
 

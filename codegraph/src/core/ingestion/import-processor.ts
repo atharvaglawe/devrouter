@@ -5,7 +5,7 @@ import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/pa
 import { getProvider, getProviderForFile, providersWithImplicitWiring } from './languages/index.js';
 import type { LanguageProvider } from './language-provider.js';
 import { generateId } from '../../lib/utils.js';
-import { getLanguageFromFilename } from '../../_shared/index.js';
+import { getLanguageFromFilename, SupportedLanguages } from '../../_shared/index.js';
 import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
 import type { ExtractedImport } from './workers/parse-worker.js';
@@ -19,7 +19,7 @@ import type {
   ImportResolutionContext,
 } from './import-resolvers/types.js';
 import type { NamedBinding } from './named-bindings/types.js';
-import type { SyntaxNode } from './utils/ast-helpers.js';
+import { extractGoImportAlias, type SyntaxNode } from './utils/ast-helpers.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -165,6 +165,8 @@ function applyImportResult(
   namedBindings?: NamedBinding[],
   namedImportMap?: NamedImportMap,
   moduleAliasMap?: ModuleAliasMap,
+  /** Explicit module alias for the whole import (e.g. Go `nerrping "…/nerrping2"`). */
+  moduleAlias?: string,
 ): void {
   if (!result) return;
 
@@ -175,6 +177,22 @@ function applyImportResult(
     }
     if (!packageMap.has(filePath)) packageMap.set(filePath, new Set());
     packageMap.get(filePath)!.add(result.dirSuffix);
+
+    // Go renamed import: the call-site receiver is the alias, not the package
+    // directory basename. Key the module-alias map by the alias so
+    // resolveModuleAliasedCall can narrow `<alias>.Symbol()` to this package's
+    // files. The pipeline's directory-basename builder still adds its own key,
+    // so both the alias and the basename resolve.
+    if (moduleAlias && moduleAliasMap && result.files.length > 0) {
+      let aliasMap = moduleAliasMap.get(filePath);
+      if (!aliasMap) {
+        aliasMap = new Map();
+        moduleAliasMap.set(filePath, aliasMap);
+      }
+      if (!aliasMap.has(moduleAlias)) {
+        aliasMap.set(moduleAlias, new Set(result.files));
+      }
+    }
   } else {
     // 'files' kind, or 'package' without PackageMap — use ImportMap directly
     const files = result.files;
@@ -184,6 +202,8 @@ function applyImportResult(
 
     // Route module aliases (import X as Y) directly to moduleAliasMap.
     // These are module-level aliases, not symbol bindings — they don't belong in namedImportMap.
+    // ModuleAliasMap values are sets to support multi-file packages (Go); Python
+    // aliases are a single-element set since one alias maps to one module file.
     if (namedBindings && moduleAliasMap && files.length === 1) {
       const resolvedFile = files[0];
       for (const binding of namedBindings) {
@@ -193,7 +213,7 @@ function applyImportResult(
           aliasMap = new Map();
           moduleAliasMap.set(filePath, aliasMap);
         }
-        aliasMap.set(binding.local, resolvedFile);
+        aliasMap.set(binding.local, new Set([resolvedFile]));
       }
     }
 
@@ -376,6 +396,8 @@ export const processImports = async (
         const result = provider.importResolver(rawImportPath, file.path, resolveCtx);
         const extractor = provider.namedBindingExtractor;
         const bindings = namedImportMap && extractor ? extractor(captureMap['import']) : undefined;
+        const moduleAlias =
+          provider.id === SupportedLanguages.Go ? extractGoImportAlias(sourceNode) : undefined;
         applyImportResult(
           result,
           file.path,
@@ -386,6 +408,7 @@ export const processImports = async (
           bindings,
           namedImportMap,
           moduleAliasMap,
+          moduleAlias,
         );
       }
 
@@ -502,6 +525,7 @@ export const processImportsFromExtracted = async (
         imp.namedBindings,
         namedImportMap,
         moduleAliasMap,
+        imp.alias,
       );
     }
   }

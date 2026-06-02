@@ -21,6 +21,7 @@ import { detectFrameworkFromAST } from './framework-detection.js';
 import { extractGoApiEndpoints } from './route-extractors/api-endpoint-go.js';
 import { extractJavaApiEndpoints } from './route-extractors/api-endpoint-java.js';
 import { extractPythonApiEndpoints } from './route-extractors/api-endpoint-python.js';
+import { extractPhpApiEndpoints } from './route-extractors/api-endpoint-php.js';
 import type { ExtractedApiEndpoints } from './route-extractors/api-endpoint-types.js';
 import {
   extractGoConfigTags,
@@ -28,6 +29,14 @@ import {
   type ConfigTagBinding,
   type TrivialGetterBinding,
 } from './route-extractors/config-tag-resolver.js';
+import {
+  extractGoStringConsts,
+  type GoStringConst,
+} from './route-extractors/url-const-resolver.js';
+import {
+  extractGoStartupTaskRegistrations,
+  type StartupTaskRegistration,
+} from './route-extractors/startup-task-extractor.js';
 import {
   extractJavaConfigTags,
   extractJavaTrivialGetters,
@@ -90,6 +99,12 @@ export interface WorkerExtractedData {
    *  statements only. Folded into a getter-name → tag-set map by
    *  Phase 3.4 to recover providerTag values at non-literal call sites. */
   trivialGetters: TrivialGetterBinding[];
+  /** Package-level string constants (Go). Folded by Phase 3.4c to
+   *  resolve getter chains ending in a constant to a literal URL path. */
+  stringConsts: GoStringConst[];
+  /** Startup/cron task registration sites (Go). Used to synthesize CALLS
+   *  edges from registration fns to task lifecycle methods. */
+  startupTaskRegistrations: StartupTaskRegistration[];
 }
 
 // ============================================================================
@@ -127,6 +142,8 @@ const processParsingWithWorkers = async (
       fileScopeBindings: [],
       configTags: [],
       trivialGetters: [],
+      stringConsts: [],
+      startupTaskRegistrations: [],
     };
 
   const total = files.length;
@@ -154,6 +171,8 @@ const processParsingWithWorkers = async (
   const fileScopeBindingsByFile: FileScopeBindings[] = [];
   const allConfigTags: ConfigTagBinding[] = [];
   const allTrivialGetters: TrivialGetterBinding[] = [];
+  const allStringConsts: GoStringConst[] = [];
+  const allStartupTaskRegistrations: StartupTaskRegistration[] = [];
   for (const result of chunkResults) {
     for (const node of result.nodes) {
       graph.addNode({
@@ -196,6 +215,11 @@ const processParsingWithWorkers = async (
       for (const _item of result.configTags) allConfigTags.push(_item);
     if (result.trivialGetters)
       for (const _item of result.trivialGetters) allTrivialGetters.push(_item);
+    if (result.stringConsts)
+      for (const _item of result.stringConsts) allStringConsts.push(_item);
+    if (result.startupTaskRegistrations)
+      for (const _item of result.startupTaskRegistrations)
+        allStartupTaskRegistrations.push(_item);
   }
 
   // Merge and log skipped languages from workers
@@ -229,6 +253,8 @@ const processParsingWithWorkers = async (
     fileScopeBindings: fileScopeBindingsByFile,
     configTags: allConfigTags,
     trivialGetters: allTrivialGetters,
+    stringConsts: allStringConsts,
+    startupTaskRegistrations: allStartupTaskRegistrations,
   };
 };
 
@@ -328,6 +354,10 @@ export interface SequentialParsingExtras {
   configTags: ConfigTagBinding[];
   /** Trivial getter functions extracted in sequential mode (Go only today). */
   trivialGetters: TrivialGetterBinding[];
+  /** Package-level string constants extracted in sequential mode (Go only). */
+  stringConsts: GoStringConst[];
+  /** Startup/cron task registration sites extracted in sequential mode (Go only). */
+  startupTaskRegistrations: StartupTaskRegistration[];
 }
 
 const processParsingSequential = async (
@@ -344,6 +374,8 @@ const processParsingSequential = async (
   const fetchCalls: ExtractedFetchCall[] = [];
   const configTags: ConfigTagBinding[] = [];
   const trivialGetters: TrivialGetterBinding[] = [];
+  const stringConsts: GoStringConst[] = [];
+  const startupTaskRegistrations: StartupTaskRegistration[] = [];
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -420,6 +452,14 @@ const processParsingSequential = async (
       if (cts.length > 0) configTags.push(...cts);
       const tgs = extractGoTrivialGetters(tree.rootNode, file.path);
       if (tgs.length > 0) trivialGetters.push(...tgs);
+      // Package-level string constants — Phase 3.4c resolves getter
+      // chains ending in a constant (e.g. `GetPath()` → `"/trf"`).
+      const scs = extractGoStringConsts(tree.rootNode, file.path);
+      if (scs.length > 0) stringConsts.push(...scs);
+      // Startup/cron task registration sites — a post-resolve pipeline
+      // phase links the registration fn to the task lifecycle methods.
+      const strs = extractGoStartupTaskRegistrations(tree.rootNode, file.path);
+      if (strs.length > 0) startupTaskRegistrations.push(...strs);
     } else if (language === SupportedLanguages.Java) {
       apiResult = extractJavaApiEndpoints(tree.rootNode, file.path);
       // Java shape: @Value/@ConfigurationProperties annotations +
@@ -436,6 +476,11 @@ const processParsingSequential = async (
       if (cts.length > 0) configTags.push(...cts);
       const tgs = extractPythonTrivialGetters(tree.rootNode, file.path);
       if (tgs.length > 0) trivialGetters.push(...tgs);
+    } else if (language === SupportedLanguages.PHP) {
+      // Plain PHP: AST file-based route fallback + outbound HTTP via
+      // file_get_contents / fopen / curl_setopt. htaccess-driven
+      // routes are layered in by pipeline.ts after the parse phase.
+      apiResult = extractPhpApiEndpoints(tree.rootNode, file.path);
     }
     if (apiResult) {
       for (const r of apiResult.routes) {
@@ -466,6 +511,7 @@ const processParsingSequential = async (
           callerSymbol: c.callerSymbol,
           callerReceiver: c.callerReceiver,
           pendingGetterLookups: c.pendingGetterLookups,
+          localAssignments: c.localAssignments,
         });
       }
     }
@@ -768,7 +814,14 @@ const processParsingSequential = async (
       .join(', ');
     console.warn(`  Skipped unsupported languages: ${summary}`);
   }
-  return { routes, fetchCalls, configTags, trivialGetters };
+  return {
+    routes,
+    fetchCalls,
+    configTags,
+    trivialGetters,
+    stringConsts,
+    startupTaskRegistrations,
+  };
 };
 
 // ============================================================================

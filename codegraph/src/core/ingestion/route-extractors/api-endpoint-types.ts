@@ -103,6 +103,23 @@ export interface PendingGetterLookup {
   receiver: string | null;
   /** Function or method name (e.g. `"GetABTestApiConfig"`). */
   name: string;
+  /** Optional tail field accessor when the captured expression was a
+   *  bare selector on a local (e.g. `originConfig.Renderer`). When
+   *  set, the URL resolver substitutes `receiver` via the call site's
+   *  {@link ClientCall.localAssignments} map (turning `originConfig`
+   *  into `config.GetOriginConfig()`), then walks the trivial-getter
+   *  return alias and appends `tail` as the final accessor.
+   *
+   *  Example: at site `Path: originConfig.Renderer`, with
+   *  `originConfig := config.GetOriginConfig()`, the extractor emits
+   *  `{receiver: "originConfig", name: "Renderer", tail: "Renderer"}`
+   *  and adds `"originConfig" → {receiver: "config", name: "GetOriginConfig"}`
+   *  to `localAssignments`.
+   *
+   *  Absent for ordinary call expressions where `name` is itself the
+   *  getter method (`config.GetXyz()` style).
+   */
+  tail?: string;
 }
 
 /** Outbound HTTP / RPC call recovered from source.
@@ -140,6 +157,22 @@ export interface ClientCall {
    *  {@link providerTag}. Empty / undefined when the URL is a literal
    *  or when no recognisable getter is present. */
   pendingGetterLookups?: PendingGetterLookup[];
+  /** Per-function `localVar := pkg.Func()` (or `localVar := selector`)
+   *  assignments visible at this call site. Lets the URL resolver
+   *  substitute bare selector chains rooted on a local back to the
+   *  call expression they came from, so a YAML key path can be
+   *  reconstructed across the indirection.
+   *
+   *  Key: local variable name. Value: either a getter call shape
+   *  `{call: {receiver, name}}` or a bare selector chain
+   *  `{alias: ["x", "Y", "Z"]}` for `local := x.Y.Z`.
+   *
+   *  Absent when the extractor didn't see any short-distance
+   *  assignments worth recording. */
+  localAssignments?: Record<
+    string,
+    { call?: { receiver: string | null; name: string }; alias?: string[] }
+  >;
 }
 
 export interface ExtractedApiEndpoints {

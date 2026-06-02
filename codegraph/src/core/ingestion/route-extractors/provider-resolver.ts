@@ -56,10 +56,20 @@ export interface ProviderInfo {
 export interface ProviderResolverIndex {
   /** Tag (lower-cased) → resolved info. */
   byTag: Map<string, ProviderInfo>;
+  /** Full dotted key path (lower-cased) → URL-shaped string values
+   *  harvested from YAML/JSON/properties leaves. Used by the
+   *  trivial-getter URL resolver to chase Go alias chains all the
+   *  way to literal URL/path values (not just to tags). For example
+   *  YAML `origins.cmserving.renderer: "/scrr.php"` lands here as
+   *  `"origins.cmserving.renderer" → {"/scrr.php"}`. Multiple
+   *  environments (canary/staging/production) for the same key are
+   *  unioned. */
+  byKeyPath: Map<string, Set<string>>;
 }
 
 export const EMPTY_PROVIDER_INDEX: ProviderResolverIndex = Object.freeze({
   byTag: new Map(),
+  byKeyPath: new Map(),
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -155,6 +165,25 @@ function extractHost(value: string): string | null {
 /** Recognise that a string *looks* like a URL or host. */
 function looksLikeUrlOrHost(value: string): boolean {
   return extractHost(value) !== null;
+}
+
+/** Recognise that a string *looks* like an HTTP URL or absolute
+ *  path — `/scrr.php`, `/api/v1/things`, `https://x.com/api`. Used
+ *  by the `byKeyPath` harvester to keep only values a downstream
+ *  call site could actually plug into a Go `url.URL{Path: …}` or
+ *  similar — bare hostnames are already handled by the tag index. */
+function looksLikeUrlOrPath(value: string): boolean {
+  const v = value.trim();
+  if (!v) return false;
+  if (v.length > 2048) return false;
+  if (v.includes(' ') || v.includes('\n') || v.includes('\t')) return false;
+  if (v.startsWith('${') || v.startsWith('$(') || v.startsWith('{{')) return false;
+  if (/^https?:\/\/[^\s]+/i.test(v)) return true;
+  // Absolute path starting with `/` and at least one non-slash
+  // character. Excludes `//x` style protocol-relative URLs (rare in
+  // server configs and ambiguous), as well as pure `/`.
+  if (/^\/[^/\s]/.test(v)) return true;
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -338,6 +367,20 @@ function ensureInfo(idx: ProviderResolverIndex, tag: string): ProviderInfo {
   return info;
 }
 
+/** Build the dotted lower-cased key for the `byKeyPath` index.
+ *  Skips numeric segments (array indices) so a YAML list element's
+ *  position doesn't get baked into the lookup key — alias chains
+ *  on the Go side never carry array indices. */
+function keyPathKey(keyPath: string[]): string | null {
+  const parts: string[] = [];
+  for (const seg of keyPath) {
+    if (!seg) continue;
+    if (/^\d+$/.test(seg)) continue;
+    parts.push(seg.toLowerCase());
+  }
+  return parts.length > 0 ? parts.join('.') : null;
+}
+
 /** Fold a single config file's leaves into the index. */
 export function ingestConfigFile(
   idx: ProviderResolverIndex,
@@ -347,15 +390,36 @@ export function ingestConfigFile(
   for (const leaf of leaves) {
     const value = leaf.value.trim();
     if (!value) continue;
-    if (!looksLikeUrlOrHost(value)) continue;
-    const tag = tagFromKeyPath(leaf.keyPath);
-    if (!tag) continue;
-    const info = ensureInfo(idx, tag);
-    info.sourceFiles.add(filename);
-    const host = extractHost(value);
-    if (host) info.hosts.add(host);
-    if (value.startsWith('http://') || value.startsWith('https://')) {
-      info.urls.add(value);
+
+    // Channel 1: tag-grained host/url index (legacy behaviour).
+    if (looksLikeUrlOrHost(value)) {
+      const tag = tagFromKeyPath(leaf.keyPath);
+      if (tag) {
+        const info = ensureInfo(idx, tag);
+        info.sourceFiles.add(filename);
+        const host = extractHost(value);
+        if (host) info.hosts.add(host);
+        if (value.startsWith('http://') || value.startsWith('https://')) {
+          info.urls.add(value);
+        }
+      }
+    }
+
+    // Channel 2: key-path-grained URL/path index. Captures values
+    // the tag channel skips — most importantly leaf keys like
+    // `renderer`, `path`, `route` whose value is `/scrr.php` or a
+    // full URL. Indexed by the full dotted key path so the Go-side
+    // alias-chain resolver can join via struct-tag fragments.
+    if (looksLikeUrlOrPath(value)) {
+      const key = keyPathKey(leaf.keyPath);
+      if (key) {
+        let bucket = idx.byKeyPath.get(key);
+        if (!bucket) {
+          bucket = new Set<string>();
+          idx.byKeyPath.set(key, bucket);
+        }
+        bucket.add(value);
+      }
     }
   }
 }
@@ -547,14 +611,19 @@ export async function scanProviderConfig(
   repoPath: string,
   options: { allRepoFiles?: string[] } = {},
 ): Promise<ProviderResolverIndex> {
-  const idx: ProviderResolverIndex = { byTag: new Map() };
+  const idx: ProviderResolverIndex = { byTag: new Map(), byKeyPath: new Map() };
 
-  // Pull the config-file subset.
+  // Pull the config-file subset. follow:true is gated on the same
+  // CODEGRAPH_FOLLOW_SYMLINKS opt-in the file walker uses, so a
+  // mega-root that symlinks multiple repos can discover each repo's
+  // config-driven provider tags (services.cmadserving.url etc.).
+  const followSymlinks = process.env.CODEGRAPH_FOLLOW_SYMLINKS === '1';
   const configFiles = await glob(CONFIG_GLOB, {
     cwd: repoPath,
     nodir: true,
     ignore: SCAN_IGNORE,
     absolute: false,
+    follow: followSymlinks,
   });
 
   for (const rel of configFiles) {
@@ -579,6 +648,7 @@ export async function scanProviderConfig(
       nodir: false,
       ignore: SCAN_IGNORE,
       absolute: false,
+      follow: followSymlinks,
     });
   }
   ingestDirectoryHints(idx, allFiles);

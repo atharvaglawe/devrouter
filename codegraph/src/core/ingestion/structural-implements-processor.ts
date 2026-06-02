@@ -90,10 +90,18 @@ interface MethodInfo {
   name: string;
   /** -1 when arity is unknown (variadic or not extracted). */
   arity: number;
+  /** File where this method/function is declared. For Go, a struct's methods
+   *  can be spread across multiple files in the same package, so this is NOT
+   *  necessarily the same as the owning type's `filePath`. */
+  filePath: string;
 }
 
 interface TypeMethodIndex {
   typeId: string;
+  /** Unqualified type name (used to key the interface-dispatch index). */
+  name: string;
+  /** File where the type itself is declared. */
+  filePath: string;
   language: string | undefined;
   methods: MethodInfo[];
   /** name → arities seen (allows overloads). */
@@ -124,6 +132,8 @@ function buildTypeMethodIndex(
         typeof n.properties.language === 'string' ? n.properties.language : undefined;
       types.set(n.id, {
         typeId: n.id,
+        name: typeof n.properties.name === 'string' ? n.properties.name : '',
+        filePath: typeof n.properties.filePath === 'string' ? n.properties.filePath : '',
         language,
         methods: [],
         byName: new Map(),
@@ -144,8 +154,10 @@ function buildTypeMethodIndex(
     if (!name) return;
     const arity =
       typeof m.properties.parameterCount === 'number' ? m.properties.parameterCount : -1;
+    const methodFilePath =
+      typeof m.properties.filePath === 'string' ? m.properties.filePath : '';
 
-    t.methods.push({ id: m.id, name, arity });
+    t.methods.push({ id: m.id, name, arity, filePath: methodFilePath });
     let arities = t.byName.get(name);
     if (!arities) {
       arities = new Set();
@@ -218,6 +230,192 @@ function expandInterfaceMethodSets(
   }
 }
 
+interface UsableInterfaceResult {
+  usable: TypeMethodIndex[];
+  skippedEmptyInterfaces: number;
+  skippedSmallInterfaces: number;
+  skippedDisabledLanguage: number;
+}
+
+/**
+ * Apply the per-language structural-implements policy gate to an interface
+ * index, returning the interfaces eligible for matching plus skip counters.
+ *
+ * Shared by {@link processStructuralImplements} (which emits graph edges) and
+ * {@link buildStructuralImplementorFiles} (which produces the call-time
+ * interface-dispatch index) so both honour the exact same eligibility rules.
+ */
+function collectUsableInterfaces(
+  interfaceIdx: Map<string, TypeMethodIndex>,
+): UsableInterfaceResult {
+  let skippedEmptyInterfaces = 0;
+  let skippedSmallInterfaces = 0;
+  let skippedDisabledLanguage = 0;
+  const usable: TypeMethodIndex[] = [];
+  for (const ti of interfaceIdx.values()) {
+    if (ti.byName.size === 0) {
+      skippedEmptyInterfaces++;
+      continue;
+    }
+    // Per-language gate: Java/Kotlin/C#/PHP have explicit `implements`, so
+    // the heritage processor already captures every real implementation.
+    // Structural-only matches in those languages collide with shared CRUD
+    // method names (`create`, `update`, `delete`, `list`) — controllers
+    // end up "implementing" every small service interface in the codebase.
+    const policy = policyFor(ti.language);
+    if (!policy.enabled) {
+      skippedDisabledLanguage++;
+      continue;
+    }
+    if (ti.byName.size < policy.minMethods) {
+      skippedSmallInterfaces++;
+      continue;
+    }
+    usable.push(ti);
+  }
+  return { usable, skippedEmptyInterfaces, skippedSmallInterfaces, skippedDisabledLanguage };
+}
+
+interface MatchOutcome {
+  matched: boolean;
+  usedArity: boolean;
+  nameOnlyFallback: boolean;
+}
+
+const NO_MATCH: MatchOutcome = { matched: false, usedArity: false, nameOnlyFallback: false };
+
+/**
+ * Decide whether `concrete`'s method-set structurally satisfies `iface`'s
+ * method-set (every interface method has a same-name method on the concrete
+ * type with a compatible arity). Reports how the decision was reached so
+ * callers can derive a confidence score.
+ *
+ * Self-matches and cross-language pairs are rejected up front.
+ */
+function evaluateInterfaceMatch(
+  iface: TypeMethodIndex,
+  concrete: TypeMethodIndex,
+): MatchOutcome {
+  if (concrete.typeId === iface.typeId) return NO_MATCH;
+
+  // Cross-language matches are off — Go structs don't structurally implement
+  // TypeScript interfaces. When either side has no language tag (older nodes)
+  // we allow the match.
+  if (concrete.language && iface.language && concrete.language !== iface.language) {
+    return NO_MATCH;
+  }
+
+  let usedArity = false;
+  let nameOnlyFallback = false;
+  for (const [name, ifaceArities] of iface.byName) {
+    const concreteArities = concrete.byName.get(name);
+    if (!concreteArities) return NO_MATCH;
+    let arityHit = false;
+    for (const ifaceArity of ifaceArities) {
+      if (ifaceArity === -1) {
+        // Unknown arity on the interface side → fall back to name match.
+        nameOnlyFallback = true;
+        arityHit = true;
+        break;
+      }
+      if (concreteArities.has(ifaceArity) || concreteArities.has(-1)) {
+        arityHit = true;
+        usedArity = true;
+        break;
+      }
+    }
+    if (!arityHit) return NO_MATCH;
+  }
+  return { matched: true, usedArity, nameOnlyFallback };
+}
+
+/**
+ * Build the inverted index methodName → interface IDs requiring it, so a
+ * concrete type only has to consider interfaces that share at least one of
+ * its method names (avoids the O(types × interfaces) cross product).
+ */
+function buildMethodNameToInterfaces(
+  usableInterfaces: readonly TypeMethodIndex[],
+): Map<string, Set<string>> {
+  const methodNameToInterfaces = new Map<string, Set<string>>();
+  for (const iface of usableInterfaces) {
+    for (const name of iface.byName.keys()) {
+      let s = methodNameToInterfaces.get(name);
+      if (!s) {
+        s = new Set();
+        methodNameToInterfaces.set(name, s);
+      }
+      s.add(iface.typeId);
+    }
+  }
+  return methodNameToInterfaces;
+}
+
+/**
+ * Build the interface-dispatch index consumed by call resolution:
+ * `interface name → set of file paths` that contain a structural implementor's
+ * methods.
+ *
+ * This mirrors {@link processStructuralImplements}'s matching exactly, but
+ * instead of emitting IMPLEMENTS edges it records implementor *files* keyed by
+ * interface **name** — the shape `HeritageMap.getImplementorFiles` (and hence
+ * `findInterfaceDispatchTargets`) expects. It must run BEFORE the CALLS phase
+ * so Go interface-typed receiver calls (which have no `implements` heritage and
+ * therefore no implementor index otherwise) can fan out to concrete methods.
+ *
+ * Go nuance: a struct's methods may live in different files than the struct
+ * declaration, so we record the union of every implementor method's file (plus
+ * the type's own file) rather than just the declaration site.
+ */
+export function buildStructuralImplementorFiles(
+  graph: KnowledgeGraph,
+): Map<string, Set<string>> {
+  const concreteIdx = buildTypeMethodIndex(graph, CONCRETE_LABELS).types;
+  const interfaceIdx = buildTypeMethodIndex(graph, INTERFACE_LABELS).types;
+  expandInterfaceMethodSets(graph, interfaceIdx);
+
+  const { usable: usableInterfaces } = collectUsableInterfaces(interfaceIdx);
+  if (usableInterfaces.length === 0) return new Map();
+
+  const methodNameToInterfaces = buildMethodNameToInterfaces(usableInterfaces);
+
+  const result = new Map<string, Set<string>>();
+  for (const concrete of concreteIdx.values()) {
+    if (concrete.byName.size === 0) continue;
+
+    const candidateIfaceIds = new Set<string>();
+    for (const name of concrete.byName.keys()) {
+      const ifaces = methodNameToInterfaces.get(name);
+      if (!ifaces) continue;
+      for (const id of ifaces) candidateIfaceIds.add(id);
+    }
+    if (candidateIfaceIds.size === 0) continue;
+
+    // Compute the implementor's method files lazily — only when it actually
+    // matches at least one interface.
+    let methodFiles: Set<string> | null = null;
+    for (const ifaceId of candidateIfaceIds) {
+      const iface = interfaceIdx.get(ifaceId);
+      if (!iface || !iface.name) continue;
+      if (!evaluateInterfaceMatch(iface, concrete).matched) continue;
+
+      if (!methodFiles) {
+        methodFiles = new Set<string>();
+        for (const m of concrete.methods) if (m.filePath) methodFiles.add(m.filePath);
+        if (concrete.filePath) methodFiles.add(concrete.filePath);
+        if (methodFiles.size === 0) continue;
+      }
+      let files = result.get(iface.name);
+      if (!files) {
+        files = new Set();
+        result.set(iface.name, files);
+      }
+      for (const f of methodFiles) files.add(f);
+    }
+  }
+  return result;
+}
+
 /**
  * Run structural-implements detection across the full graph.
  *
@@ -238,31 +436,12 @@ export function processStructuralImplements(
   // `{Read, Close}` rather than `{}`.
   expandInterfaceMethodSets(graph, interfaceIdx);
 
-  let skippedEmptyInterfaces = 0;
-  let skippedSmallInterfaces = 0;
-  let skippedDisabledLanguage = 0;
-  const usableInterfaces: TypeMethodIndex[] = [];
-  for (const ti of interfaceIdx.values()) {
-    if (ti.byName.size === 0) {
-      skippedEmptyInterfaces++;
-      continue;
-    }
-    // Per-language gate: Java/Kotlin/C#/PHP have explicit `implements`, so
-    // the heritage processor already captures every real implementation.
-    // Structural-only matches in those languages collide with shared CRUD
-    // method names (`create`, `update`, `delete`, `list`) — controllers
-    // end up "implementing" every small service interface in the codebase.
-    const policy = policyFor(ti.language);
-    if (!policy.enabled) {
-      skippedDisabledLanguage++;
-      continue;
-    }
-    if (ti.byName.size < policy.minMethods) {
-      skippedSmallInterfaces++;
-      continue;
-    }
-    usableInterfaces.push(ti);
-  }
+  const {
+    usable: usableInterfaces,
+    skippedEmptyInterfaces,
+    skippedSmallInterfaces,
+    skippedDisabledLanguage,
+  } = collectUsableInterfaces(interfaceIdx);
 
   // Track existing IMPLEMENTS / METHOD_IMPLEMENTS edges so we don't duplicate
   // anything heritage-processor or a previous pass already emitted.
@@ -275,17 +454,7 @@ export function processStructuralImplements(
 
   // Inverted index: methodName → interface IDs requiring it. Lets us skip
   // the full O(I × J) cross product per concrete type.
-  const methodNameToInterfaces = new Map<string, Set<string>>();
-  for (const iface of usableInterfaces) {
-    for (const name of iface.byName.keys()) {
-      let s = methodNameToInterfaces.get(name);
-      if (!s) {
-        s = new Set();
-        methodNameToInterfaces.set(name, s);
-      }
-      s.add(iface.typeId);
-    }
-  }
+  const methodNameToInterfaces = buildMethodNameToInterfaces(usableInterfaces);
 
   let implementsEdges = 0;
   let methodImplementsEdges = 0;
@@ -306,45 +475,8 @@ export function processStructuralImplements(
     for (const ifaceId of candidateIfaceIds) {
       const iface = interfaceIdx.get(ifaceId);
       if (!iface) continue;
-      if (concrete.typeId === iface.typeId) continue;
 
-      // Cross-language matches are off — Go structs don't structurally
-      // implement TypeScript interfaces. When either side has no language
-      // tag (older nodes) we allow the match.
-      if (concrete.language && iface.language && concrete.language !== iface.language) {
-        continue;
-      }
-
-      // Every interface method must have a same-name method on the concrete
-      // type with a compatible arity.
-      let matched = true;
-      let usedArity = false;
-      let nameOnlyFallback = false;
-      for (const [name, ifaceArities] of iface.byName) {
-        const concreteArities = concrete.byName.get(name);
-        if (!concreteArities) {
-          matched = false;
-          break;
-        }
-        let arityHit = false;
-        for (const ifaceArity of ifaceArities) {
-          if (ifaceArity === -1) {
-            // Unknown arity on the interface side → fall back to name match.
-            nameOnlyFallback = true;
-            arityHit = true;
-            break;
-          }
-          if (concreteArities.has(ifaceArity) || concreteArities.has(-1)) {
-            arityHit = true;
-            usedArity = true;
-            break;
-          }
-        }
-        if (!arityHit) {
-          matched = false;
-          break;
-        }
-      }
+      const { matched, usedArity, nameOnlyFallback } = evaluateInterfaceMatch(iface, concrete);
       if (!matched) continue;
 
       const confidence =

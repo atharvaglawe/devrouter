@@ -61,12 +61,34 @@ const EMPTY_SET: ReadonlySet<string> = new Set();
 export const buildHeritageMap = (
   heritage: readonly ExtractedHeritage[],
   ctx: ResolutionContext,
+  /**
+   * Optional structural implementor index (interface name → implementor file
+   * paths) computed by `buildStructuralImplementorFiles`. Merged into the
+   * heritage-derived implementor index so interface-dispatch resolution works
+   * for languages without an `implements` keyword (notably Go), where the
+   * heritage stream yields no implementor entries.
+   */
+  seededImplementorFiles?: ReadonlyMap<string, ReadonlySet<string>>,
 ): HeritageMap => {
   // childNodeId → Set<parentNodeId>  (Set to deduplicate cross-chunk duplicates)
   const directParents = new Map<string, Set<string>>();
 
   // interfaceName → Set<filePath>  (implementor lookup for interface dispatch)
   const implementorFiles = new Map<string, Set<string>>();
+
+  // Seed structural (duck-typed) implementors first; heritage-derived entries
+  // below are merged on top into the same sets.
+  if (seededImplementorFiles) {
+    for (const [interfaceName, files] of seededImplementorFiles) {
+      if (files.size === 0) continue;
+      let set = implementorFiles.get(interfaceName);
+      if (!set) {
+        set = new Set();
+        implementorFiles.set(interfaceName, set);
+      }
+      for (const f of files) set.add(f);
+    }
+  }
 
   for (const h of heritage) {
     // ── Parent lookup (nodeId-based) ────────────────────────────────

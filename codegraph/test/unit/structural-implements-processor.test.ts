@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { processStructuralImplements } from '../../src/core/ingestion/structural-implements-processor.js';
+import {
+  processStructuralImplements,
+  buildStructuralImplementorFiles,
+} from '../../src/core/ingestion/structural-implements-processor.js';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
 import type { KnowledgeGraph } from '../../src/core/graph/types.js';
 import { generateId } from '../../src/lib/utils.js';
@@ -381,5 +384,133 @@ describe('processStructuralImplements', () => {
     expect(targets).toEqual(
       [generateId('Interface', 'Reader'), generateId('Interface', 'Closer')].sort(),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildStructuralImplementorFiles — the interface-dispatch index consumed by
+// call resolution (interface name → implementor file paths). Mirrors the
+// structural matching but keyed for HeritageMap.getImplementorFiles.
+// ---------------------------------------------------------------------------
+
+/** Add a method node owned by `ownerName` but declared in an arbitrary file. */
+function addMethodInFile(
+  graph: KnowledgeGraph,
+  ownerName: string,
+  ownerLabel: AnyTypeLabel,
+  methodName: string,
+  arity: number | undefined,
+  language: string,
+  filePath: string,
+): string {
+  const ownerId = generateId(ownerLabel, ownerName);
+  const methodId = generateId('Method', `${ownerName}.${methodName}#${arity ?? 'V'}@${filePath}`);
+  graph.addNode({
+    id: methodId,
+    label: 'Method',
+    properties: {
+      name: methodName,
+      filePath,
+      language,
+      ...(arity !== undefined ? { parameterCount: arity } : {}),
+    },
+  });
+  graph.addRelationship({
+    id: generateId('HAS_METHOD', `${ownerId}->${methodId}`),
+    sourceId: ownerId,
+    targetId: methodId,
+    type: 'HAS_METHOD',
+    confidence: 1.0,
+    reason: '',
+  });
+  return methodId;
+}
+
+describe('buildStructuralImplementorFiles', () => {
+  it('maps a Go interface name to its structural implementor files', () => {
+    const graph = createKnowledgeGraph();
+    // addType/addMethod default both the struct node and its method to
+    // src/<Name>.go, so the implementor file is src/CleanupJob.go.
+    addType(graph, 'Task', 'Interface', 'go');
+    addType(graph, 'CleanupJob', 'Struct', 'go');
+
+    addMethod(graph, 'Task', 'Interface', 'Execute', 0, 'go');
+    addMethod(graph, 'CleanupJob', 'Struct', 'Execute', 0, 'go');
+
+    const index = buildStructuralImplementorFiles(graph);
+
+    const files = index.get('Task');
+    expect(files, 'Task should have implementor files').toBeDefined();
+    expect([...files!]).toContain('src/CleanupJob.go');
+  });
+
+  it('includes every file holding an implementor method (Go split-file packages)', () => {
+    const graph = createKnowledgeGraph();
+    addType(graph, 'Server', 'Interface', 'go', 'src/iface.go');
+    // Struct declared in src/HTTPServer.go (addType default), its two methods
+    // spread across two more files.
+    addType(graph, 'HTTPServer', 'Struct', 'go');
+    addMethod(graph, 'Server', 'Interface', 'Start', 0, 'go');
+    addMethod(graph, 'Server', 'Interface', 'Stop', 0, 'go');
+    addMethodInFile(graph, 'HTTPServer', 'Struct', 'Start', 0, 'go', 'src/server_start.go');
+    addMethodInFile(graph, 'HTTPServer', 'Struct', 'Stop', 0, 'go', 'src/server_stop.go');
+
+    const index = buildStructuralImplementorFiles(graph);
+    const files = index.get('Server');
+    expect(files).toBeDefined();
+    // Both method files plus the struct declaration file must be present, so a
+    // subsequent lookupExactAll(file, 'Start'/'Stop') can find the method
+    // regardless of which file it lives in.
+    expect([...files!].sort()).toEqual(
+      ['src/HTTPServer.go', 'src/server_start.go', 'src/server_stop.go'].sort(),
+    );
+  });
+
+  it('does not index an interface when no concrete type satisfies it', () => {
+    const graph = createKnowledgeGraph();
+    addType(graph, 'ReadWriter', 'Interface', 'go');
+    addType(graph, 'OnlyReader', 'Struct', 'go');
+    addMethod(graph, 'ReadWriter', 'Interface', 'Read', 1, 'go');
+    addMethod(graph, 'ReadWriter', 'Interface', 'Write', 1, 'go');
+    addMethod(graph, 'OnlyReader', 'Struct', 'Read', 1, 'go');
+
+    const index = buildStructuralImplementorFiles(graph);
+    expect(index.has('ReadWriter')).toBe(false);
+  });
+
+  it('skips zero-method interfaces (would match every type)', () => {
+    const graph = createKnowledgeGraph();
+    addType(graph, 'Any', 'Interface', 'go');
+    addType(graph, 'Foo', 'Struct', 'go');
+    addMethod(graph, 'Foo', 'Struct', 'Bar', 0, 'go');
+
+    const index = buildStructuralImplementorFiles(graph);
+    expect(index.has('Any')).toBe(false);
+  });
+
+  it('does not match across languages', () => {
+    const graph = createKnowledgeGraph();
+    addType(graph, 'Reader', 'Interface', 'go', 'src/reader.go');
+    addType(graph, 'TsReader', 'Class', 'typescript', 'src/reader.ts');
+    addMethod(graph, 'Reader', 'Interface', 'Read', 1, 'go');
+    addMethod(graph, 'TsReader', 'Class', 'Read', 1, 'typescript');
+
+    const index = buildStructuralImplementorFiles(graph);
+    expect(index.has('Reader')).toBe(false);
+  });
+
+  it('records all implementors of an interface under one name', () => {
+    const graph = createKnowledgeGraph();
+    addType(graph, 'Stringer', 'Interface', 'go', 'src/iface.go');
+    addType(graph, 'A', 'Struct', 'go');
+    addType(graph, 'B', 'Struct', 'go');
+    addMethod(graph, 'Stringer', 'Interface', 'String', 0, 'go');
+    addMethod(graph, 'A', 'Struct', 'String', 0, 'go');
+    addMethod(graph, 'B', 'Struct', 'String', 0, 'go');
+
+    const index = buildStructuralImplementorFiles(graph);
+    const files = index.get('Stringer');
+    expect(files).toBeDefined();
+    expect([...files!].sort()).toEqual(['src/A.go', 'src/B.go'].sort());
   });
 });
