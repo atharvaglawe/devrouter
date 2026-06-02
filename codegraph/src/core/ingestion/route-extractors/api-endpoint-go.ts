@@ -674,6 +674,293 @@ function tryClientVerbMethod(
   ];
 }
 
+/** Client-side URL-builder form:
+ *    urlBuilder.SetPath("/jsonAds")
+ *    b.WithPath("/log")
+ *
+ *  Why this lives here: internal Go services in monorepos commonly
+ *  construct outbound URLs through a fluent builder (`urlutil.NewUrlBuilder`,
+ *  `pageview.UrlBuilder`, etc.) instead of passing a string literal
+ *  to an HTTP-client verb. The string literal sits on the
+ *  `SetPath`/`WithPath` call; later `.String()` / `.Build()` consumes
+ *  it and hands the result to whichever transport runs the request.
+ *
+ *  Because that downstream HTTP call is dataflow-invisible to the
+ *  static extractor, we accept the literal on the builder call as
+ *  the most reliable evidence of an outbound URL and emit a
+ *  {@link ClientCall} with `method=null` (the builder doesn't carry
+ *  the method — that's set elsewhere). The downstream URL-pattern
+ *  matcher in pipeline.ts joins this to {@link Route} nodes the
+ *  same way it does for `http.Get("/x")`.
+ *
+ *  False positives are extremely rare: `.SetPath("/literal")` with
+ *  an absolute path is overwhelmingly a URL builder; non-HTTP
+ *  builders (filesystem paths, CLI args) don't share the naming. */
+/** Resolve a Go type node to its base type name, stripping pointer,
+ *  package qualifier, and generic wrappers. Returns null for shapes
+ *  we don't resolve (slices, maps, func types, etc.). */
+function goBaseTypeName(typeNode: SyntaxNode | null | undefined): string | null {
+  let n: SyntaxNode | null | undefined = typeNode;
+  let guard = 0;
+  while (n && guard++ < 8) {
+    switch (n.type) {
+      case 'pointer_type':
+        n = n.namedChildren?.[0] ?? null;
+        continue;
+      case 'parenthesized_type':
+        n = n.namedChildren?.[0] ?? null;
+        continue;
+      case 'qualified_type':
+        return n.childForFieldName?.('name')?.text ?? null;
+      case 'type_identifier':
+        return n.text ?? null;
+      case 'generic_type': {
+        const inner = n.namedChildren?.find(
+          (c) => c.type === 'type_identifier' || c.type === 'qualified_type',
+        );
+        n = inner ?? null;
+        continue;
+      }
+      default:
+        return null;
+    }
+  }
+  return null;
+}
+
+/** Build a same-file `structType → (field → baseTypeName)` map from a
+ *  Go file root. Used by the URL-builder recogniser to resolve a
+ *  receiver-field chain (`c.adClickRouteService`) to its declared
+ *  type (`AdClickRoute`) so the pending getter lookup is scoped to a
+ *  type — preventing a generic method name (`GetPath`) from matching
+ *  every same-named getter across the repo at resolve time. */
+function collectStructFieldTypes(rootNode: SyntaxNode): Map<string, Map<string, string>> {
+  const out = new Map<string, Map<string, string>>();
+  const stack: SyntaxNode[] = [rootNode];
+  while (stack.length > 0) {
+    const n = stack.pop()!;
+    if (n.type === 'type_spec') {
+      const owner = n.childForFieldName?.('name')?.text;
+      const typeNode = n.childForFieldName?.('type');
+      if (owner && typeNode?.type === 'struct_type') {
+        const fieldList = typeNode.namedChildren?.find(
+          (c) => c.type === 'field_declaration_list',
+        );
+        if (fieldList) {
+          let fm = out.get(owner);
+          if (!fm) {
+            fm = new Map<string, string>();
+            out.set(owner, fm);
+          }
+          for (const fd of fieldList.namedChildren ?? []) {
+            if (fd.type !== 'field_declaration') continue;
+            const base = goBaseTypeName(fd.childForFieldName?.('type'));
+            if (!base) continue;
+            const names: SyntaxNode[] = [];
+            const explicit = fd.childForFieldName?.('name');
+            if (explicit) names.push(explicit);
+            else for (const c of fd.namedChildren ?? []) if (c.type === 'field_identifier') names.push(c);
+            for (const nm of names) if (nm.text) fm.set(nm.text, base);
+          }
+        }
+      }
+    }
+    for (const c of n.namedChildren ?? []) stack.push(c);
+  }
+  return out;
+}
+
+/** Receiver variable name + type for the nearest enclosing method.
+ *  `(c *ClickUrl)` → `{varName:"c", typeName:"ClickUrl"}`. Null for
+ *  free functions or when the receiver shape is unrecognised. */
+function findEnclosingReceiverVarType(
+  node: SyntaxNode,
+): { varName: string; typeName: string } | null {
+  let cur: SyntaxNode | null = node.parent;
+  while (cur) {
+    if (cur.type === 'method_declaration') {
+      const recvList = cur.childForFieldName?.('receiver');
+      if (recvList) {
+        for (const child of recvList.children ?? []) {
+          if (child.type !== 'parameter_declaration') continue;
+          const nameN = child.childForFieldName?.('name');
+          const typeName = goBaseTypeName(child.childForFieldName?.('type'));
+          if (nameN?.text && typeName) return { varName: nameN.text, typeName };
+          return null;
+        }
+      }
+      return null;
+    }
+    if (cur.type === 'function_declaration') return null;
+    cur = cur.parent;
+  }
+  return null;
+}
+
+/** Flatten a selector / call / identifier into a left-to-right chain
+ *  of identifier texts (`c.adClickRouteService.GetPath()` →
+ *  `["c","adClickRouteService","GetPath"]`). Calls drop their args;
+ *  any non-trivial shape returns null. */
+function flattenGoChain(node: SyntaxNode | null | undefined): string[] | null {
+  if (!node) return null;
+  if (node.type === 'identifier' || node.type === 'field_identifier' || node.type === 'type_identifier') {
+    return node.text ? [node.text] : null;
+  }
+  if (node.type === 'selector_expression') {
+    const left = flattenGoChain(node.childForFieldName?.('operand'));
+    const field = node.childForFieldName?.('field');
+    if (!left || !field?.text) return null;
+    return [...left, field.text];
+  }
+  if (node.type === 'call_expression') {
+    return flattenGoChain(node.childForFieldName?.('function'));
+  }
+  if (node.type === 'parenthesized_expression') {
+    return flattenGoChain(node.namedChildren?.[0]);
+  }
+  return null;
+}
+
+/** Find the RHS expression of a `name := <rhs>` / `name = <rhs>`
+ *  assignment within `scope`, not descending into nested functions.
+ *  Only the trivial single-LHS / single-RHS case. */
+function findLocalAssignmentRHS(
+  scope: SyntaxNode | null | undefined,
+  name: string,
+): SyntaxNode | null {
+  if (!scope) return null;
+  const stack: SyntaxNode[] = [scope];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (
+      cur !== scope &&
+      (cur.type === 'func_literal' ||
+        cur.type === 'function_declaration' ||
+        cur.type === 'method_declaration')
+    ) {
+      continue;
+    }
+    if (cur.type === 'short_var_declaration' || cur.type === 'assignment_statement') {
+      const left = cur.childForFieldName?.('left');
+      const right = cur.childForFieldName?.('right');
+      if (left && right) {
+        const lhs = (left.namedChildren ?? []).filter((c) => c.type === 'identifier');
+        const rhs = (right.namedChildren ?? []).filter((c) => c.isNamed === true);
+        if (lhs.length === 1 && rhs.length === 1 && lhs[0].text === name) {
+          return rhs[0];
+        }
+      }
+    }
+    for (const c of cur.namedChildren ?? []) stack.push(c);
+  }
+  return null;
+}
+
+function tryClientUrlBuilder(
+  callNode: SyntaxNode,
+  filePath: string,
+  structFieldTypes: Map<string, Map<string, string>>,
+): ClientCall[] {
+  const fn = callNode.childForFieldName?.('function');
+  if (!fn || fn.type !== 'selector_expression') return [];
+  const { field } = splitSelector(fn);
+  if (!field) return [];
+  if (field !== 'SetPath' && field !== 'WithPath' && field !== 'SetHost') return [];
+  const args = [...callArguments(callNode)];
+  if (args.length === 0) return [];
+  const arg = args[0];
+  const url = readGoString(arg);
+  const enclosing = findEnclosingFuncInfo(callNode);
+
+  if (url !== null) {
+    // Literal argument. Only the path setters carry a route literal,
+    // and only when absolute. Non-absolute paths (e.g. `"v1/foo"`)
+    // are usually relative-resolve idioms inside non-HTTP builders;
+    // a literal host on `SetHost` is not a route either.
+    if (field === 'SetHost') return [];
+    if (!url.startsWith('/')) return [];
+    return [
+      {
+        // The builder doesn't know the HTTP verb — the verb is set
+        // wherever the built URL is consumed. Downstream pipeline
+        // matches by URL alone; method=null is a valid match input.
+        method: null,
+        pathLiteral: url,
+        providerTag: null,
+        callerSymbol: enclosing.symbol,
+        callerReceiver: enclosing.receiver,
+        filePath,
+        framework: 'go.urlbuilder',
+        lineNumber: callNode.startPosition.row,
+        // Confidence band reflects this is one step removed from
+        // a real HTTP call (the builder is plausibly consumed by an
+        // HTTP client, but we don't statically prove it).
+        confidence: 0.7,
+      },
+    ];
+  }
+
+  // Non-literal argument (e.g. `urlBuilder.SetPath(svc.GetPath())` or
+  // `path := svc.GetPath(); urlBuilder.SetPath(path)`). Record the
+  // getter chain as a pending lookup so Phase 3.4c can chase it back
+  // to an in-code string constant (e.g. `const DefaultPath = "/trf"`)
+  // and stamp `fetchURL`. The downstream matcher self-filters: a
+  // recovered literal only yields a FETCHES edge when it matches a
+  // registered route, so coincidental constants never create edges.
+  const body = findEnclosingFuncBody(callNode);
+
+  // Recover the value expression: when the setter arg is a bare local,
+  // substitute it for its assignment RHS.
+  let valueExpr: SyntaxNode | null = arg;
+  if (arg.type === 'identifier' && body) {
+    const rhs = findLocalAssignmentRHS(body, arg.text);
+    if (rhs) valueExpr = rhs;
+  }
+  const chain = flattenGoChain(valueExpr);
+  if (!chain || chain.length === 0) return [];
+  const method = chain[chain.length - 1];
+
+  // Scope the lookup to the receiver TYPE when the chain is rooted at
+  // the enclosing method's receiver and every hop is a known struct
+  // field — e.g. `c.adClickRouteService.GetPath` with receiver
+  // `c *ClickUrl` and field `adClickRouteService *AdClickRoute`
+  // resolves the lookup to `{receiver:"AdClickRoute", name:"GetPath"}`.
+  // Without a resolvable type the lookup stays receiver-less; the
+  // in-code-constant resolver only emits receiver-scoped keys, so an
+  // unresolved chain simply produces no edge (no false positives from
+  // generic method names).
+  let receiverType: string | null = null;
+  if (chain.length >= 2) {
+    const recv = findEnclosingReceiverVarType(callNode);
+    if (recv && chain[0] === recv.varName) {
+      let cur: string | null = recv.typeName;
+      for (let i = 1; i < chain.length - 1 && cur; i++) {
+        cur = structFieldTypes.get(cur)?.get(chain[i]) ?? null;
+      }
+      receiverType = cur;
+    }
+  }
+
+  const localAssignments = body ? collectLocalAssignments(body) : {};
+  return [
+    {
+      method: null,
+      pathLiteral: null,
+      providerTag: null,
+      callerSymbol: enclosing.symbol,
+      callerReceiver: enclosing.receiver,
+      filePath,
+      framework: 'go.urlbuilder',
+      lineNumber: callNode.startPosition.row,
+      // Two+ hops removed from a real HTTP call (builder arg resolved
+      // through a getter + constant chain) — band the confidence low.
+      confidence: 0.6,
+      pendingGetterLookups: [{ receiver: receiverType, name: method }],
+      ...(Object.keys(localAssignments).length > 0 ? { localAssignments } : {}),
+    },
+  ];
+}
+
 /** Client-side request-builder form:
  *    http.NewRequest(method, url, body) | http.NewRequestWithContext(ctx, method, url, body)
  *  We capture method+URL at the builder site directly. The
@@ -788,17 +1075,42 @@ function collectGetterLookups(node: SyntaxNode | null | undefined): PendingGette
           const field = fn.childForFieldName?.('field');
           if (field?.text) {
             const recv = operand?.type === 'identifier' ? operand.text : null;
-            const key = `${recv ?? '*'}::${field.text}`;
+            const key = `${recv ?? '*'}::${field.text}::`;
             if (!seen.has(key)) {
               seen.add(key);
               out.push({ receiver: recv, name: field.text });
             }
           }
         } else if (fn.type === 'identifier') {
-          const key = `*::${fn.text}`;
+          const key = `*::${fn.text}::`;
           if (!seen.has(key)) {
             seen.add(key);
             out.push({ receiver: null, name: fn.text });
+          }
+        }
+      }
+    } else if (cur.type === 'selector_expression') {
+      // Bare field access on a local: `originConfig.Renderer`.
+      // Only capture when it's NOT the function-position of an
+      // enclosing call (the call branch above handles those).
+      const parent = cur.parent;
+      const isCallFn =
+        parent?.type === 'call_expression' &&
+        parent.childForFieldName?.('function') === cur;
+      if (!isCallFn) {
+        const operand = cur.childForFieldName?.('operand');
+        const field = cur.childForFieldName?.('field');
+        if (operand?.type === 'identifier' && field?.text) {
+          const recv = operand.text;
+          const key = `${recv}::${field.text}::${field.text}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            // `tail` set signals the URL resolver to substitute the
+            // receiver via the call site's localAssignments and then
+            // apply `tail` as the field accessor on the substituted
+            // chain. The legacy tag resolver also still tries
+            // `(receiver, name)` / `(null, name)` for backward compat.
+            out.push({ receiver: recv, name: field.text, tail: field.text });
           }
         }
       }
@@ -806,6 +1118,111 @@ function collectGetterLookups(node: SyntaxNode | null | undefined): PendingGette
     for (const c of cur.namedChildren ?? []) stack.push(c);
   }
   return out;
+}
+
+/** Walk a function body and record short-distance local assignments
+ *  of the form `local := pkg.Func(...)` (call shape) or
+ *  `local := x.Y.Z` (bare selector chain). Used by the URL resolver
+ *  to substitute bare selector receivers back to a getter call so
+ *  the YAML key path can be reconstructed across the indirection.
+ *
+ *  Scoping: stops descending into nested function literals; the
+ *  outer body's locals don't leak in and inner-only locals don't
+ *  leak out. Re-assignments overwrite earlier ones (last wins). */
+function collectLocalAssignments(
+  scope: SyntaxNode | null | undefined,
+): Record<string, { call?: { receiver: string | null; name: string }; alias?: string[] }> {
+  const out: Record<
+    string,
+    { call?: { receiver: string | null; name: string }; alias?: string[] }
+  > = {};
+  if (!scope) return out;
+  const stack: SyntaxNode[] = [scope];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    // Don't descend into nested function literals — they have their
+    // own scope. The outer extractor will visit them separately if
+    // they emit ClientCalls of their own.
+    if (cur !== scope && (cur.type === 'func_literal' || cur.type === 'function_declaration' || cur.type === 'method_declaration')) {
+      continue;
+    }
+    if (cur.type === 'short_var_declaration' || cur.type === 'assignment_statement') {
+      const left = cur.childForFieldName?.('left');
+      const right = cur.childForFieldName?.('right');
+      if (left && right) {
+        const lhsList = (left.namedChildren ?? []).filter((c) => c.type === 'identifier');
+        const rhsList = (right.namedChildren ?? []).filter((c) => c.isNamed === true);
+        // Only handle the trivial 1:1 case. Multi-return and tuple
+        // destructuring are out of scope (typically not config-driven).
+        if (lhsList.length === 1 && rhsList.length === 1) {
+          const localName = lhsList[0].text;
+          const rhs = rhsList[0];
+          if (!localName) {
+            // nothing
+          } else if (rhs.type === 'call_expression') {
+            const fn = rhs.childForFieldName?.('function');
+            if (fn?.type === 'selector_expression') {
+              const operand = fn.childForFieldName?.('operand');
+              const field = fn.childForFieldName?.('field');
+              if (field?.text) {
+                out[localName] = {
+                  call: {
+                    receiver: operand?.type === 'identifier' ? operand.text : null,
+                    name: field.text,
+                  },
+                };
+              }
+            } else if (fn?.type === 'identifier') {
+              out[localName] = { call: { receiver: null, name: fn.text } };
+            }
+          } else if (rhs.type === 'selector_expression') {
+            const alias = flattenSelectorChain(rhs);
+            if (alias && alias.length >= 2) {
+              out[localName] = { alias };
+            }
+          }
+        }
+      }
+    }
+    for (const c of cur.namedChildren ?? []) stack.push(c);
+  }
+  return out;
+}
+
+/** Flatten a selector_expression / identifier into a left-to-right
+ *  chain of identifier texts. Returns null when any intermediate
+ *  node isn't a plain identifier or another selector. */
+function flattenSelectorChain(node: SyntaxNode | null | undefined): string[] | null {
+  if (!node) return null;
+  if (node.type === 'identifier' || node.type === 'field_identifier') {
+    return node.text ? [node.text] : null;
+  }
+  if (node.type === 'selector_expression') {
+    const operand = node.childForFieldName?.('operand') ?? null;
+    const field = node.childForFieldName?.('field') ?? null;
+    const left = flattenSelectorChain(operand);
+    if (!left || !field?.text) return null;
+    return [...left, field.text];
+  }
+  return null;
+}
+
+/** Find the nearest enclosing function or method body (the `block`
+ *  node that holds locals visible to `node`). Returns null when
+ *  `node` is at top level. */
+function findEnclosingFuncBody(node: SyntaxNode | null): SyntaxNode | null {
+  let cur: SyntaxNode | null = node;
+  while (cur) {
+    if (
+      cur.type === 'function_declaration' ||
+      cur.type === 'method_declaration' ||
+      cur.type === 'func_literal'
+    ) {
+      return cur.childForFieldName?.('body') ?? null;
+    }
+    cur = cur.parent;
+  }
+  return null;
 }
 
 /** Client-side options-bag form:
@@ -918,6 +1335,38 @@ function tryClientOptionsBag(
   if (url === null && provider === null && pendingLookups.length === 0) return [];
 
   const enclosing = findEnclosingFuncInfo(litNode);
+
+  // When a pending lookup carries a `tail` (bare selector shape like
+  // `originConfig.Renderer`), the URL resolver needs to substitute
+  // the bare receiver back to a getter call. Walk the enclosing
+  // function body once to build the local→call map and attach it.
+  let localAssignments: Record<
+    string,
+    { call?: { receiver: string | null; name: string }; alias?: string[] }
+  > | undefined;
+  const hasBareSelector = pendingLookups.some((l) => l.tail !== undefined);
+  if (hasBareSelector) {
+    const body = findEnclosingFuncBody(litNode);
+    if (body) {
+      const all = collectLocalAssignments(body);
+      // Trim to only the names actually referenced by pending lookups
+      // so we don't bloat the ClientCall with unused entries.
+      const needed = new Set(pendingLookups.filter((l) => l.tail).map((l) => l.receiver ?? ''));
+      const filtered: Record<
+        string,
+        { call?: { receiver: string | null; name: string }; alias?: string[] }
+      > = {};
+      let kept = 0;
+      for (const name of needed) {
+        if (name && all[name]) {
+          filtered[name] = all[name];
+          kept++;
+        }
+      }
+      if (kept > 0) localAssignments = filtered;
+    }
+  }
+
   return [
     {
       method,
@@ -934,6 +1383,7 @@ function tryClientOptionsBag(
       // or drops them entirely.
       confidence: url ? (method ? 0.95 : 0.85) : provider ? 0.7 : 0.5,
       pendingGetterLookups: pendingLookups.length > 0 ? pendingLookups : undefined,
+      localAssignments,
     },
   ];
 }
@@ -1014,6 +1464,11 @@ export function extractGoApiEndpoints(
   // Cheap — same iterative walk shape as the main pass.
   const groupPrefixes = collectGroupPrefixes(rootNode);
 
+  // Same-file struct field types — lets the URL-builder recogniser
+  // resolve a receiver-field chain to a declared type so its pending
+  // getter lookup is type-scoped (see tryClientUrlBuilder).
+  const structFieldTypes = collectStructFieldTypes(rootNode);
+
   // Main pass.
   const stack: SyntaxNode[] = [rootNode];
   while (stack.length > 0) {
@@ -1041,6 +1496,7 @@ export function extractGoApiEndpoints(
       clientCalls.push(...tryClientStdlibVerb(node, filePath));
       clientCalls.push(...tryClientVerbMethod(node, filePath));
       clientCalls.push(...tryClientRequestBuilder(node, filePath));
+      clientCalls.push(...tryClientUrlBuilder(node, filePath, structFieldTypes));
       clientCalls.push(...tryClientGrpcStub(node, filePath));
       clientCalls.push(...tryClientProviderFactory(node, filePath));
     } else if (node.type === 'composite_literal') {

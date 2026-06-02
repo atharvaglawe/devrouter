@@ -17,6 +17,10 @@ import {
   extractGoConfigTags,
   extractGoTrivialGetters,
   buildResolvedGetters,
+  buildResolvedGetterURLs,
+  buildFieldTagMap,
+  aliasToKeyPath,
+  resolveGetterTailURL,
   getterKey,
 } from '../../src/core/ingestion/route-extractors/config-tag-resolver.js';
 
@@ -332,5 +336,130 @@ func GetY() int { return cfg.Y }
     const getters = extractGoTrivialGetters(tree.rootNode, 'config.go');
     const resolved = buildResolvedGetters(tags, getters);
     expect(resolved.get(getterKey(null, 'GetY'))).toBeUndefined();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// aliasToKeyPath / resolveGetterTailURL / buildResolvedGetterURLs
+// ─────────────────────────────────────────────────────────────────
+
+describe('aliasToKeyPath', () => {
+  it('translates an alias chain to a dotted YAML key path via field tags', () => {
+    const tree = parseGo(`
+package config
+type Configuration struct {
+  Origins OriginConfigurations \`yaml:"origins"\`
+}
+type OriginConfigurations struct {
+  CmServing OriginConfig \`yaml:"cmserving"\`
+}
+type OriginConfig struct {
+  Renderer string \`yaml:"renderer"\`
+}
+`);
+    const tags = extractGoConfigTags(tree.rootNode, 'config.go');
+    const fieldTagMap = buildFieldTagMap(tags);
+    const result = aliasToKeyPath(
+      ['selected', 'Origins', 'CmServing', 'Renderer'],
+      fieldTagMap,
+    );
+    expect(result).toBe('origins.cmserving.renderer');
+  });
+
+  it('returns null when any link is missing a tag', () => {
+    const tree = parseGo(`
+package config
+type X struct { A int \`yaml:"a"\` }
+`);
+    const tags = extractGoConfigTags(tree.rootNode, 'config.go');
+    const fieldTagMap = buildFieldTagMap(tags);
+    expect(aliasToKeyPath(['x', 'B'], fieldTagMap)).toBeNull();
+    expect(aliasToKeyPath(['x'], fieldTagMap)).toBeNull();
+  });
+});
+
+describe('buildResolvedGetterURLs', () => {
+  it('resolves a trivial getter whose return alias points at a tagged URL leaf', () => {
+    const tree = parseGo(`
+package config
+type Configuration struct {
+  Origins OriginConfigurations \`yaml:"origins"\`
+}
+type OriginConfigurations struct {
+  CmServing OriginConfig \`yaml:"cmserving"\`
+}
+type OriginConfig struct {
+  Renderer string \`yaml:"renderer"\`
+}
+var selected Configuration
+func GetCmServingOrigin() OriginConfig {
+  return selected.Origins.CmServing
+}
+`);
+    const tags = extractGoConfigTags(tree.rootNode, 'config.go');
+    const getters = extractGoTrivialGetters(tree.rootNode, 'config.go');
+    const byKeyPath = new Map<string, Set<string>>([
+      ['origins.cmserving.renderer', new Set(['/scrr.php'])],
+    ]);
+    // The getter returns the *struct* (no Renderer field accessor),
+    // so a direct getter→URL resolution alone shouldn't fire. We
+    // verify the tail-extension helper instead.
+    const fieldTagMap = buildFieldTagMap(tags);
+    const out = resolveGetterTailURL(getters[0], 'Renderer', fieldTagMap, byKeyPath);
+    expect([...out]).toContain('/scrr.php');
+
+    // Direct map: a getter returning the URL field itself
+    // (e.g. `func GetRendererPath() string { return selected.Origins.CmServing.Renderer }`)
+    // should land in the resolved-URL map at (null, name).
+    const tree2 = parseGo(`
+package config
+type Configuration struct {
+  Origins OriginConfigurations \`yaml:"origins"\`
+}
+type OriginConfigurations struct {
+  CmServing OriginConfig \`yaml:"cmserving"\`
+}
+type OriginConfig struct {
+  Renderer string \`yaml:"renderer"\`
+}
+var selected Configuration
+func GetRendererPath() string {
+  return selected.Origins.CmServing.Renderer
+}
+`);
+    const tags2 = extractGoConfigTags(tree2.rootNode, 'config.go');
+    const getters2 = extractGoTrivialGetters(tree2.rootNode, 'config.go');
+    const resolved = buildResolvedGetterURLs(tags2, getters2, byKeyPath);
+    const v = resolved.get(getterKey(null, 'GetRendererPath'));
+    expect(v).toBeDefined();
+    expect([...v!]).toContain('/scrr.php');
+  });
+
+  it('returns an empty map when byKeyPath is empty', () => {
+    const tree = parseGo(`
+package config
+type X struct { Y string \`yaml:"y"\` }
+func GetY() string { var x X; return x.Y }
+`);
+    const tags = extractGoConfigTags(tree.rootNode, 'config.go');
+    const getters = extractGoTrivialGetters(tree.rootNode, 'config.go');
+    const resolved = buildResolvedGetterURLs(tags, getters, new Map());
+    expect(resolved.size).toBe(0);
+  });
+
+  it('emits direct field bindings when the field tag matches a top-level YAML key', () => {
+    const tree = parseGo(`
+package config
+type C struct { Renderer string \`yaml:"renderer"\` }
+`);
+    const tags = extractGoConfigTags(tree.rootNode, 'config.go');
+    const byKeyPath = new Map<string, Set<string>>([
+      ['renderer', new Set(['/x.php'])],
+    ]);
+    const resolved = buildResolvedGetterURLs(tags, [], byKeyPath);
+    // (null, "Renderer") fallback should hit `renderer: "/x.php"`.
+    const v = resolved.get(getterKey(null, 'Renderer'));
+    expect(v).toBeDefined();
+    expect([...v!]).toContain('/x.php');
   });
 });

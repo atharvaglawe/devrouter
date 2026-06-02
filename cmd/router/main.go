@@ -57,6 +57,19 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "cross-context":
+			err := runCrossContext(os.Args[2:])
+			switch {
+			case err == nil:
+				return
+			case err == errExitNoHits:
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			default:
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
 		case "-h", "--help":
 			printDevrouterHelp()
 			return
@@ -153,6 +166,7 @@ Usage:
   devrouter                          Start the MCP server on stdio (default)
   devrouter <codegraph-subcommand>   Run a codegraph CLI command
   devrouter codegraph <args...>      Same, with explicit "codegraph" prefix
+  devrouter cross-context "<query>"  Federated search across indexed repos
   devrouter gitnexus <args...>       Legacy alias (deprecated)
   devrouter --help                   Show this message
 
@@ -164,6 +178,11 @@ Codegraph subcommands (forwarded to the in-tree Node CLI):
   status    Show index status for current repo
   clean     Delete the codegraph index for current repo
   help      Show codegraph CLI help
+
+Cross-repo subcommand:
+  cross-context  Run a query against multiple indexed repos in parallel and
+                 merge the results. Backs Option B from docs/architecture.md
+                 (federated linker). Run with --help for full flag list.
 
 Environment:
   DEVROUTER_REDIS                Redis address (default localhost:6379)

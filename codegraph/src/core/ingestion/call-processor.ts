@@ -1557,8 +1557,8 @@ const resolveModuleAliasedCall = (
   if (!call.receiverName) return null;
   const aliasMap = ctx.moduleAliasMap?.get(currentFile);
   if (!aliasMap) return null;
-  const moduleFile = aliasMap.get(call.receiverName);
-  if (!moduleFile) return null;
+  const moduleFiles = aliasMap.get(call.receiverName);
+  if (!moduleFiles || moduleFiles.size === 0) return null;
 
   // Reuse the caller's pre-computed tiered result when available —
   // the dispatcher already called ctx.resolve(call.calledName, currentFile).
@@ -1566,32 +1566,49 @@ const resolveModuleAliasedCall = (
   if (!tiered) return null;
 
   // Try member-form, then constructor-form (for `module.ClassName()` patterns)
+  // moduleFiles is the full set of files belonging to the aliased module —
+  // 1 file for Python (`import X` → X.py), N files for Go (every `.go` file
+  // under the imported package directory). Filtering with `.has` rather than
+  // an equality check is the entire point of widening the alias map: a Go
+  // `<pkg>.New(...)` call lands on whichever file in <pkg>/ actually defines
+  // `New`, instead of failing whenever it's not the package's primary file.
   let filtered = filterCallableCandidates(tiered.candidates, call.argCount, call.callForm).filter(
-    (c) => c.filePath === moduleFile,
+    (c) => moduleFiles.has(c.filePath),
   );
   if (filtered.length === 0) {
     filtered = filterCallableCandidates(tiered.candidates, call.argCount, 'constructor').filter(
-      (c) => c.filePath === moduleFile,
+      (c) => moduleFiles.has(c.filePath),
     );
   }
   if (filtered.length === 0) {
-    // Widen to global callable index scoped to the aliased module file.
-    const cacheKey = `${call.calledName}\0${moduleFile}`;
+    // Widen to global callable index scoped to the aliased module's files.
+    // Cache key uses a single representative file path so the widened lookup
+    // is shared across calls that resolve to the same module (the cache is
+    // keyed by callable name × module identity, not by the full file set).
+    const cacheKey = `${call.calledName}\0${firstFromSet(moduleFiles)}`;
     let defs = widenCache?.get(cacheKey);
     if (!defs) {
       defs = ctx.symbols.lookupCallableByName(call.calledName);
       widenCache?.set(cacheKey, defs);
     }
     filtered = filterCallableCandidates(defs, call.argCount, call.callForm).filter(
-      (c) => c.filePath === moduleFile,
+      (c) => moduleFiles.has(c.filePath),
     );
     if (filtered.length === 0) {
       filtered = filterCallableCandidates(defs, call.argCount, 'constructor').filter(
-        (c) => c.filePath === moduleFile,
+        (c) => moduleFiles.has(c.filePath),
       );
     }
   }
   return filtered.length === 1 ? toResolveResult(filtered[0], tiered.tier) : null;
+};
+
+/** Stable "any element" probe for a ReadonlySet. Order is iteration order,
+ *  which Set guarantees to be insertion order — fine for cache keys since the
+ *  builders that populate the set are themselves deterministic. */
+const firstFromSet = (s: ReadonlySet<string>): string => {
+  for (const v of s) return v;
+  return '';
 };
 
 /**
@@ -1617,8 +1634,11 @@ const resolveMemberCallByFile = (
 ): ResolveResult | null => {
   const typeResolved = ctx.resolve(receiverTypeName, currentFile);
   if (!typeResolved || typeResolved.candidates.length === 0) return null;
-  const typeNodeIds = new Set(typeResolved.candidates.map((d) => d.nodeId));
-  const typeFiles = new Set(typeResolved.candidates.map((d) => d.filePath));
+  // Go: prefer the caller-package homonym (see preferCallerPackageTypes) so
+  // file/owner narrowing and the dir fallback all bind to the local type.
+  const scopedCandidates = preferCallerPackageTypes(typeResolved.candidates, currentFile);
+  const typeNodeIds = new Set(scopedCandidates.map((d) => d.nodeId));
+  const typeFiles = new Set(scopedCandidates.map((d) => d.filePath));
 
   const methodPool = filterCallableCandidates(
     ctx.symbols.lookupCallableByName(calledName),
@@ -1644,6 +1664,21 @@ const resolveMemberCallByFile = (
       preComputedArgTypes,
     );
     if (disambiguated) return toResolveResult(disambiguated, typeResolved.tier);
+  }
+
+  // Cross-file owner fallback (Go split-package methods): when neither the
+  // type's files nor its node ids matched, try (type name + package directory).
+  // Mirrors the fallback in resolveMethodByOwner so the overload/`skipMember`
+  // path benefits too. Only reached when strict narrowing produced nothing.
+  if (ownerFiltered.length === 0) {
+    const dirDef = resolveMethodByOwnerDir(
+      receiverTypeName,
+      calledName,
+      ctx,
+      scopedCandidates,
+      argCount,
+    );
+    if (dirDef) return toResolveResult(dirDef, typeResolved.tier);
   }
 
   // Zero-match null-route: receiver type resolved but no candidate matched
@@ -1771,12 +1806,13 @@ const resolveCallTarget = (
     // the receiver type a second time here is free.
     const typeResolves = ctx.resolve(call.receiverTypeName, currentFile);
     const aliasMap = ctx.moduleAliasMap?.get(currentFile);
-    const aliasTargetFile =
+    const aliasTargetFiles =
       call.receiverName && aliasMap ? aliasMap.get(call.receiverName) : undefined;
     if (
-      aliasTargetFile &&
+      aliasTargetFiles &&
+      aliasTargetFiles.size > 0 &&
       typeResolves &&
-      typeResolves.candidates.some((c) => c.filePath === aliasTargetFile)
+      typeResolves.candidates.some((c) => aliasTargetFiles.has(c.filePath))
     ) {
       const aliasResult = resolveModuleAliasedCall(call, currentFile, ctx, widenCache, tiered);
       if (aliasResult) return aliasResult;
@@ -1978,6 +2014,74 @@ const resolveFieldOwnership = (
  * Threaded out here so callers don't need a second `ctx.resolve(ownerType, ...)` call —
  * this decouples callers from `ctx.resolve`'s per-file caching contract.
  */
+/** Directory of a forward-slash-normalized path ('' for a bare filename). */
+const dirOfFile = (filePath: string): string => {
+  const normalized = filePath.replace(/\\/g, '/');
+  const idx = normalized.lastIndexOf('/');
+  return idx >= 0 ? normalized.slice(0, idx) : '';
+};
+
+/**
+ * Restrict same-named type candidates to those declared in the caller's own
+ * package directory, for Go member/receiver calls.
+ *
+ * Go's one-package-per-directory rule means a member call `a.method()` (where
+ * `a` is the method receiver, or any same-package value) targets the type
+ * declared in the CALLER's directory. Repos commonly declare many homonym
+ * types (e.g. dozens of `App` structs across binaries); without this scoping,
+ * owner resolution can either lock onto a wrong-package homonym — whichever
+ * one happens to have its method co-located with the type, giving it a valid
+ * `ownerId` — or collapse to "ambiguous" when several homonyms match. Returns
+ * the input unchanged for non-Go files or when the caller's directory holds no
+ * candidate (the genuine cross-package/imported-type case).
+ */
+const preferCallerPackageTypes = (
+  candidates: readonly SymbolDefinition[],
+  currentFile: string,
+): readonly SymbolDefinition[] => {
+  if (getLanguageFromFilename(currentFile) !== SupportedLanguages.Go) return candidates;
+  const callerDir = dirOfFile(currentFile);
+  const local = candidates.filter(
+    (c) => CLASS_LIKE_TYPES.has(c.type) && dirOfFile(c.filePath) === callerDir,
+  );
+  return local.length > 0 ? local : candidates;
+};
+
+/**
+ * Cross-file owner fallback (Go split-package methods): resolve a method whose
+ * declaring file differs from its type's declaring file by matching on the
+ * resolved type's NAME + package DIRECTORY. Only meaningful after strict
+ * ownerId-scoped lookups have missed. `typeCandidates` is expected to already
+ * be scoped to the caller's package via {@link preferCallerPackageTypes}, so
+ * the per-directory lookups collapse to a single answer; the ambiguity guard
+ * still protects the widened (no local candidate) case.
+ */
+const resolveMethodByOwnerDir = (
+  receiverTypeName: string,
+  methodName: string,
+  ctx: ResolutionContext,
+  typeCandidates: readonly SymbolDefinition[],
+  argCount?: number,
+): SymbolDefinition | undefined => {
+  let firstDef: SymbolDefinition | undefined;
+  for (const candidate of typeCandidates) {
+    if (!CLASS_LIKE_TYPES.has(candidate.type)) continue;
+    const def = ctx.symbols.lookupMethodByOwnerInDir(
+      receiverTypeName,
+      dirOfFile(candidate.filePath),
+      methodName,
+      argCount,
+    );
+    if (!def) continue;
+    if (!firstDef) {
+      firstDef = def;
+    } else if (def.nodeId !== firstDef.nodeId) {
+      return undefined; // ambiguous across same-named types in different dirs
+    }
+  }
+  return firstDef;
+};
+
 const resolveMethodByOwner = (
   receiverTypeName: string,
   methodName: string,
@@ -1994,6 +2098,11 @@ const resolveMethodByOwner = (
   const language = heritageMap ? getLanguageFromFilename(filePath) : null;
   const canWalkMRO = heritageMap != null && language != null;
 
+  // Go: scope homonym types to the caller's package so a receiver call binds to
+  // the local-package type, not a same-named type in another binary whose
+  // method merely happens to have a valid (co-located) ownerId.
+  const candidates = preferCallerPackageTypes(typeResolved.candidates, filePath);
+
   // Iterate all class-like candidates tracking the first unambiguous hit.
   // Zero-allocation fast path: the common case is exactly one class candidate,
   // so we avoid building a Map. A second hit with a different `nodeId` flips
@@ -2009,7 +2118,7 @@ const resolveMethodByOwner = (
   // owner-scoped lookup rather than collapsing to an arbitrary first pick.
   let firstDef: SymbolDefinition | undefined;
   let ambiguous = false;
-  for (const candidate of typeResolved.candidates) {
+  for (const candidate of candidates) {
     if (!CLASS_LIKE_TYPES.has(candidate.type)) continue;
     const def = canWalkMRO
       ? lookupMethodByOwnerWithMRO(
@@ -2030,7 +2139,22 @@ const resolveMethodByOwner = (
     }
   }
 
-  if (!firstDef || ambiguous) return undefined;
+  if (ambiguous) return undefined;
+  if (!firstDef) {
+    // Cross-file owner fallback: the type resolved to indexed class-like nodes
+    // but no method was found under their exact node ids. For Go split-package
+    // method sets, the method's ownerId is keyed to its own file (not the
+    // type's), so retry by (type name + package directory).
+    const dirDef = resolveMethodByOwnerDir(
+      receiverTypeName,
+      methodName,
+      ctx,
+      candidates,
+      argCount,
+    );
+    if (!dirDef) return undefined;
+    return { def: dirDef, tier: typeResolved.tier };
+  }
   return { def: firstDef, tier: typeResolved.tier };
 };
 
@@ -3212,13 +3336,25 @@ export const processNextjsFetchRoutes = (
     return chosen;
   };
 
+  // `normalizeFetchURL` strips server-side file extensions (.php,
+  // .asp, …) from the fetcher's literal URL so callers that hold
+  // `/foo.php` match routes registered as `/foo`. We mirror that
+  // normalization on the route side here so the basename-preserving
+  // PHP routes (`/scrr.php`) also join up against bare-name fetch
+  // URLs — and so a `.php`-tail fetch URL joins a `.php`-tail route
+  // after both sides collapse to the same form.
+  const normalizedRoutes = routes.map((r) => ({
+    r,
+    normPath: normalizeFetchURL(r.pathTemplate) ?? r.pathTemplate,
+  }));
+
   // Pre-count how many routes each consumer file matches (for confidence attribution)
   const routeCountByFile = new Map<string, number>();
   for (const call of fetchCalls) {
     const normalized = normalizeFetchURL(call.fetchURL);
     if (!normalized) continue;
-    for (const r of routes) {
-      if (routeMatches(normalized, r.pathTemplate)) {
+    for (const nr of normalizedRoutes) {
+      if (routeMatches(normalized, nr.normPath)) {
         routeCountByFile.set(call.filePath, (routeCountByFile.get(call.filePath) ?? 0) + 1);
         break;
       }
@@ -3229,8 +3365,9 @@ export const processNextjsFetchRoutes = (
     const normalized = normalizeFetchURL(call.fetchURL);
     if (!normalized) continue;
 
-    for (const r of routes) {
-      if (routeMatches(normalized, r.pathTemplate)) {
+    for (const nr of normalizedRoutes) {
+      const r = nr.r;
+      if (routeMatches(normalized, nr.normPath)) {
         const fileSourceId = generateId('File', call.filePath);
         const routeNodeId = generateId('Route', r.routeKey);
 

@@ -45,9 +45,25 @@ export const TIER_CONFIDENCE: Record<ResolutionTier, number> = {
 // --- Map types ---
 export type ImportMap = Map<string, Set<string>>;
 export type PackageMap = Map<string, Set<string>>;
-/** Maps callerFile → (moduleAlias → sourceFilePath) for Python namespace imports.
- *  e.g. `import models` in app.py → moduleAliasMap.get('app.py')?.get('models') === 'models.py' */
-export type ModuleAliasMap = Map<string, Map<string, string>>;
+/** Maps callerFile → (moduleAlias → set of files belonging to the aliased module/package).
+ *
+ *  The value is a Set because Go packages span multiple files: one `import "x/y/foo"`
+ *  introduces alias `foo` whose definitions can live in any `.go` file under `x/y/foo/`.
+ *  Python remains a single-element set per alias (one module = one file).
+ *
+ *  Examples:
+ *    Python `import models` in app.py
+ *       → moduleAliasMap.get('app.py')?.get('models') === Set({'models.py'})
+ *    Go     `import "smartcacheserving/.../scrrmodulemanager"` in newflow.go
+ *       → moduleAliasMap.get('newflow.go')?.get('scrrmodulemanager')
+ *           === Set({'…/scrrmodulemanager.go', '…/entitymodulelist.go', …})
+ *
+ *  The set form lets resolveModuleAliasedCall filter callable candidates with
+ *  `aliasFiles.has(candidate.filePath)` instead of an equality check, which is
+ *  what unblocks correct resolution of package-qualified Go calls where the
+ *  target symbol is defined in a sibling file of the package (the common case
+ *  in goserving, kosmos, oscar, etc.). */
+export type ModuleAliasMap = Map<string, Map<string, ReadonlySet<string>>>;
 
 export interface ResolutionContext {
   /**
@@ -65,7 +81,9 @@ export interface ResolutionContext {
   readonly importMap: ImportMap;
   readonly packageMap: PackageMap;
   readonly namedImportMap: NamedImportMap;
-  /** Module-alias map for Python namespace imports: callerFile → (alias → sourceFile). */
+  /** Module-alias map: callerFile → (alias → set of files in the aliased module).
+   *  Populated by buildPythonModuleAliasForFile for Python `import X` and
+   *  buildGoModuleAliasForFile for Go `import "x/y/pkg"`. See ModuleAliasMap. */
   readonly moduleAliasMap: ModuleAliasMap;
 
   // --- Per-file cache lifecycle ---

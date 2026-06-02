@@ -7,6 +7,28 @@ import { generateId } from '../../../lib/utils.js';
 export type SyntaxNode = Parser.SyntaxNode;
 
 /**
+ * Extract the explicit alias from a Go import spec, given the import path
+ * string node captured by the import query (`@import.source`).
+ *
+ * Go allows renaming an imported package: `nerrping "…/nerrping2"` makes the
+ * call-site receiver `nerrping`, even though the package directory is
+ * `nerrping2`. The path node's parent is the `import_spec`, whose optional
+ * `name` field holds the alias. Only a real `package_identifier` alias is
+ * returned — dot-imports (`.`) and blank imports (`_`) are ignored, as is the
+ * common case where no alias is present.
+ *
+ * Returns `undefined` for non-Go imports or when no explicit alias exists.
+ */
+export function extractGoImportAlias(importSourceNode: SyntaxNode | undefined): string | undefined {
+  const spec = importSourceNode?.parent;
+  if (!spec || spec.type !== 'import_spec') return undefined;
+  const nameNode = spec.childForFieldName?.('name');
+  if (!nameNode || nameNode.type !== 'package_identifier') return undefined;
+  const alias = nameNode.text;
+  return alias && alias !== '_' && alias !== '.' ? alias : undefined;
+}
+
+/**
  * Ordered list of definition capture keys for tree-sitter query matches.
  * Used to extract the definition node from a capture map.
  */

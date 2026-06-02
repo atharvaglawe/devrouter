@@ -19,7 +19,7 @@ import {
 } from '../../src/core/ingestion/route-extractors/provider-resolver.js';
 
 function newIdx(): ProviderResolverIndex {
-  return { byTag: new Map() };
+  return { byTag: new Map(), byKeyPath: new Map() };
 }
 
 describe('parseConfigFile', () => {
@@ -135,6 +135,59 @@ services:
     const k = resolveTag('kosmos', idx);
     expect(k).toBeDefined();
     expect([...k!.hosts]).toContain('kosmos.internal');
+  });
+
+  it('populates byKeyPath with absolute-path URL values from YAML', () => {
+    const idx = newIdx();
+    const leaves = parseConfigFile(
+      'config.yaml',
+      `
+origins:
+  cmserving:
+    protocol: http
+    host: cm.internal
+    port: "80"
+    path: /
+    renderer: "/scrr.php"
+  dchc:
+    renderer: "/dchc.php"
+`,
+    )!;
+    ingestConfigFile(idx, 'config.yaml', leaves);
+    finalizeIndex(idx);
+
+    expect(idx.byKeyPath.get('origins.cmserving.renderer')).toBeDefined();
+    expect([...idx.byKeyPath.get('origins.cmserving.renderer')!]).toContain('/scrr.php');
+    expect([...idx.byKeyPath.get('origins.dchc.renderer')!]).toContain('/dchc.php');
+    // Non-URL values must NOT land in byKeyPath.
+    expect(idx.byKeyPath.has('origins.cmserving.protocol')).toBe(false);
+    expect(idx.byKeyPath.has('origins.cmserving.port')).toBe(false);
+    // Bare `host` value stays in byTag, not byKeyPath (it's a hostname, not a URL/path).
+    expect(idx.byKeyPath.has('origins.cmserving.host')).toBe(false);
+  });
+
+  it('unions URL values across environments (canary/staging/production)', () => {
+    const idx = newIdx();
+    const leaves1 = parseConfigFile('canary.yaml', `origins:\n  cm:\n    renderer: "/x.php"`)!;
+    const leaves2 = parseConfigFile('prod.yaml', `origins:\n  cm:\n    renderer: "/x.php"`)!;
+    ingestConfigFile(idx, 'canary.yaml', leaves1);
+    ingestConfigFile(idx, 'prod.yaml', leaves2);
+    const urls = idx.byKeyPath.get('origins.cm.renderer');
+    expect(urls).toBeDefined();
+    expect([...urls!]).toEqual(['/x.php']);
+  });
+
+  it('captures both full URLs and absolute paths', () => {
+    const idx = newIdx();
+    const leaves = parseConfigFile(
+      'services.json',
+      JSON.stringify({
+        kosmos: { url: 'https://kosmos.internal/api', renderer: '/render' },
+      }),
+    )!;
+    ingestConfigFile(idx, 'services.json', leaves);
+    expect([...idx.byKeyPath.get('kosmos.url')!]).toContain('https://kosmos.internal/api');
+    expect([...idx.byKeyPath.get('kosmos.renderer')!]).toContain('/render');
   });
 
   it('skips entries whose value is not URL-shaped', () => {

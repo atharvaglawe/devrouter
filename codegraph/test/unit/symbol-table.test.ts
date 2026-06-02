@@ -407,6 +407,61 @@ describe('SymbolTable', () => {
     });
   });
 
+  describe('lookupMethodByOwnerInDir (cross-file owner fallback)', () => {
+    // Go split-package layout: the App struct is declared in app.go but its
+    // method getDetailsAndLog lives in failovers.go, so the parse-worker keys
+    // the method's ownerId to failovers.go (`Struct:pkg/app/failovers.go:App`)
+    // rather than the real struct node (`Struct:pkg/app/app.go:App`).
+    const addCrossFileMethod = () =>
+      table.add('pkg/app/failovers.go', 'getDetailsAndLog', 'method:gdal', 'Method', {
+        parameterCount: 1,
+        returnType: 'string',
+        ownerId: 'Struct:pkg/app/failovers.go:App',
+      });
+
+    it('resolves a method by type name + package directory when the ownerId file differs', () => {
+      addCrossFileMethod();
+      // Lookup keyed by the type's name and its package directory (app.go's dir).
+      const def = table.lookupMethodByOwnerInDir('App', 'pkg/app', 'getDetailsAndLog');
+      expect(def).toBeDefined();
+      expect(def!.nodeId).toBe('method:gdal');
+    });
+
+    it('does not match a method in a different package directory', () => {
+      addCrossFileMethod();
+      expect(
+        table.lookupMethodByOwnerInDir('App', 'other/pkg', 'getDetailsAndLog'),
+      ).toBeUndefined();
+    });
+
+    it('does not match a different type name in the same directory', () => {
+      addCrossFileMethod();
+      expect(table.lookupMethodByOwnerInDir('Other', 'pkg/app', 'getDetailsAndLog')).toBeUndefined();
+    });
+
+    it('narrows overloads by arity', () => {
+      table.add('pkg/svc/a.go', 'run', 'method:run1', 'Method', {
+        parameterCount: 0,
+        returnType: 'A',
+        ownerId: 'Struct:pkg/svc/a.go:Svc',
+      });
+      table.add('pkg/svc/b.go', 'run', 'method:run2', 'Method', {
+        parameterCount: 2,
+        returnType: 'B',
+        ownerId: 'Struct:pkg/svc/b.go:Svc',
+      });
+      expect(table.lookupMethodByOwnerInDir('Svc', 'pkg/svc', 'run', 2)!.nodeId).toBe('method:run2');
+      expect(table.lookupMethodByOwnerInDir('Svc', 'pkg/svc', 'run', 0)!.nodeId).toBe('method:run1');
+    });
+
+    it('is cleared by clear()', () => {
+      addCrossFileMethod();
+      expect(table.lookupMethodByOwnerInDir('App', 'pkg/app', 'getDetailsAndLog')).toBeDefined();
+      table.clear();
+      expect(table.lookupMethodByOwnerInDir('App', 'pkg/app', 'getDetailsAndLog')).toBeUndefined();
+    });
+  });
+
   describe('lookupCallableByName', () => {
     it('returns only callable types (Function, Method, Constructor)', () => {
       table.add('src/a.ts', 'foo', 'func:foo', 'Function');
@@ -1776,7 +1831,7 @@ describe('resolveCallTarget thin dispatcher (SM-19)', () => {
       ownerId: 'class:other:User',
     });
     ctx.importMap.set('src/app.py', new Set(['src/auth.py', 'src/other.py']));
-    ctx.moduleAliasMap.set('src/app.py', new Map([['auth', 'src/auth.py']]));
+    ctx.moduleAliasMap.set('src/app.py', new Map([['auth', new Set(['src/auth.py'])]]));
 
     const result = _resolveCallTargetForTesting(
       {

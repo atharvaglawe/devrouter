@@ -284,6 +284,47 @@ describe('extractGoApiEndpoints — client forms', () => {
     expect(c).toBeUndefined();
   });
 
+  it('Form 7: URL builder SetPath("/literal") emits a tag-less client call', () => {
+    const c = findCall(
+      calls,
+      (x) => x.framework === 'go.urlbuilder' && x.pathLiteral === '/jsonAds',
+    );
+    expect(c).toBeDefined();
+    expect(c?.method).toBeNull();
+    expect(c?.providerTag).toBeNull();
+    expect(c?.callerSymbol).toBe('buildJsonAdsURL');
+  });
+
+  it('Form 7: URL builder WithPath chained literal', () => {
+    const c = findCall(
+      calls,
+      (x) => x.framework === 'go.urlbuilder' && x.pathLiteral === '/log',
+    );
+    expect(c).toBeDefined();
+    expect(c?.callerSymbol).toBe('buildLogsURL');
+  });
+
+  it('Form 7: relative (non-absolute) path is NOT emitted', () => {
+    const c = findCall(
+      calls,
+      (x) => x.framework === 'go.urlbuilder' && x.pathLiteral === 'relative/path',
+    );
+    expect(c).toBeUndefined();
+  });
+
+  it('Form 7 variant: dynamic SetPath(getter) emits a pending getter lookup', () => {
+    const c = findCall(
+      calls,
+      (x) =>
+        x.framework === 'go.urlbuilder' &&
+        x.callerSymbol === 'buildDynamicURL' &&
+        x.pathLiteral === null,
+    );
+    expect(c).toBeDefined();
+    expect(c?.method).toBeNull();
+    expect(c?.pendingGetterLookups?.some((lk) => lk.name === 'GetPath')).toBe(true);
+  });
+
   it('does not double-emit: every client call appears exactly once', () => {
     const seen = new Set<string>();
     for (const c of calls) {

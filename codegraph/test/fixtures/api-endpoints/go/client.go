@@ -135,3 +135,60 @@ var httpclient = &providerStub{}
 func fetchByTag(ctx context.Context) {
 	_ = httpclient.GetClient("kosmos")
 }
+
+// ── Form 7: URL builder (SetPath / WithPath) ───────────────────────
+// Internal monorepos commonly construct outbound URLs through a
+// fluent builder; the path literal sits on the SetPath call and the
+// `.String()`/`.Build()` consumes it later before handing the
+// result to an HTTP client. Static dataflow can't trace that hand-off
+// reliably, but the SetPath literal IS reliable evidence of an
+// outbound URL.
+
+type urlBuilder struct{}
+
+func (u *urlBuilder) SetHost(string)              {}
+func (u *urlBuilder) SetPath(string)              {}
+func (u *urlBuilder) WithPath(string) *urlBuilder { return u }
+func (u *urlBuilder) String() string              { return "" }
+
+func newUrlBuilder() *urlBuilder { return &urlBuilder{} }
+
+func buildJsonAdsURL() string {
+	b := newUrlBuilder()
+	b.SetHost("ads.internal")
+	b.SetPath("/jsonAds")
+	return b.String()
+}
+
+func buildLogsURL() string {
+	b := newUrlBuilder()
+	return b.WithPath("/log").String()
+}
+
+func buildPipelinePath() string {
+	// Non-absolute path — should NOT be recognised as an outbound URL.
+	b := newUrlBuilder()
+	b.SetPath("relative/path")
+	return b.String()
+}
+
+// ── Form 7 variant: dynamic path via getter ────────────────────────
+// The SetPath argument is not a literal — it's a value pulled from a
+// getter. The extractor can't recover the path here, but it records a
+// pending getter lookup so the in-code-constant resolver (Phase 3.4c)
+// can chase the getter chain to a string constant downstream.
+
+type pathProvider struct{}
+
+func (p *pathProvider) GetPath() string { return "" }
+
+type urlService struct {
+	pathProvider *pathProvider
+}
+
+func (s *urlService) buildDynamicURL() string {
+	b := newUrlBuilder()
+	path := s.pathProvider.GetPath()
+	b.SetPath(path)
+	return b.String()
+}

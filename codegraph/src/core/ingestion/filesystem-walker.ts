@@ -40,6 +40,11 @@ export const walkRepositoryPaths = async (
     nodir: true,
     dot: false,
     ignore: ignoreFilter,
+    // Opt-in: follow symlinked subtrees when indexing a "mega" root
+    // that symlinks multiple repos into one indexable directory. Off
+    // by default so a single indexed repo doesn't accidentally walk
+    // into a developer's sibling projects via a stray symlink.
+    follow: process.env.CODEGRAPH_FOLLOW_SYMLINKS === '1',
   });
   const entries: ScannedFile[] = [];
   let processed = 0;

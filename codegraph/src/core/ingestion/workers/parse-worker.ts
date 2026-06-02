@@ -50,6 +50,7 @@ import {
   genericFuncName,
   inferFunctionLabel,
   CLASS_CONTAINER_TYPES,
+  extractGoImportAlias,
   type SyntaxNode,
 } from '../utils/ast-helpers.js';
 import {
@@ -68,6 +69,7 @@ import { detectFrameworkFromAST } from '../framework-detection.js';
 import { extractGoApiEndpoints } from '../route-extractors/api-endpoint-go.js';
 import { extractJavaApiEndpoints } from '../route-extractors/api-endpoint-java.js';
 import { extractPythonApiEndpoints } from '../route-extractors/api-endpoint-python.js';
+import { extractPhpApiEndpoints } from '../route-extractors/api-endpoint-php.js';
 import type { ExtractedApiEndpoints } from '../route-extractors/api-endpoint-types.js';
 import {
   extractGoConfigTags,
@@ -75,6 +77,14 @@ import {
   type ConfigTagBinding,
   type TrivialGetterBinding,
 } from '../route-extractors/config-tag-resolver.js';
+import {
+  extractGoStringConsts,
+  type GoStringConst,
+} from '../route-extractors/url-const-resolver.js';
+import {
+  extractGoStartupTaskRegistrations,
+  type StartupTaskRegistration,
+} from '../route-extractors/startup-task-extractor.js';
 import {
   extractJavaConfigTags,
   extractJavaTrivialGetters,
@@ -160,6 +170,12 @@ export interface ExtractedImport {
   language: SupportedLanguages;
   /** Named bindings from the import (e.g., import {User as U} → [{local:'U', exported:'User'}]) */
   namedBindings?: NamedBinding[];
+  /**
+   * Explicit module alias for the whole import (e.g. Go `nerrping "…/nerrping2"`
+   * → "nerrping"). Used to key the module-alias map by the call-site receiver
+   * name when it differs from the package directory basename.
+   */
+  alias?: string;
 }
 
 export interface ExtractedCall {
@@ -248,10 +264,28 @@ export interface ExtractedFetchCall {
   callerReceiver?: string | null;
   /** Pending getter-chain lookups recorded by the extractor when
    *  the call site's URL/path/host RHS was non-literal but contained
-   *  a function/method call. Phase 3.4 in pipeline.ts resolves these
-   *  via struct-tag bindings to backfill {@link providerTag}. Carried
-   *  as a serialisable shape so it survives the worker IPC boundary. */
-  pendingGetterLookups?: Array<{ receiver: string | null; name: string }>;
+   *  a function/method call (or bare selector). Phase 3.4 in
+   *  pipeline.ts resolves these via struct-tag bindings to backfill
+   *  {@link providerTag}, and Phase 3.4b resolves them to a literal
+   *  URL via the YAML-keyPath index. Carried as a serialisable shape
+   *  so it survives the worker IPC boundary. */
+  pendingGetterLookups?: Array<{
+    receiver: string | null;
+    name: string;
+    /** When set, the lookup originated from a bare-selector value
+     *  (e.g., `originConfig.Renderer`); the URL resolver substitutes
+     *  the bare `receiver` via {@link localAssignments} and applies
+     *  `tail` as the final field accessor. */
+    tail?: string;
+  }>;
+  /** Local `localVar := pkg.Func()` / `localVar := selector` shapes
+   *  observed in the enclosing function. Used by the URL resolver to
+   *  follow bare-selector pending lookups back to their originating
+   *  call expression. */
+  localAssignments?: Record<
+    string,
+    { call?: { receiver: string | null; name: string }; alias?: string[] }
+  >;
 }
 
 export interface ExtractedDecoratorRoute {
@@ -334,6 +368,12 @@ export interface ParseWorkerResult {
   configTags: ConfigTagBinding[];
   /** Trivial getter functions (Go) — see config-tag-resolver.ts. */
   trivialGetters: TrivialGetterBinding[];
+  /** Package-level string constants (Go) — see url-const-resolver.ts.
+   *  Used by Phase 3.4c to resolve getter chains to in-code URL paths. */
+  stringConsts: GoStringConst[];
+  /** Startup/cron task registration sites (Go) — see startup-task-extractor.ts.
+   *  Used to synthesize CALLS edges from registration fns to task lifecycle methods. */
+  startupTaskRegistrations: StartupTaskRegistration[];
   skippedLanguages: Record<string, number>;
   fileCount: number;
 }
@@ -611,8 +651,19 @@ const findEnclosingFunctionId = (
           const override = provider.labelOverride(current, label);
           if (override !== null) finalLabel = override;
         }
-        // Qualify with enclosing class to match definition-phase node IDs
-        const classInfo = cachedFindEnclosingClassInfo(current, filePath);
+        // Qualify with enclosing class to match definition-phase node IDs.
+        let classInfo = cachedFindEnclosingClassInfo(current, filePath);
+        // Go (and other languages whose methods are NOT nested inside their
+        // type) carry the receiver type ON the method node itself. The ancestor-
+        // only walk above starts at current.parent and therefore misses it,
+        // yielding a bare ID that never matches the definition-phase node ID
+        // (which derives the receiver from the method's name node). Re-run from
+        // a child so findEnclosingClassInfo reaches the method_declaration's own
+        // receiver. Without this, every receiver call inside such a method emits
+        // a dangling CALLS edge that is silently dropped at persistence.
+        if (!classInfo && current.type === 'method_declaration' && current.firstNamedChild) {
+          classInfo = cachedFindEnclosingClassInfo(current.firstNamedChild, filePath);
+        }
         const qualifiedName = classInfo ? `${classInfo.className}.${funcName}` : funcName;
         // Include #<arity> suffix to match definition-phase Method/Constructor IDs.
         // Use the same MethodExtractor (getMethodInfo) as the definition phase.
@@ -640,6 +691,19 @@ const findEnclosingFunctionId = (
                   typeTagForId(methodMap, funcName, arity, info, encLang, g) +
                   constTagForId(methodMap, funcName, arity, info, g);
               }
+            }
+          } else if (encLang && provider.methodExtractor?.extractFromNode) {
+            // Top-level method (e.g. Go method_declaration): no enclosing class
+            // node, so mirror the definition phase's extractFromNode path to get
+            // the same arity suffix (definition phase appends no type tag here).
+            const info = provider.methodExtractor.extractFromNode(current, {
+              filePath,
+              language: encLang,
+            });
+            if (info) {
+              arity = info.parameters.some((p) => p.isVariadic)
+                ? undefined
+                : info.parameters.length;
             }
           }
         }
@@ -767,6 +831,8 @@ const processBatch = (
     fileScopeBindings: [],
     configTags: [],
     trivialGetters: [],
+    stringConsts: [],
+    startupTaskRegistrations: [],
     skippedLanguages: {},
     fileCount: 0,
   };
@@ -1533,11 +1599,16 @@ const processFileGroup = (
         if (!rawImportPath) continue;
         const extractor = provider.namedBindingExtractor;
         const namedBindings = extractor ? extractor(captureMap['import']) : undefined;
+        const moduleAlias =
+          language === SupportedLanguages.Go
+            ? extractGoImportAlias(captureMap['import.source'])
+            : undefined;
         result.imports.push({
           filePath: file.path,
           rawImportPath,
           language: language,
           ...(namedBindings ? { namedBindings } : {}),
+          ...(moduleAlias ? { alias: moduleAlias } : {}),
         });
         continue;
       }
@@ -2285,6 +2356,17 @@ const processFileGroup = (
       if (cts.length > 0) result.configTags.push(...cts);
       const tgs = extractGoTrivialGetters(tree.rootNode, file.path);
       if (tgs.length > 0) result.trivialGetters.push(...tgs);
+      // Package-level string constants — fed to Phase 3.4c so getter
+      // chains ending in a constant (e.g. `GetPath()` → `"/trf"`) can
+      // backfill a literal fetchURL and link dynamically-built URLs.
+      const scs = extractGoStringConsts(tree.rootNode, file.path);
+      if (scs.length > 0) result.stringConsts.push(...scs);
+      // Startup/cron task registration sites — fed to a post-resolve
+      // pipeline phase that links the registration fn to the task's
+      // StartupRun/PeriodicRun lifecycle methods (an interface-dispatch
+      // hop the CALLS graph otherwise misses).
+      const strs = extractGoStartupTaskRegistrations(tree.rootNode, file.path);
+      if (strs.length > 0) result.startupTaskRegistrations.push(...strs);
     } else if (language === SupportedLanguages.Java) {
       apiResult = extractJavaApiEndpoints(tree.rootNode, file.path);
       const cts = extractJavaConfigTags(tree.rootNode, file.path);
@@ -2297,6 +2379,10 @@ const processFileGroup = (
       if (cts.length > 0) result.configTags.push(...cts);
       const tgs = extractPythonTrivialGetters(tree.rootNode, file.path);
       if (tgs.length > 0) result.trivialGetters.push(...tgs);
+    } else if (language === SupportedLanguages.PHP) {
+      // Plain-PHP: per-file AST + outbound stdlib HTTP. htaccess
+      // routes are added in pipeline.ts (one-shot, repo-wide).
+      apiResult = extractPhpApiEndpoints(tree.rootNode, file.path);
     }
     if (apiResult) {
       for (const r of apiResult.routes) {
@@ -2327,6 +2413,7 @@ const processFileGroup = (
           callerSymbol: c.callerSymbol,
           callerReceiver: c.callerReceiver,
           pendingGetterLookups: c.pendingGetterLookups,
+          localAssignments: c.localAssignments,
         });
       }
     }
@@ -2372,6 +2459,8 @@ let accumulated: ParseWorkerResult = {
   fileScopeBindings: [],
   configTags: [],
   trivialGetters: [],
+  stringConsts: [],
+  startupTaskRegistrations: [],
   skippedLanguages: {},
   fileCount: 0,
 };
@@ -2402,6 +2491,8 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   appendAll(target.fileScopeBindings, src.fileScopeBindings);
   appendAll(target.configTags, src.configTags);
   appendAll(target.trivialGetters, src.trivialGetters);
+  appendAll(target.stringConsts, src.stringConsts);
+  appendAll(target.startupTaskRegistrations, src.startupTaskRegistrations);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -2456,6 +2547,8 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
         fileScopeBindings: [],
         configTags: [],
         trivialGetters: [],
+        stringConsts: [],
+        startupTaskRegistrations: [],
         skippedLanguages: {},
         fileCount: 0,
       };

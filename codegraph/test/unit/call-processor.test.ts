@@ -2491,7 +2491,9 @@ describe('processCalls — D0 MRO fast path (SM-10)', () => {
       returnType: 'bool',
     });
     // Register the module alias: in app.py, `auth` points to auth_mod.py.
-    const aliasMap = new Map<string, string>([['auth', authModFile]]);
+    // Value is a Set per ModuleAliasMap; Python aliases are single-element
+    // sets since one module = one file.
+    const aliasMap = new Map<string, ReadonlySet<string>>([['auth', new Set([authModFile])]]);
     ctx.moduleAliasMap.set(appFile, aliasMap);
     ctx.importMap.set(appFile, new Set([authModFile]));
 
@@ -2535,6 +2537,83 @@ describe('processCalls — D0 MRO fast path (SM-10)', () => {
     expect(userSave).toBeUndefined();
   });
 
+  it('module-alias multi-file (Go-style): package-qualified `pkg.New()` lands on the package file that defines New, not a sibling overload', async () => {
+    // Regression for the "scrrmodulemanager.New goes to adcodetoken.New" bug:
+    // Go packages span many files. A caller doing `scrrmodulemanager.New()` has
+    // a moduleAliasMap entry `scrrmodulemanager → Set(every .go file under
+    // scrrmodulemanager/)`. The resolver must filter the tiered candidate
+    // pool with `aliasFiles.has(c.filePath)` (set membership) instead of
+    // `c.filePath === aliasFile` (equality), or it null-routes the call and
+    // the downstream singleCandidate fallback misroutes it to whichever
+    // `New` the global tier returns first.
+    //
+    // This test creates two Go packages each with two files; only one file in
+    // each package defines `New`. It also seeds an unrelated `New` in a third
+    // package to make sure we're not just getting lucky on the global tier.
+    const scrrEntry = 'svc/scrrmodulemanager/scrrmodulemanager.go';
+    const scrrSibling = 'svc/scrrmodulemanager/entitymodulelist.go';
+    const tokenEntry = 'svc/adcodetoken/adcodetoken.go';
+    const tokenSibling = 'svc/adcodetoken/tokenutils.go';
+    const unrelated = 'svc/unrelated/other.go';
+    const callerFile = 'svc/newflow/newflow.go';
+
+    const scrrNewId = 'Function:svc/scrrmodulemanager/scrrmodulemanager.go:New';
+    const tokenNewId = 'Function:svc/adcodetoken/adcodetoken.go:New';
+    const unrelatedNewId = 'Function:svc/unrelated/other.go:New';
+
+    ctx.symbols.add(scrrEntry, 'New', scrrNewId, 'Function', { parameterCount: 1 });
+    ctx.symbols.add(tokenEntry, 'New', tokenNewId, 'Function', { parameterCount: 1 });
+    ctx.symbols.add(unrelated, 'New', unrelatedNewId, 'Function', { parameterCount: 1 });
+
+    // Caller imports BOTH packages (every file in each). PackageMap-style:
+    // alias → set of all imported files in that package's directory.
+    ctx.importMap.set(
+      callerFile,
+      new Set([scrrEntry, scrrSibling, tokenEntry, tokenSibling]),
+    );
+    ctx.moduleAliasMap.set(
+      callerFile,
+      new Map<string, ReadonlySet<string>>([
+        ['scrrmodulemanager', new Set([scrrEntry, scrrSibling])],
+        ['adcodetoken', new Set([tokenEntry, tokenSibling])],
+      ]),
+    );
+
+    const calls: ExtractedCall[] = [
+      {
+        filePath: callerFile,
+        calledName: 'New',
+        sourceId: 'Function:svc/newflow/newflow.go:Run',
+        argCount: 1,
+        callForm: 'member',
+        receiverName: 'scrrmodulemanager',
+      },
+      {
+        filePath: callerFile,
+        calledName: 'New',
+        sourceId: 'Function:svc/newflow/newflow.go:Run',
+        argCount: 1,
+        callForm: 'member',
+        receiverName: 'adcodetoken',
+      },
+    ];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const calls_ = graph.relationships.filter((r) => r.type === 'CALLS');
+    const scrrCall = calls_.find((r) => r.targetId === scrrNewId);
+    const tokenCall = calls_.find((r) => r.targetId === tokenNewId);
+    const unrelatedCall = calls_.find((r) => r.targetId === unrelatedNewId);
+
+    // Each package-qualified call lands on its own package's New.
+    expect(scrrCall).toBeDefined();
+    expect(tokenCall).toBeDefined();
+    // The third-package `New` was never aliased — it must not be picked up.
+    expect(unrelatedCall).toBeUndefined();
+    // No extra noise CALLS were emitted (e.g., one call resolving to two targets).
+    expect(calls_).toHaveLength(2);
+  });
+
   it('module-alias guard (real homonym): both files imported, alias narrows typed member call to aliased file', async () => {
     // When both homonym files are imported by the caller, import-scoped
     // tiering no longer narrows the tiered pool — the dispatcher sees two
@@ -2563,7 +2642,7 @@ describe('processCalls — D0 MRO fast path (SM-10)', () => {
     // BOTH files imported by app.py — creates real ambiguity in tiered pool.
     ctx.importMap.set(appFile, new Set([authModFile, userModFile]));
     // Alias: `auth` points to auth_mod.py.
-    ctx.moduleAliasMap.set(appFile, new Map([['auth', authModFile]]));
+    ctx.moduleAliasMap.set(appFile, new Map([['auth', new Set([authModFile])]]));
 
     // Call `auth.User.save(user)` — receiverName is `auth` (matches alias),
     // receiverTypeName is `User` (the class). This is the class-as-receiver
@@ -2618,7 +2697,7 @@ describe('processCalls — D0 MRO fast path (SM-10)', () => {
       returnType: 'None',
     });
     ctx.importMap.set(appFile, new Set([modelsFile, authFile]));
-    ctx.moduleAliasMap.set(appFile, new Map([['auth', authFile]]));
+    ctx.moduleAliasMap.set(appFile, new Map([['auth', new Set([authFile])]]));
 
     const calls: ExtractedCall[] = [
       {
@@ -2665,7 +2744,7 @@ describe('processCalls — D0 MRO fast path (SM-10)', () => {
       returnType: 'None',
     });
     ctx.importMap.set(appFile, new Set([modelsFile, authFile]));
-    ctx.moduleAliasMap.set(appFile, new Map([['auth', authFile]]));
+    ctx.moduleAliasMap.set(appFile, new Map([['auth', new Set([authFile])]]));
 
     const calls: ExtractedCall[] = [
       {
@@ -2705,7 +2784,7 @@ describe('processCalls — D0 MRO fast path (SM-10)', () => {
       returnType: 'None',
     });
     ctx.importMap.set(appFile, new Set([modelsFile, authFile]));
-    ctx.moduleAliasMap.set(appFile, new Map([['auth', authFile]]));
+    ctx.moduleAliasMap.set(appFile, new Map([['auth', new Set([authFile])]]));
 
     const calls: ExtractedCall[] = [
       {
@@ -2745,7 +2824,7 @@ describe('processCalls — D0 MRO fast path (SM-10)', () => {
     });
     // empty.py: no symbols at all.
     ctx.importMap.set(appFile, new Set([modelsFile, emptyFile]));
-    ctx.moduleAliasMap.set(appFile, new Map([['auth', emptyFile]]));
+    ctx.moduleAliasMap.set(appFile, new Map([['auth', new Set([emptyFile])]]));
 
     const calls: ExtractedCall[] = [
       {
@@ -2934,7 +3013,7 @@ describe('D2 widen path: lookupCallableByName via module alias', () => {
     // Consumer has a same-file function that shadows 'login' at Tier 1
     ctx.symbols.add('src/consumer.py', 'login', 'Function:src/consumer.py:login', 'Function');
     // Module alias: consumer.py → auth → src/auth.py
-    ctx.moduleAliasMap.set('src/consumer.py', new Map([['auth', 'src/auth.py']]));
+    ctx.moduleAliasMap.set('src/consumer.py', new Map([['auth', new Set(['src/auth.py'])]]));
 
     const calls: ExtractedCall[] = [
       {
