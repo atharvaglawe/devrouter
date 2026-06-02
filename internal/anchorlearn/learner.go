@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 // Probe is the abstraction the Learner uses to ask the codegraph layer
@@ -362,6 +364,7 @@ func (l *Learner) RewardFeedback(
 		for _, kw := range keywords {
 			_ = l.store.IncKeywordAffinity(ctx, kw, patternID, weight)
 		}
+		telemetry.AnchorObservations.WithLabelValues("rewarded").Inc()
 		log.Printf("[anchorlearn] feedback: rewarded pattern=%s repo=%s w=%.2f file=%s",
 			patternID, obs.Repo, weight, file)
 	}
@@ -420,6 +423,7 @@ func (l *Learner) attributeMemorySave(ctx context.Context, obs Observation, file
 		for _, kw := range keywords {
 			_ = l.store.IncKeywordAffinity(ctx, kw, patternID, memorySaveWeight)
 		}
+		telemetry.AnchorObservations.WithLabelValues("rewarded").Inc()
 		log.Printf("[anchorlearn] memory_save: rewarded pattern=%s repo=%s file=%s",
 			patternID, obs.Repo, file)
 		return
@@ -451,6 +455,7 @@ func (l *Learner) attributeMemorySave(ctx context.Context, obs Observation, file
 		for _, kw := range keywords {
 			_ = l.store.IncKeywordAffinity(ctx, kw, suffix, memorySaveWeight)
 		}
+		telemetry.AnchorObservations.WithLabelValues("discovered").Inc()
 		log.Printf("[anchorlearn] discovered new pattern repo=%s suffix=%s", obs.Repo, suffix)
 		return
 	}

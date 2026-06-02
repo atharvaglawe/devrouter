@@ -175,6 +175,31 @@
     margin-bottom: 8px;
   }
   .row-detail .grid b { color: var(--text-dim); font-weight: normal; }
+  /* Codegraph file list on the Live Queries detail panel. Stage
+     headers (Search / Graph) read as the second column entries; each
+     row underneath holds the file paths the router stashed on the
+     trace hash. Files are rendered as monospace chips so the eye can
+     scan the list quickly even when there are 30+ entries. */
+  .row-detail .codegraph-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 2px 0;
+  }
+  .row-detail .codegraph-files code {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11.5px;
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .row-detail .codegraph-files .more {
+    color: var(--text-dim);
+    font-style: italic;
+    font-size: 11.5px;
+  }
   .heuristics-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
@@ -998,8 +1023,36 @@
     return `<span class="badge intent ${cls}" title="${title}">${fmt.escape(label)}</span>`;
   }
 
+  // codegraphFilesBlock renders the file list the router stashed on
+  // the trace hash for one codegraph stage (search or graph). Files
+  // are chipped up to a soft cap; if the persisted list itself was
+  // capped server-side (router.codegraphFileFieldCap = 50) the +N
+  // hint surfaces that fact, otherwise the dashboard shows the full
+  // set. Returns the "none" sentinel when codegraph returned
+  // nothing — both stages can be empty on a degraded codegraph, so
+  // this is an honest "we asked and got nothing" rather than a UI
+  // glitch.
+  function codegraphFilesBlock(files) {
+    if (!files || files.length === 0) {
+      return '<i>none returned</i>';
+    }
+    // RENDER_CAP keeps the detail panel scrollable even for a query
+    // that legitimately touched 50 files. Beyond this we collapse to
+    // a "+N more" note; the +N is computed against the persisted
+    // length (the slice we received), not the original codegraph
+    // result, so it accurately reflects what's in Redis.
+    const RENDER_CAP = 30;
+    const shown = files.slice(0, RENDER_CAP).map(p => `<code>${fmt.escape(p)}</code>`).join('');
+    const extra = files.length > RENDER_CAP
+      ? `<span class="more">+${files.length - RENDER_CAP} more</span>`
+      : '';
+    return `<div class="codegraph-files">${shown}${extra}</div>`;
+  }
+
   function queryDetail(row) {
     const mk = (row.memory_keys || []).map(k => `<code>${fmt.escape(k)}</code>`).join('<br/>') || '<i>none returned</i>';
+    const searchFiles = codegraphFilesBlock(row.search_files);
+    const graphFiles = codegraphFilesBlock(row.graph_files);
     return `
       <div class="row-detail">
         <div class="grid">
@@ -1021,6 +1074,8 @@
             <b>Adjusted reward</b><div>${row.adjusted_reward.toFixed(3)}</div>
             <b>Source</b><div>${fmt.escape(row.feedback_source)}</div>
           ` : '<b>Feedback</b><div><i>not yet received</i></div>'}
+          <b>Codegraph search</b><div>${searchFiles}</div>
+          <b>Codegraph graph</b><div>${graphFiles}</div>
           <b>Memory keys</b><div>${mk}</div>
         </div>
       </div>`;

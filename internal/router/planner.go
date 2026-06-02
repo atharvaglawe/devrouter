@@ -2,6 +2,8 @@ package router
 
 import (
 	"strings"
+
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 // This file defines the sanitization pipeline that every QueryPlan goes
@@ -32,13 +34,49 @@ const (
 // before it drives retrieval. It lowercases, trims, dedups, enforces
 // length caps per field, and drops obvious garbage. Safe to call on a
 // zero-valued QueryPlan (returns a zero-valued QueryPlan).
+//
+// Per-field drop counters are emitted so a sustained "agent is sending
+// 12 should_terms" regression shows up in the metrics surface before
+// it visibly degrades retrieval. Counters increment on the diff
+// between sanitized-input length and sanitized-output length, so
+// reordering / lowercasing on its own doesn't trip them.
 func SanitizePlan(in QueryPlan) QueryPlan {
+	must := sanitizeTerms(in.MustTerms)
+	should := sanitizeTerms(in.ShouldTerms)
+	exclude := sanitizeTerms(in.ExcludeTerms)
+	phrases := sanitizePhrases(in.Phrases)
+	hints := sanitizeHints(in.ContextHints)
+
+	recordPlanDrop("must_terms", len(in.MustTerms), len(must))
+	recordPlanDrop("should_terms", len(in.ShouldTerms), len(should))
+	recordPlanDrop("exclude_terms", len(in.ExcludeTerms), len(exclude))
+	recordPlanDrop("phrases", len(in.Phrases), len(phrases))
+	recordPlanDrop("context_hints", len(in.ContextHints), len(hints))
+
+	mustCapped := capTerms(must, maxMustTerms)
+	shouldCapped := capTerms(should, maxShouldTerms)
+	excludeCapped := capTerms(exclude, maxExcludeTerms)
+	phrasesCapped := capTerms(phrases, maxPhrases)
+	hintsCapped := capTerms(hints, maxContextHints)
+
+	recordPlanDrop("must_terms", len(must), len(mustCapped))
+	recordPlanDrop("should_terms", len(should), len(shouldCapped))
+	recordPlanDrop("exclude_terms", len(exclude), len(excludeCapped))
+	recordPlanDrop("phrases", len(phrases), len(phrasesCapped))
+	recordPlanDrop("context_hints", len(hints), len(hintsCapped))
+
 	return QueryPlan{
-		MustTerms:    capTerms(sanitizeTerms(in.MustTerms), maxMustTerms),
-		ShouldTerms:  capTerms(sanitizeTerms(in.ShouldTerms), maxShouldTerms),
-		ExcludeTerms: capTerms(sanitizeTerms(in.ExcludeTerms), maxExcludeTerms),
-		Phrases:      capTerms(sanitizePhrases(in.Phrases), maxPhrases),
-		ContextHints: capTerms(sanitizeHints(in.ContextHints), maxContextHints),
+		MustTerms:    mustCapped,
+		ShouldTerms:  shouldCapped,
+		ExcludeTerms: excludeCapped,
+		Phrases:      phrasesCapped,
+		ContextHints: hintsCapped,
+	}
+}
+
+func recordPlanDrop(field string, before, after int) {
+	if drop := before - after; drop > 0 {
+		telemetry.SanitizePlanDrops.WithLabelValues(field).Add(float64(drop))
 	}
 }
 

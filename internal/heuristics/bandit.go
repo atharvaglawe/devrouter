@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 // banditStore is the slice of Store the bandit actually depends on.
@@ -329,6 +331,7 @@ func (b *Bandit) promote(key string, c *candidate) {
 		To:        c.profile,
 		Reason:    "candidate beat base by >= PromotionLift over PromotionWindow samples",
 	})
+	telemetry.HeuristicsPromotions.WithLabelValues(c.intent).Inc()
 	log.Printf("[heuristics] %s promoted candidate (%s -> %s)", key, c.baseID, c.profileID)
 	delete(b.active, key)
 }
@@ -342,6 +345,7 @@ func (b *Bandit) discard(key string, c *candidate) {
 		To:        c.base,
 		Reason:    "candidate did not beat base over window",
 	})
+	telemetry.HeuristicsDiscards.WithLabelValues(c.intent).Inc()
 	log.Printf("[heuristics] %s discarded candidate %s (no lift)", key, c.profileID)
 	delete(b.active, key)
 }
@@ -360,6 +364,7 @@ func (b *Bandit) rollback(key string, c *candidate, reason string) {
 		To:        def,
 		Reason:    reason,
 	})
+	telemetry.HeuristicsRollbacks.WithLabelValues(c.intent).Inc()
 	log.Printf("[heuristics] %s ROLLBACK to default: %s", key, reason)
 	delete(b.active, key)
 }

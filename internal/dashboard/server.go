@@ -7,11 +7,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/atharva-ag/devrouter/internal/heuristics"
 	"github.com/atharva-ag/devrouter/internal/memory"
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 //go:embed index.html
@@ -142,7 +145,29 @@ func newMux(cfg Config) *http.ServeMux {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	// /metrics is the Prometheus exposition endpoint. Mounted on the
+	// same mux as the dashboard so a single bind solves both UIs;
+	// disable independently with DEVROUTER_METRICS_ADDR=off when an
+	// SRE wants to keep the dashboard but route /metrics elsewhere.
+	if metricsEnabled() {
+		mux.Handle("/metrics", telemetry.Handler())
+	}
+
 	return mux
+}
+
+// metricsEnabled honours DEVROUTER_METRICS_ADDR for opt-out. The
+// "addr" name is forward-looking: a future change can let SREs bind
+// /metrics on a separate port by reading the same variable. For now
+// only the off sentinels are interpreted; any other value (including
+// the default empty string) means "mount on the dashboard mux".
+func metricsEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("DEVROUTER_METRICS_ADDR")))
+	switch v {
+	case "off", "none", "disabled", "false", "0":
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

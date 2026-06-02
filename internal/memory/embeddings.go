@@ -11,6 +11,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
 // EmbedDim is the vector dimension every Provider must produce.
@@ -78,25 +80,32 @@ type embedResponse struct {
 func (p *HTTPProvider) Embed(text string) ([]float32, error) {
 	body, _ := json.Marshal(embedRequest{Model: p.Model, Input: text})
 
+	start := time.Now()
 	resp, err := p.Client.Post(p.URL, "application/json", bytes.NewReader(body))
+	telemetry.EmbedderRequestDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
+		telemetry.EmbedderRequests.WithLabelValues("network").Inc()
 		return nil, fmt.Errorf("embed request to %s: %w", p.URL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		telemetry.EmbedderRequests.WithLabelValues("http_error").Inc()
 		return nil, fmt.Errorf("embed endpoint %s returned %d", p.URL, resp.StatusCode)
 	}
 
 	var result embedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		telemetry.EmbedderRequests.WithLabelValues("bad_response").Inc()
 		return nil, fmt.Errorf("embed decode from %s: %w", p.URL, err)
 	}
 
 	if len(result.Embeddings) == 0 || len(result.Embeddings[0]) == 0 {
+		telemetry.EmbedderRequests.WithLabelValues("bad_response").Inc()
 		return nil, fmt.Errorf("embed endpoint %s returned no vectors for model %q", p.URL, p.Model)
 	}
 
+	telemetry.EmbedderRequests.WithLabelValues("ok").Inc()
 	return result.Embeddings[0], nil
 }
 
@@ -134,6 +143,8 @@ func Embed(text string) ([]float32, error) {
 		return nil, err
 	}
 	if len(vec) != EmbedDim {
+		telemetry.EmbedderDimMismatch.Inc()
+		telemetry.EmbedderRequests.WithLabelValues("dim_mismatch").Inc()
 		return nil, fmt.Errorf(
 			"embedding provider %s returned %d-dim vector, want %d "+
 				"(Redis index is built for %d; either use a %d-dim model or recreate the index with a different EmbedDim)",

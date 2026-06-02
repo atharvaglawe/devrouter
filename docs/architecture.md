@@ -271,6 +271,26 @@ For each pipeline stage in the diagram, the canonical rule lives in
 | Section 10 | Per-memory FP learning (false-positive feedback loop) |
 | Section 11 | Honest signals (cosine-derived confidence on every field) |
 
+## Observability surfaces
+
+devrouter exposes two complementary observability stories:
+
+| Surface | Lives in | Best for |
+|---------|----------|----------|
+| **Per-query traces** | `feedback:trace:{query_id}` hashes in Redis, rendered by [`internal/dashboard/`](../internal/dashboard) at `http://127.0.0.1:8088` | Debugging a specific call: which memories were returned, what the bandit picked, what reward joined later. |
+| **Process metrics** | Prometheus exposition at `http://127.0.0.1:8088/metrics`, served by [`internal/telemetry/`](../internal/telemetry) | Aggregate RED / SLIs across all calls: per-intent latency histograms, per-tool MCP RED, codegraph + Redis + embedder external-call instrumentation, bandit health (promotions / rollbacks / reward samples), build_info. |
+
+The split is deliberate. Labels on the Prometheus surface are
+bounded (`intent`, `plan_source`, `tool`, `stage`, `endpoint`,
+canonical Redis command name) so an SRE can confidently scrape and
+alert. High-cardinality identifiers like `query_id` and
+`heuristic_profile_id` stay on the Redis trace + the slog stream,
+where the dashboard can join them on demand.
+
+See [`configuration.md` § Telemetry](configuration.md#telemetry) for
+the full metric catalogue and the `DEVROUTER_METRICS_ADDR` /
+`DEVROUTER_LOG_FORMAT` knobs.
+
 ## Related docs
 
 - [`retrieval-rules.md`](retrieval-rules.md) — the canonical request
@@ -286,4 +306,4 @@ For each pipeline stage in the diagram, the canonical rule lives in
   actually close
 - [`configuration.md`](configuration.md) — every env var that
   influences the pipeline (cosine floor, freeze mode, hosted-service
-  overrides)
+  overrides, telemetry exposition)
