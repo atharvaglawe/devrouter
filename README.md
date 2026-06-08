@@ -121,6 +121,54 @@ Per-tool input schemas, return shapes, and usage notes live in
 [`docs/tools.md`](docs/tools.md). For the call-order rules agents must
 follow, see [`docs/agent-rules.md`](docs/agent-rules.md).
 
+## External retrieval tools
+
+Beyond the native memory + codegraph paths, devrouter can fan out to
+external read-only sources — a docs search, issue tracker, wiki, any
+MCP server or OpenAPI-described REST API — and merge their results into
+the `documentation` channel of a `dev_context` response. **MCP and
+OpenAPI tools are self-describing, so adding one is a single config
+entry pointing at its endpoint — no Go code, no response mapper.**
+
+Point `DEVROUTER_TOOLS_CONFIG` at a JSON file:
+
+```json
+[
+  { "name": "wiki", "transport": "mcp-http", "endpoint": "https://wiki.internal/mcp",
+    "headers": { "Authorization": "Bearer $WIKI_TOKEN" } },
+
+  { "name": "clickup", "transport": "mcp-stdio", "endpoint": "clickup-mcp" },
+
+  { "name": "petstore", "transport": "openapi",
+    "endpoint": "https://api.internal/openapi.json", "timeout_ms": 15000 }
+]
+```
+
+Then reference the file from your MCP-host config:
+
+```json
+{
+  "mcpServers": {
+    "devrouter": {
+      "command": "/abs/path/to/devrouter",
+      "env": {
+        "DEVROUTER_REDIS": "localhost:6379",
+        "DEVROUTER_TOOLS_CONFIG": "/abs/path/to/tools.json"
+      }
+    }
+  }
+}
+```
+
+devrouter discovers each tool's search operation and query argument
+(via MCP `tools/list` or the OpenAPI spec), normalizes any response
+shape with a generic mapper, and lets each source learn how many docs
+to return over time. Each tool runs in parallel under
+`DEVROUTER_SOURCE_TIMEOUT_MS` — raise it (or set a per-tool `timeout_ms`)
+for slow backends, or they're silently cut off. Full guide, including
+the bespoke-transport escape hatch and the per-source breadth bandit:
+[`docs/integrating-tools.md`](docs/integrating-tools.md).
+
 ## Benchmarks
 
 DevRouter is benchmarked against `agentmemory` (BM25 + hybrid BM25+vector
@@ -185,6 +233,10 @@ Details:
   (turning off self-tuning, hosted-service overrides, dashboard port)
 - [`docs/tools.md`](docs/tools.md) — every MCP tool with its input schema
   and usage notes
+- [`docs/integrating-tools.md`](docs/integrating-tools.md) — how to add a
+  new external retrieval tool (docs/issues/wiki sources): MCP/OpenAPI
+  self-description, a single config entry, the generic mapper, and how
+  sources learn their own retrieval breadth
 - [`docs/agent-rules.md`](docs/agent-rules.md) — canonical agent ruleset
   (paste into `CLAUDE.md` / `.cursor/rules/devrouter.mdc` / `AGENTS.md`)
 - [`docs/retrieval-rules.md`](docs/retrieval-rules.md) — how a raw query

@@ -41,6 +41,24 @@ func NewServer(r *router.Router) *Server {
 	return &Server{router: r}
 }
 
+// includeResponseTrace controls whether the verbose retrieval_trace
+// block is embedded in the dev_context response. Default on. Set
+// DEVROUTER_RETRIEVAL_TRACE to an opt-out sentinel (off/none/disabled/
+// false/0) to omit it from the payload — useful for trimming tokens.
+//
+// This only affects the dev_context *response*: the trace is still built,
+// still persisted to Redis for the dev_feedback join, and still returned
+// in full by the retrieve_debug tool. query_id stays on the response so
+// dev_feedback continues to work.
+var includeResponseTrace = func() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEVROUTER_RETRIEVAL_TRACE"))) {
+	case "off", "none", "disabled", "false", "0":
+		return false
+	default:
+		return true
+	}
+}()
+
 func (s *Server) Run() error {
 	reader := bufio.NewReader(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
@@ -390,6 +408,13 @@ func (s *Server) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
 		result, err := s.router.HandleQueryWithPlan(args.Query, args.Repo, args.Plan.toRouterPlan())
 		if err != nil {
 			return s.errResp(req.ID, -32000, err.Error())
+		}
+		// Optionally drop the heavy retrieval_trace from the response to
+		// save tokens. query_id stays (it's a separate top-level field),
+		// so dev_feedback still works; Redis persistence already happened
+		// inside HandleQueryWithPlan. retrieve_debug is unaffected.
+		if !includeResponseTrace {
+			result.RetrievalTrace = nil
 		}
 		text, _ := json.MarshalIndent(result, "", "  ")
 		return s.success(req.ID, map[string]any{

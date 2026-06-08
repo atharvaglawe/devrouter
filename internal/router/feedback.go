@@ -56,6 +56,24 @@ type FeedbackInput struct {
 	MissingFiles string `json:"missing_files"`
 }
 
+// sourceExploreFromTrace reads the per-source breadth-bandit explore
+// record persisted on a trace hash (src_explore_name / src_explore_val).
+// Returns ok=false when no source was sampled for that query.
+func sourceExploreFromTrace(f map[string]string) (name string, val int, ok bool) {
+	if len(f) == 0 {
+		return "", 0, false
+	}
+	name = f["src_explore_name"]
+	if name == "" {
+		return "", 0, false
+	}
+	v, err := strconv.Atoi(f["src_explore_val"])
+	if err != nil {
+		return "", 0, false
+	}
+	return name, v, true
+}
+
 // splitCSV is the standard comma-separated parser used across the router
 // for agent-supplied list fields. Trims whitespace and drops empty entries.
 func splitCSV(s string) []string {
@@ -222,6 +240,12 @@ func (r *Router) SubmitFeedback(in FeedbackInput) FeedbackResult {
 	}
 
 	r.Heuristics.UpdateWithTopic(intent, repo, topicID, profileID, adjusted, heuristics.ExplicitWeight)
+
+	// Route the same reward to the per-source breadth bandit when this
+	// query sampled a source (recorded on the trace). No-op otherwise.
+	if name, val, ok := sourceExploreFromTrace(traceFields); ok {
+		r.Heuristics.UpdateSource(intent, repo, topicID, name, val, adjusted, heuristics.ExplicitWeight)
+	}
 
 	// AnchorLearner reward attribution. dev_feedback's file_paths are
 	// the agent's authoritative "I actually read these" list; any

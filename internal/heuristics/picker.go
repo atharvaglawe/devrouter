@@ -33,10 +33,11 @@ import (
 // tuning. nil disables the topic-aware path entirely (everything
 // behaves like Pick(intent)).
 type Picker struct {
-	Store  *Store
-	Bandit *Bandit
-	Topics *TopicStore
-	frozen bool
+	Store        *Store
+	Bandit       *Bandit
+	SourceBandit *SourceBandit
+	Topics       *TopicStore
+	frozen       bool
 
 	mu sync.RWMutex
 }
@@ -52,10 +53,11 @@ func NewPicker(rdb *redis.Client) *Picker {
 	s := NewStore(rdb)
 	frozen := strings.EqualFold(os.Getenv("DEVROUTER_HEURISTICS_FROZEN"), "true")
 	p := &Picker{
-		Store:  s,
-		Bandit: NewBandit(s),
-		Topics: NewTopicStore(rdb),
-		frozen: frozen,
+		Store:        s,
+		Bandit:       NewBandit(s),
+		SourceBandit: NewSourceBandit(s),
+		Topics:       NewTopicStore(rdb),
+		frozen:       frozen,
 	}
 	p.warmDefaults(context.Background())
 
@@ -77,6 +79,14 @@ func NewPicker(rdb *redis.Client) *Picker {
 				}
 			}
 			log.Printf("[heuristics] bandit enabled for knobs: %s", tune)
+		}
+
+		// The per-source breadth bandit is a separate surface; enable it
+		// when DEVROUTER_HEURISTICS_BANDIT is "all" or includes the
+		// "source_docs" knob name.
+		if tune := os.Getenv("DEVROUTER_HEURISTICS_BANDIT"); tune == "all" || csvContains(tune, SourceDocsKnob) {
+			p.SourceBandit.Enable()
+			log.Printf("[heuristics] source-docs bandit enabled")
 		}
 	}
 
@@ -204,6 +214,41 @@ func (p *Picker) UpdateWithTopic(intent, repo, topic, profileID string, adjusted
 		return
 	}
 	p.Bandit.Update(intent, repo, topic, profileID, adjustedReward, weight)
+}
+
+// SelectSources returns the per-source doc breadth for this query plus
+// the explore record (nil when no source is being sampled). Topic-aware:
+// uses the bucket's centroid sample count to gate exploration on a real
+// bucket, matching PickWithTopic. No-op exploration when frozen.
+func (p *Picker) SelectSources(intent, repo, topic string, seeds []SourceSeed) (map[string]int, *ExploreRec) {
+	if p.SourceBandit == nil || len(seeds) == 0 {
+		return nil, nil
+	}
+	samples := 0
+	if p.Topics != nil && !isGlobalBucket(repo, topic) {
+		samples = p.Topics.Samples(context.Background(), intent, repo, topic)
+	}
+	return p.SourceBandit.SelectAll(intent, repo, topic, seeds, samples)
+}
+
+// UpdateSource routes a reward to the explored source cell. No-op when
+// frozen or no source bandit is configured.
+func (p *Picker) UpdateSource(intent, repo, topic, source string, servedVal int, adjustedReward, weight float64) {
+	if p.frozen || p.SourceBandit == nil {
+		return
+	}
+	p.SourceBandit.Update(intent, repo, topic, source, servedVal, adjustedReward, weight)
+}
+
+// csvContains reports whether a comma-separated list contains target
+// (whitespace-trimmed).
+func csvContains(csv, target string) bool {
+	for _, part := range strings.Split(csv, ",") {
+		if strings.TrimSpace(part) == target {
+			return true
+		}
+	}
+	return false
 }
 
 // Reset restores the frozen-default profile for an intent and clears any
