@@ -213,10 +213,28 @@ Environment:
   DEVROUTER_METRICS_ADDR         Prometheus /metrics control (default: mounted on dashboard; set off to disable)
   DEVROUTER_LOG_FORMAT           Log output format (default text; set json for structured slog records)
   DEVROUTER_LOG_LEVEL            Minimum log level (default info; debug/info/warn/error)
+  DEVROUTER_RETRIEVAL_TRACE      Include retrieval_trace in dev_context responses (default on; set off/none/disabled/false/0 to omit and save tokens — query_id, Redis persistence, and retrieve_debug are unaffected)
   CODEGRAPH_URL                  Codegraph HTTP base URL (default http://localhost:4747)
   GITNEXUS_URL                   Legacy alias for CODEGRAPH_URL (deprecated)
   DEVROUTER_CODEGRAPH_CLI        Override path to codegraph dist/cli/index.js
-  DEVROUTER_GITNEXUS_CLI         Legacy alias for DEVROUTER_CODEGRAPH_CLI (deprecated)`)
+  DEVROUTER_GITNEXUS_CLI         Legacy alias for DEVROUTER_CODEGRAPH_CLI (deprecated)
+
+External retrieval tools (all OFF unless their URL is set; run in parallel, per-tool timeout):
+  DEVROUTER_CMDOCS_URL           cmdocs FastAPI sidecar /search URL (e.g. http://127.0.0.1:8099/search)
+  DEVROUTER_CMDOCS_CMD           Alternative: stdio MCP command for cmdocs (used only if _URL unset)
+  DEVROUTER_CMDOCS_MAX_DOCS      Max docs cmdocs returns per query (default 3)
+  DEVROUTER_GITLAB_MCP_URL       GitLab MCP Streamable-HTTP endpoint (PAT-based community server)
+  DEVROUTER_GITLAB_TOKEN         GitLab PAT, sent as Authorization: Bearer + PRIVATE-TOKEN headers
+  DEVROUTER_GITLAB_TOOL          GitLab MCP tool name to call (default search_issues)
+  DEVROUTER_TOOLS_CONFIG         Path to a JSON array of tool configs (mcp-stdio/mcp-http/openapi/http-json);
+                                 MCP/OpenAPI tools self-describe, so {name,transport,endpoint} is usually enough.
+                                 See docs/integrating-tools.md.
+  DEVROUTER_SOURCE_TIMEOUT_MS    Per-tool call timeout in ms (default 8000); bounds both the context deadline
+                                 and the transport client timeout. Raise for slow backends (cmdocs ~9-12s).
+
+Heuristics learning:
+  DEVROUTER_HEURISTICS_BANDIT    Enable bandit tuning: "all", or a CSV of knob names. Include "source_docs"
+                                 to let each external source learn its per-(intent,repo,topic) doc breadth.`)
 }
 
 // runCodegraphPassthrough execs `node <cli> <args...>`, inheriting stdio and

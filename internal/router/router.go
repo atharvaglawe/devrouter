@@ -17,8 +17,10 @@ import (
 	"github.com/atharva-ag/devrouter/internal/anchorlearn"
 	"github.com/atharva-ag/devrouter/internal/codegraph"
 	"github.com/atharva-ag/devrouter/internal/heuristics"
+	"github.com/atharva-ag/devrouter/internal/mcpsource"
 	"github.com/atharva-ag/devrouter/internal/memory"
 	"github.com/atharva-ag/devrouter/internal/prompt"
+	"github.com/atharva-ag/devrouter/internal/retrieval"
 	"github.com/atharva-ag/devrouter/internal/telemetry"
 )
 
@@ -52,6 +54,18 @@ type Router struct {
 	// for very large monorepos) and stable across queries.
 	dirsCacheMu sync.Mutex
 	dirsCache   map[string][]string
+
+	// Sources is the registry of external retrieval tools (cmdocs,
+	// GitLab, …) that run in the parallel fan-out alongside the native
+	// memory + codegraph paths. Populated from env in New; empty (and
+	// thus a no-op) unless the per-tool config is set. Native tools
+	// also satisfy retrieval.Source (see source_adapters.go) but run
+	// inline; this list holds only the pluggable externals.
+	Sources []retrieval.Source
+
+	// sourceTimeout bounds each external tool call so a slow/hung MCP
+	// server can never stall a dev_context response.
+	sourceTimeout time.Duration
 }
 
 // codegraphProbe satisfies anchorlearn.Probe by delegating to
@@ -104,7 +118,127 @@ func New(graph *codegraph.Client, mem *memory.Store) *Router {
 		}
 	}
 
+	r.sourceTimeout = sourceTimeoutFromEnv()
+	r.Sources = buildExternalSources(r.sourceTimeout)
+	for _, s := range r.Sources {
+		log.Printf("[router] external retrieval source registered: %s", s.Name())
+	}
+
 	return r
+}
+
+// sourceTimeoutFromEnv returns the per-external-tool call timeout,
+// overridable via DEVROUTER_SOURCE_TIMEOUT_MS (default 8s).
+func sourceTimeoutFromEnv() time.Duration {
+	if v := os.Getenv("DEVROUTER_SOURCE_TIMEOUT_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return 8 * time.Second
+}
+
+// buildExternalSources reads the per-tool env config and constructs the
+// external retrieval sources. Every tool is OFF unless its config is
+// present, so a default install registers nothing and the orchestrator
+// fan-out is a no-op. A misconfigured tool logs and is skipped rather
+// than crashing the server.
+//
+// Adding a new external tool = one more block here (or one mcpsource
+// .Config row) — no pipeline changes.
+//
+// sourceTimeout is the per-tool budget (DEVROUTER_SOURCE_TIMEOUT_MS). It
+// is applied as each source's transport Timeout so the HTTP/RPC client
+// timeout matches the context deadline the fan-out enforces — otherwise
+// a tool slower than the transport's 8s default (e.g. cmdocs) would be
+// cut off regardless of DEVROUTER_SOURCE_TIMEOUT_MS. A tools-config
+// entry's explicit timeout_ms still wins.
+func buildExternalSources(sourceTimeout time.Duration) []retrieval.Source {
+	var out []retrieval.Source
+	add := func(cfg mcpsource.Config) {
+		if cfg.Timeout <= 0 {
+			cfg.Timeout = sourceTimeout
+		}
+		src, err := mcpsource.New(cfg)
+		if err != nil {
+			log.Printf("[router] skipping source %q: %v", cfg.Name, err)
+			return
+		}
+		out = append(out, src)
+	}
+
+	// Generic, env-driven tools: DEVROUTER_TOOLS_CONFIG points at a JSON
+	// array of tool configs. New tools are added by config alone — no Go
+	// code — each defaulting to MCP/OpenAPI self-description plus the
+	// generic mapper. Loaded first so the named env blocks below can act
+	// as overrides/back-compat.
+	if path := strings.TrimSpace(os.Getenv("DEVROUTER_TOOLS_CONFIG")); path != "" {
+		if data, err := os.ReadFile(path); err != nil {
+			log.Printf("[router] DEVROUTER_TOOLS_CONFIG read %q: %v", path, err)
+		} else if cfgs, err := mcpsource.ParseConfigs(data); err != nil {
+			log.Printf("[router] DEVROUTER_TOOLS_CONFIG parse %q: %v", path, err)
+		} else {
+			for _, cfg := range cfgs {
+				add(cfg)
+			}
+		}
+	}
+
+	// cmdocs (PageIndex docs). Prefer the FastAPI sidecar (HTTP JSON);
+	// fall back to a stdio MCP command if that's how it's deployed.
+	if url := strings.TrimSpace(os.Getenv("DEVROUTER_CMDOCS_URL")); url != "" {
+		add(mcpsource.Config{
+			Name:      "cmdocs",
+			Transport: mcpsource.TransportHTTPJSON,
+			Endpoint:  url,
+			ToolName:  "pageindex_search",
+			QueryArg:  "query",
+			ExtraArgs: map[string]any{"max_docs": cmdocsMaxDocs()},
+			Mapper:    "cmdocs",
+		})
+	} else if cmd := strings.TrimSpace(os.Getenv("DEVROUTER_CMDOCS_CMD")); cmd != "" {
+		add(mcpsource.Config{
+			Name:      "cmdocs",
+			Transport: mcpsource.TransportMCPStdio,
+			Endpoint:  cmd,
+			ToolName:  "pageindex_search",
+			QueryArg:  "query",
+			Mapper:    "cmdocs",
+		})
+	}
+
+	// GitLab issues/MRs over MCP (Streamable HTTP). PAT auth via header.
+	if url := strings.TrimSpace(os.Getenv("DEVROUTER_GITLAB_MCP_URL")); url != "" {
+		headers := map[string]string{}
+		if tok := strings.TrimSpace(os.Getenv("DEVROUTER_GITLAB_TOKEN")); tok != "" {
+			headers["Authorization"] = "Bearer " + tok
+			headers["PRIVATE-TOKEN"] = tok
+		}
+		tool := strings.TrimSpace(os.Getenv("DEVROUTER_GITLAB_TOOL"))
+		if tool == "" {
+			tool = "search_issues"
+		}
+		add(mcpsource.Config{
+			Name:      "gitlab",
+			Transport: mcpsource.TransportMCPHTTP,
+			Endpoint:  url,
+			Headers:   headers,
+			ToolName:  tool,
+			QueryArg:  "search",
+			Mapper:    "gitlab",
+		})
+	}
+
+	return out
+}
+
+func cmdocsMaxDocs() int {
+	if v := os.Getenv("DEVROUTER_CMDOCS_MAX_DOCS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 3
 }
 
 // QueryPlan is the structured retrieval plan that drives router scoring.
@@ -540,6 +674,14 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 			})
 			r.Heuristics.UpdateWithTopic(repeatHit.PrevIntent, repeatHit.PrevRepo, repeatHit.PrevTopicID,
 				repeatHit.PrevProfileID, adjusted, heuristics.ImplicitWeight)
+			// Route the same penalty to the prior query's explored source
+			// cell, if any (read from the prior trace).
+			if pf, perr := r.Heuristics.Store.GetTrace(ctx, repeatHit.PrevQueryID); perr == nil {
+				if name, val, ok := sourceExploreFromTrace(pf); ok {
+					r.Heuristics.UpdateSource(repeatHit.PrevIntent, repeatHit.PrevRepo, repeatHit.PrevTopicID,
+						name, val, adjusted, heuristics.ImplicitWeight)
+				}
+			}
 			log.Printf("[heuristics] implicit_repeat: prev=%s sim=%.3f raw=%.2f adjusted=%.2f bucket=%s/%s",
 				repeatHit.PrevQueryID, repeatHit.Sim, raw, adjusted,
 				repeatHit.PrevRepo, repeatHit.PrevTopicID)
@@ -1260,6 +1402,43 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 		}
 	}
 
+	// --- EXTERNAL TOOL FAN-OUT (cmdocs, gitlab, …) ---
+	// Every registered external source runs in parallel, aimed by
+	// memory's recalled signals (autoHints folded into the Request),
+	// each under its own timeout and with no gating. No-op when nothing
+	// is configured, so a default install pays nothing here.
+	//
+	// Per-source doc breadth comes from the breadth bandit (section 5):
+	// at most one source explores a perturbed value per query for clean
+	// credit assignment. A repeat-exploration additionally widens every
+	// source's breadth for this call (Expand) on top of the bandit.
+	var documentation []prompt.DocEntry
+	var docStages map[string]*prompt.StageTrace
+	if len(r.Sources) > 0 {
+		srcReq := r.buildRetrievalRequest(query, repo, branch, queryEmbed, string(intent), plan, memRes.autoHints)
+		seeds := r.sourceSeeds()
+		isRepeat := repeatHit.Sim >= heuristics.RepeatSimThreshold
+
+		var breadths map[string]int
+		if r.Heuristics != nil {
+			var explore *heuristics.ExploreRec
+			breadths, explore = r.Heuristics.SelectSources(string(intent), repo, topicID, seeds)
+			// Record the explore sample only on a normal call. A repeat
+			// widens every source below, which would corrupt the bandit's
+			// A/B comparison, so we don't sample on repeats.
+			if explore != nil && !isRepeat {
+				trace.SourceExplore = &prompt.SourceExploreRec{
+					Source: explore.Source, Val: explore.Val, Base: explore.Base,
+				}
+			}
+		}
+		if isRepeat {
+			srcReq.Expand = true
+			breadths = widenBreadths(breadths, seeds)
+		}
+		documentation, docStages = r.fetchDocSources(srcReq, breadths)
+	}
+
 	dp := prompt.Build(string(intent), symbols, impactNames, primaryCtx, snippets)
 	dp.Decisions = decisionCtx
 	// Prepend decision-type-aware instructions if decisions exist
@@ -1268,7 +1447,11 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 	}
 	dp.CallChain = chain
 	dp.Graph = graph
+	dp.Documentation = documentation
 	dp.ModelHint = modelHint(memCount)
+	if docStages != nil {
+		trace.ToolStages = docStages
+	}
 
 	// [funnel] stage 3: final DevPrompt — what the agent actually sees.
 	// Walks the same buckets the bench adapter walks, in the same order,
@@ -1495,6 +1678,7 @@ func (r *Router) HandleQueryWithPlan(query, repo string, providedPlan *QueryPlan
 		FilesReturned:      filesReturned,
 		SymbolsReturned:    len(dp.Symbols),
 		SnippetsReturned:   len(dp.CodeSnippets),
+		DocsReturned:       len(dp.Documentation),
 		TrimmedFiles:       trimmed,
 		BudgetUsedFraction: budgetUsed,
 		LatencyMs:          int(trace.TotalLatencyMs),
@@ -1618,6 +1802,11 @@ func traceHashFields(t *prompt.RetrievalTrace, repo, query, intent, profileID st
 	if t.HeuristicFromTopic {
 		fields["heuristic_from_topic"] = "true"
 	}
+	if t.SourceExplore != nil {
+		fields["src_explore_name"] = t.SourceExplore.Source
+		fields["src_explore_val"] = fmt.Sprintf("%d", t.SourceExplore.Val)
+		fields["src_explore_base"] = fmt.Sprintf("%d", t.SourceExplore.Base)
+	}
 	if t.Outcome != nil {
 		fields["prompt_tokens"] = fmt.Sprintf("%d", t.Outcome.PromptTokens)
 		fields["files_returned"] = fmt.Sprintf("%d", t.Outcome.FilesReturned)
@@ -1707,6 +1896,11 @@ func estimateTokens(dp *prompt.DevPrompt) int {
 	// Code snippets
 	for _, s := range dp.CodeSnippets {
 		totalChars += len(s.Content)
+	}
+
+	// External documentation / tracker context
+	for _, d := range dp.Documentation {
+		totalChars += len(d.Title) + len(d.Content)
 	}
 
 	// Rough estimate: 4 chars per token

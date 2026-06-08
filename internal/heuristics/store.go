@@ -545,3 +545,114 @@ func (s *Store) RollingMeanFor(ctx context.Context, intent, repo, topic string, 
 	}
 	return sum / float64(len(rows))
 }
+
+// ---------------------------------------------------------------------------
+// Per-source breadth (keyed by intent + repo + topic + source)
+//
+// The source bandit (sourcebandit.go) tunes one integer per
+// (intent, repo, topic, source) cell: how many docs that source
+// returns. Stored under heuristics:source:* so it never collides with
+// the codegraph Profile surface. Promotion/rollback is driven by the
+// bandit's in-memory samples; only the learned current value and its
+// frozen default are persisted (so learning survives restarts), plus a
+// small audit history.
+// ---------------------------------------------------------------------------
+
+const keySource = "heuristics:source"
+
+// SourceHistoryEntry records one breadth change for a source cell.
+type SourceHistoryEntry struct {
+	Timestamp int64  `json:"timestamp"`
+	Kind      string `json:"kind"` // "promote" | "rollback"
+	From      int    `json:"from"`
+	To        int    `json:"to"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+func (s *Store) sourceCurrentKey(intent, repo, topic, source string) string {
+	return fmt.Sprintf("%s:%s:%s:%s:%s:current", keySource, intent, repo, topic, source)
+}
+
+func (s *Store) sourceDefaultKey(intent, repo, topic, source string) string {
+	return fmt.Sprintf("%s:%s:%s:%s:%s:default", keySource, intent, repo, topic, source)
+}
+
+func (s *Store) sourceHistoryKey(intent, repo, topic, source string) string {
+	return fmt.Sprintf("%s:%s:%s:%s:%s:history", keySource, intent, repo, topic, source)
+}
+
+// CurrentSourceBreadth returns the learned doc breadth for a source
+// cell, self-seeding from seedDefault (the tool's configured MaxDocs)
+// on first access and recording it as the frozen rollback default.
+func (s *Store) CurrentSourceBreadth(ctx context.Context, intent, repo, topic, source string, seedDefault int) int {
+	seedDefault = clipSourceDocs(seedDefault)
+	key := s.sourceCurrentKey(intent, repo, topic, source)
+	val, err := s.rdb.Get(ctx, key).Result()
+	if err == redis.Nil {
+		_ = s.rdb.Set(ctx, key, seedDefault, 0).Err()
+		_ = s.rdb.SetNX(ctx, s.sourceDefaultKey(intent, repo, topic, source), seedDefault, 0).Err()
+		return seedDefault
+	}
+	if err != nil {
+		return seedDefault
+	}
+	n, e := strconv.Atoi(val)
+	if e != nil {
+		return seedDefault
+	}
+	return clipSourceDocs(n)
+}
+
+// SetSourceBreadth overwrites the learned breadth for a source cell.
+func (s *Store) SetSourceBreadth(ctx context.Context, intent, repo, topic, source string, val int) error {
+	return s.rdb.Set(ctx, s.sourceCurrentKey(intent, repo, topic, source), clipSourceDocs(val), 0).Err()
+}
+
+// LoadSourceDefault returns the frozen default breadth for a source
+// cell (the rollback target), falling back to the supplied value.
+func (s *Store) LoadSourceDefault(ctx context.Context, intent, repo, topic, source string, fallback int) int {
+	val, err := s.rdb.Get(ctx, s.sourceDefaultKey(intent, repo, topic, source)).Result()
+	if err != nil {
+		return clipSourceDocs(fallback)
+	}
+	n, e := strconv.Atoi(val)
+	if e != nil {
+		return clipSourceDocs(fallback)
+	}
+	return clipSourceDocs(n)
+}
+
+// AppendSourceHistory records a breadth change for a source cell
+// (newest first, capped).
+func (s *Store) AppendSourceHistory(ctx context.Context, intent, repo, topic, source string, entry SourceHistoryEntry) error {
+	if entry.Timestamp == 0 {
+		entry.Timestamp = time.Now().UnixMilli()
+	}
+	data, _ := json.Marshal(entry)
+	key := s.sourceHistoryKey(intent, repo, topic, source)
+	pipe := s.rdb.Pipeline()
+	pipe.LPush(ctx, key, data)
+	pipe.LTrim(ctx, key, 0, 49)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// SourceHistory returns the most recent breadth-change entries for a
+// source cell, newest first.
+func (s *Store) SourceHistory(ctx context.Context, intent, repo, topic, source string, n int) []SourceHistoryEntry {
+	if n <= 0 {
+		n = 10
+	}
+	items, err := s.rdb.LRange(ctx, s.sourceHistoryKey(intent, repo, topic, source), 0, int64(n-1)).Result()
+	if err != nil {
+		return nil
+	}
+	out := make([]SourceHistoryEntry, 0, len(items))
+	for _, raw := range items {
+		var h SourceHistoryEntry
+		if err := json.Unmarshal([]byte(raw), &h); err == nil {
+			out = append(out, h)
+		}
+	}
+	return out
+}

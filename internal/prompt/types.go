@@ -19,6 +19,7 @@ type DevPrompt struct {
 	Graph             *GraphLinks            `json:"graph,omitempty"`
 	ImpactRadius      []string               `json:"impact_radius,omitempty"`
 	CodeSnippets      []Snippet              `json:"code_snippets,omitempty"`
+	Documentation     []DocEntry             `json:"documentation,omitempty"`
 	ModelHint         *ModelHint             `json:"model_hint,omitempty"`
 	QueryPlan         *PlanDebug             `json:"query_plan,omitempty"`
 	RetrievalTrace    *RetrievalTrace        `json:"retrieval_trace,omitempty"` // debug/observability only
@@ -179,6 +180,20 @@ type Snippet struct {
 	Content string `json:"content"`
 }
 
+// DocEntry is one piece of external documentation / tracker context
+// returned by a non-code retrieval tool (cmdocs PageIndex docs, GitLab
+// issues/MRs, and later ClickUp tasks). It is deliberately generic so
+// every such tool shares one prompt channel (DevPrompt.Documentation),
+// grouped by Source. Code-bearing tools use CodeSnippets instead.
+type DocEntry struct {
+	Source     string `json:"source"`               // "cmdocs" | "gitlab" | ...
+	ID         string `json:"id,omitempty"`         // doc_id / issue iid / task id
+	Title      string `json:"title,omitempty"`      // doc/issue/task title
+	Collection string `json:"collection,omitempty"` // doc collection / project / list
+	URL        string `json:"url,omitempty"`        // canonical link when available
+	Content    string `json:"content"`              // section/issue/task body (capped)
+}
+
 // RetrievalTrace captures detailed observability data from each stage of the retrieval pipeline.
 // Used for debugging, measuring quality, and understanding why specific context was selected.
 type RetrievalTrace struct {
@@ -237,6 +252,18 @@ type RetrievalTrace struct {
 	RerankStage  *StageTrace `json:"rerank_stage,omitempty"`
 	PackingStage *StageTrace `json:"packing_stage,omitempty"`
 
+	// ToolStages holds one StageTrace per external retrieval tool that
+	// ran in the parallel fan-out (cmdocs, gitlab, …), keyed by the
+	// source Name(). Records latency, docs returned, and any non-fatal
+	// error so a slow/failing tool is visible without blocking the query.
+	ToolStages map[string]*StageTrace `json:"tool_stages,omitempty"`
+
+	// SourceExplore records which external source the per-source breadth
+	// bandit sampled on this query (and at what breadth), so dev_feedback
+	// and repeat-detection can route the reward to that (intent, repo,
+	// topic, source) cell. Nil when no source explored.
+	SourceExplore *SourceExploreRec `json:"source_explore,omitempty"`
+
 	FinalTokens    int   `json:"final_tokens"`
 	TotalLatencyMs int64 `json:"total_latency_ms"`
 
@@ -248,6 +275,15 @@ type RetrievalTrace struct {
 	// later by dev_feedback or repeat-detection. This is what makes
 	// dashboards, replay, regression, and per-knob attribution trivial.
 	Outcome *RetrievalOutcome `json:"outcome,omitempty"`
+}
+
+// SourceExploreRec is the trace-side mirror of the source-breadth
+// bandit's explore record: the source sampled this query, the served
+// breadth (Val), and the cell's current best (Base).
+type SourceExploreRec struct {
+	Source string `json:"source"`
+	Val    int    `json:"val"`
+	Base   int    `json:"base"`
 }
 
 // RetrievalOutcome is the per-query joined "span" record. Filled in two
@@ -265,6 +301,7 @@ type RetrievalOutcome struct {
 	FilesReturned      int     `json:"files_returned"`
 	SymbolsReturned    int     `json:"symbols_returned"`
 	SnippetsReturned   int     `json:"snippets_returned"`
+	DocsReturned       int     `json:"docs_returned,omitempty"`
 	TrimmedFiles       int     `json:"trimmed_files"`
 	BudgetUsedFraction float64 `json:"budget_used_fraction"`
 	LatencyMs          int     `json:"latency_ms"`
@@ -282,16 +319,16 @@ type RetrievalOutcome struct {
 
 // StageTrace captures metrics and descriptions for a single stage of retrieval.
 type StageTrace struct {
-	LatencyMs   int64                  `json:"latency_ms"`
-	Description string                 `json:"description,omitempty"`
+	LatencyMs   int64  `json:"latency_ms"`
+	Description string `json:"description,omitempty"`
 
 	// Numeric results from this stage
-	CandidatesIn  int                  `json:"candidates_in,omitempty"`  // how many we started with
-	CandidatesOut int                  `json:"candidates_out,omitempty"` // how many passed this stage
+	CandidatesIn  int `json:"candidates_in,omitempty"`  // how many we started with
+	CandidatesOut int `json:"candidates_out,omitempty"` // how many passed this stage
 
 	// Stage-specific details
-	Details     map[string]interface{} `json:"details,omitempty"`
+	Details map[string]interface{} `json:"details,omitempty"`
 
 	// Any errors that occurred but didn't block (degradation)
-	Warnings    []string               `json:"warnings,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
 }

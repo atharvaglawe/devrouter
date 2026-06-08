@@ -15,6 +15,25 @@ EMBEDDER_IMAGE  := devrouter-embedder:latest
 EMBEDDER_PORT   ?= 11435
 EMBEDDER_URL    := http://localhost:$(EMBEDDER_PORT)
 
+# ── External retrieval tools ────────────────────────────────────────
+# cmdocs (PageIndex documentation search) is ON by default in this flow:
+# `make up` starts its FastAPI sidecar and `make run` wires devrouter to
+# it when reachable. Point CMDOCS_DIR at your cmdocs checkout; override
+# CMDOCS_PYTHON if the venv lives elsewhere. Disable with CMDOCS_URL= .
+CMDOCS_DIR     ?= $(abspath ../cmdocs)
+CMDOCS_PORT    ?= 8099
+CMDOCS_PYTHON  ?= $(CMDOCS_DIR)/PageIndex/.venv/bin/python
+CMDOCS_HEALTH  := http://127.0.0.1:$(CMDOCS_PORT)/healthz
+CMDOCS_URL     ?= http://127.0.0.1:$(CMDOCS_PORT)/search
+
+# GitLab issues/MRs source — OFF unless both are set (PAT-based MCP).
+GITLAB_MCP_URL ?=
+GITLAB_TOKEN   ?=
+
+# Include the verbose retrieval_trace block in dev_context responses.
+# Empty = on (devrouter default); set RETRIEVAL_TRACE=off to omit it.
+RETRIEVAL_TRACE ?=
+
 # ── Node resolver (vendored codegraph needs Node >= 20) ──────────────
 # Resolution order:
 #   1. $NODE / $DEVROUTER_NODE   — explicit override
@@ -43,7 +62,7 @@ require-node:
 		exit 1; \
 	fi
 
-.PHONY: all build deps up down status redis codegraph clean require-node \
+.PHONY: all build deps up down status redis codegraph cmdocs clean require-node \
         codegraph-install codegraph-build codegraph-serve codegraph-analyze codegraph-migrate \
         embedder-deps embedder-fetch-model embedder-build-local embedder-test \
         embedder-build embedder-up embedder-down embedder-status embedder-logs \
@@ -93,10 +112,11 @@ up: deps
 	@echo "  Redis:     $(REDIS_ADDR)"
 	@echo "  Embedder:  $(EMBEDDER_URL)/api/embed"
 	@echo "  Codegraph: $(CODEGRAPH_URL)"
+	@echo "  cmdocs:    $(CMDOCS_HEALTH)"
 	@echo ""
 	@echo "To start devrouter MCP:  make run"
 
-deps: redis embedder-up codegraph build
+deps: redis embedder-up codegraph cmdocs build
 
 # ── Stop everything ─────────────────────────────────────────
 down:
@@ -106,6 +126,8 @@ down:
 	-@cd $(EMBEDDER_DIR) && docker compose down 2>/dev/null || true
 	@echo "Stopping Codegraph..."
 	-@pkill -f "codegraph.*serve" 2>/dev/null || true
+	@echo "Stopping cmdocs sidecar..."
+	-@pkill -f "uvicorn server:app" 2>/dev/null || true
 	@echo "Done."
 
 # ── Service health ──────────────────────────────────────────
@@ -113,6 +135,7 @@ status:
 	@printf "Redis:     " && (redis-cli ping 2>/dev/null || echo "DOWN")
 	@printf "Embedder:  " && (curl -sf $(EMBEDDER_URL)/api/health >/dev/null && echo "PONG" || echo "DOWN")
 	@printf "Codegraph: " && (curl -sf $(CODEGRAPH_URL)/api/repos >/dev/null && echo "PONG" || echo "DOWN")
+	@printf "cmdocs:    " && (curl -sf $(CMDOCS_HEALTH) >/dev/null && echo "PONG" || echo "DOWN (optional)")
 	@printf "Memories:  " && echo "total=$$(redis-cli KEYS 'mem:*' 2>/dev/null | grep -v '^$$' | wc -l | tr -d ' ')"
 	@echo "  Repos:" && redis-cli KEYS 'mem:*' 2>/dev/null | grep -v '^$$' | sed 's/^mem:\([^:]*\):.*/\1/' | sort -u | while read repo; do \
 		files=$$(redis-cli KEYS "mem:$$repo:file:*" 2>/dev/null | wc -l | tr -d ' '); \
@@ -155,16 +178,53 @@ codegraph: require-node
 		fi; \
 	fi
 
+# cmdocs FastAPI sidecar — the documentation retrieval source. OPTIONAL
+# and NON-FATAL: if the repo/venv/port aren't available it warns and
+# continues so the core stack still comes up. devrouter only queries
+# cmdocs when the sidecar is reachable (see the `run` target's gate).
+cmdocs:
+	@if curl -sf $(CMDOCS_HEALTH) >/dev/null 2>&1; then \
+		echo "cmdocs already running on port $(CMDOCS_PORT)"; \
+	elif [ -z "$(CMDOCS_URL)" ]; then \
+		echo "cmdocs disabled (CMDOCS_URL empty)"; \
+	elif [ ! -d "$(CMDOCS_DIR)" ]; then \
+		echo "cmdocs: repo not found at $(CMDOCS_DIR) — skipping (set CMDOCS_DIR=/path/to/cmdocs)"; \
+	elif [ ! -x "$(CMDOCS_PYTHON)" ]; then \
+		echo "cmdocs: python not found at $(CMDOCS_PYTHON) — skipping (run: $(CMDOCS_PYTHON) -m pip install -r $(CMDOCS_DIR)/requirements-sidecar.txt)"; \
+	else \
+		echo "Starting cmdocs sidecar on port $(CMDOCS_PORT) (dir: $(CMDOCS_DIR))..."; \
+		cd $(CMDOCS_DIR) && nohup $(CMDOCS_PYTHON) -m uvicorn server:app --host 127.0.0.1 --port $(CMDOCS_PORT) >/tmp/devrouter-cmdocs.log 2>&1 & \
+		for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+			curl -sf $(CMDOCS_HEALTH) >/dev/null 2>&1 && break; \
+			sleep 1; \
+		done; \
+		if curl -sf $(CMDOCS_HEALTH) >/dev/null 2>&1; then \
+			echo "cmdocs ready (logs: /tmp/devrouter-cmdocs.log)"; \
+		else \
+			echo "cmdocs failed to start within 15s — continuing without it (logs: /tmp/devrouter-cmdocs.log)"; \
+		fi; \
+	fi
+
 # ── Run devrouter ───────────────────────────────────────────
 # Both targets start the same daemon (MCP server on stdio + HTTP
 # dashboard on DASHBOARD_ADDR). `make dashboard` is a discoverable alias.
 # Disable the dashboard by overriding: make run DASHBOARD_ADDR=off
 run dashboard: build
 	@echo "Dashboard: http://$(DASHBOARD_ADDR)"
+	@CMDOCS=""; \
+	if [ -n "$(CMDOCS_URL)" ] && curl -sf $(CMDOCS_HEALTH) >/dev/null 2>&1; then \
+		CMDOCS="$(CMDOCS_URL)"; echo "cmdocs:    $(CMDOCS_URL)"; \
+	else \
+		echo "cmdocs:    (sidecar not reachable — documentation disabled; run 'make cmdocs')"; \
+	fi; \
 	DEVROUTER_REDIS=$(REDIS_ADDR) \
 	CODEGRAPH_URL=$(CODEGRAPH_URL) \
 	DEVROUTER_EMBEDDING_URL=$(EMBEDDER_URL)/api/embed \
 	DEVROUTER_DASHBOARD_ADDR=$(DASHBOARD_ADDR) \
+	DEVROUTER_CMDOCS_URL=$$CMDOCS \
+	DEVROUTER_GITLAB_MCP_URL=$(GITLAB_MCP_URL) \
+	DEVROUTER_GITLAB_TOKEN=$(GITLAB_TOKEN) \
+	DEVROUTER_RETRIEVAL_TRACE=$(RETRIEVAL_TRACE) \
 	./$(BINARY)
 
 # ── Embedder ────────────────────────────────────────────────

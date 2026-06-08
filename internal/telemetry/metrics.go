@@ -20,24 +20,24 @@ var (
 	// registry on first access via ensureRegistry(). This keeps the
 	// usage pattern simple (telemetry.MCPRequests.WithLabelValues(...).Inc())
 	// while letting tests reset everything between cases.
-	MCPRequests         *prometheus.CounterVec
-	MCPRequestDuration  *prometheus.HistogramVec
-	MCPSessionsTotal    prometheus.Counter
-	MCPSessionDuration  prometheus.Histogram
-	MCPSessionsActive   prometheus.Gauge
+	MCPRequests        *prometheus.CounterVec
+	MCPRequestDuration *prometheus.HistogramVec
+	MCPSessionsTotal   prometheus.Counter
+	MCPSessionDuration prometheus.Histogram
+	MCPSessionsActive  prometheus.Gauge
 
-	QueryTotal          *prometheus.CounterVec
-	QueryDuration       *prometheus.HistogramVec
-	StageDuration       *prometheus.HistogramVec
-	PromptTokens        *prometheus.HistogramVec
-	BudgetUsedFraction  *prometheus.HistogramVec
-	FilesReturned       *prometheus.HistogramVec
-	TrimmedFiles        *prometheus.HistogramVec
-	RelevanceGateDrops  *prometheus.CounterVec
-	AutoAnchorTotal     *prometheus.CounterVec
-	RepeatQueryTotal    *prometheus.CounterVec
-	FallbackTotal       *prometheus.CounterVec
-	SanitizePlanDrops   *prometheus.CounterVec
+	QueryTotal         *prometheus.CounterVec
+	QueryDuration      *prometheus.HistogramVec
+	StageDuration      *prometheus.HistogramVec
+	PromptTokens       *prometheus.HistogramVec
+	BudgetUsedFraction *prometheus.HistogramVec
+	FilesReturned      *prometheus.HistogramVec
+	TrimmedFiles       *prometheus.HistogramVec
+	RelevanceGateDrops *prometheus.CounterVec
+	AutoAnchorTotal    *prometheus.CounterVec
+	RepeatQueryTotal   *prometheus.CounterVec
+	FallbackTotal      *prometheus.CounterVec
+	SanitizePlanDrops  *prometheus.CounterVec
 
 	FeedbackTotal           *prometheus.CounterVec
 	FeedbackRawReward       *prometheus.HistogramVec
@@ -48,6 +48,11 @@ var (
 	CodegraphRequests        *prometheus.CounterVec
 	CodegraphRequestDuration *prometheus.HistogramVec
 	CodegraphInflight        *prometheus.GaugeVec
+
+	// SourceRequests counts external retrieval-tool calls (cmdocs,
+	// gitlab, …) labeled by source name and outcome. Tool names are a
+	// small fixed set, so cardinality stays bounded.
+	SourceRequests *prometheus.CounterVec
 
 	EmbedderRequests        *prometheus.CounterVec
 	EmbedderRequestDuration prometheus.Histogram
@@ -61,6 +66,12 @@ var (
 	HeuristicsDiscards      *prometheus.CounterVec
 	HeuristicsRewardSamples *prometheus.CounterVec
 	HeuristicsFrozen        prometheus.Gauge
+
+	// SourceDocs* track the per-source breadth bandit (section 5),
+	// labeled by source name.
+	SourceDocsPromotions *prometheus.CounterVec
+	SourceDocsRollbacks  *prometheus.CounterVec
+	SourceDocsDiscards   *prometheus.CounterVec
 
 	AnchorExplorations  prometheus.Counter
 	AnchorObservations  *prometheus.CounterVec
@@ -90,10 +101,10 @@ var (
 	// most are seconds, some are hours. Logarithmic.
 	sessionBucketsSeconds = prometheus.ExponentialBuckets(1, 4, 8) // 1s .. ~16k s (~4.5h)
 
-	tokenBuckets        = []float64{500, 1000, 2000, 4000, 8000, 16000, 32000, 64000}
-	fractionBuckets     = []float64{0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
-	smallCountBuckets   = []float64{0, 1, 2, 4, 8, 16, 32, 64, 128}
-	rewardBuckets       = []float64{-2, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 2}
+	tokenBuckets      = []float64{500, 1000, 2000, 4000, 8000, 16000, 32000, 64000}
+	fractionBuckets   = []float64{0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
+	smallCountBuckets = []float64{0, 1, 2, 4, 8, 16, 32, 64, 128}
+	rewardBuckets     = []float64{-2, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 2}
 )
 
 // init eagerly materialises the registry the moment any package
@@ -279,6 +290,12 @@ func buildRegistry() {
 
 	// ---- Codegraph client ------------------------------------------
 
+	SourceRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: "retrieval",
+		Name: "source_requests_total",
+		Help: "External retrieval-tool calls, labeled by source name and outcome (ok|error).",
+	}, []string{"source", "status"})
+
 	CodegraphRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: "codegraph",
 		Name: "requests_total",
@@ -348,6 +365,24 @@ func buildRegistry() {
 		Help: "Bandit rollbacks to the frozen default profile.",
 	}, []string{"intent"})
 
+	SourceDocsPromotions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: "heuristics",
+		Name: "source_docs_promotions_total",
+		Help: "Per-source breadth-bandit promotions, labeled by source.",
+	}, []string{"source"})
+
+	SourceDocsRollbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: "heuristics",
+		Name: "source_docs_rollbacks_total",
+		Help: "Per-source breadth-bandit rollbacks to default, labeled by source.",
+	}, []string{"source"})
+
+	SourceDocsDiscards = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: "heuristics",
+		Name: "source_docs_discards_total",
+		Help: "Per-source breadth-bandit candidates discarded for no lift, labeled by source.",
+	}, []string{"source"})
+
 	HeuristicsDiscards = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: "heuristics",
 		Name: "discards_total",
@@ -400,10 +435,11 @@ func buildRegistry() {
 		FilesReturned, TrimmedFiles, RelevanceGateDrops, AutoAnchorTotal, RepeatQueryTotal,
 		FallbackTotal, SanitizePlanDrops,
 		FeedbackTotal, FeedbackRawReward, FeedbackAdjustedReward, FeedbackAdditionalFiles, FeedbackFPRecorded,
-		CodegraphRequests, CodegraphRequestDuration, CodegraphInflight,
+		CodegraphRequests, CodegraphRequestDuration, CodegraphInflight, SourceRequests,
 		EmbedderRequests, EmbedderRequestDuration, EmbedderDimMismatch,
 		RedisCommands, RedisCommandDuration,
 		HeuristicsPromotions, HeuristicsRollbacks, HeuristicsDiscards, HeuristicsRewardSamples, HeuristicsFrozen,
+		SourceDocsPromotions, SourceDocsRollbacks, SourceDocsDiscards,
 		AnchorExplorations, AnchorObservations, AnchorProbeFailures,
 		BuildInfo,
 	)
