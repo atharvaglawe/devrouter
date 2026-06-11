@@ -1,7 +1,0 @@
-origins:
-  cmserving:
-    protocol: http
-    host: cm.internal
-    port: "80"
-    path: /
-    renderer: "/scrr.php"

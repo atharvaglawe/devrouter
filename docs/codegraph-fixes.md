@@ -1,5 +1,27 @@
 # codegraph fixes — extractor + structural-edge work
 
+> **Historical — describes the previous (GitNexus fork) engine.**
+> DevRouter now vendors the MIT-licensed `colbymchenry/codegraph` engine
+> (see [`codegraph/MIGRATION.md`](../codegraph/MIGRATION.md)); the custom
+> extractor patches below were **not** ported — the MIT engine ships its
+> own extraction/resolution pipeline. How the four strands map onto the
+> new engine:
+>
+> 1. **API-endpoint / route extraction** — provided natively but
+>    **framework-dependent** (the engine's resolvers detect Gin, Laravel,
+>    etc.); generic in-house HTTP wrappers may not be recognised. Best
+>    re-validated per repo.
+> 2. **Provider / config-tag resolution** (runtime URL recovery) — **not**
+>    carried over; the MIT engine has no equivalent config-tag matcher.
+> 3. **Structural IMPLEMENTS for Go/TS** — **covered natively** (the
+>    engine's `goImplementsEdges` synthesises Go implicit `implements` by
+>    method-set matching; validated on real repos).
+> 4. **Go switch-case constant ACCESSES edges** — call edges inside
+>    switch/type-switch branches are captured; the dedicated *constant*
+>    ACCESSES edge from a `case` arm is **not** specifically reproduced.
+>
+> The rest of this file is retained for historical context only.
+
 This doc summarises the codegraph improvements that landed in the
 working tree on top of the initial commit. Four independent but
 related strands:

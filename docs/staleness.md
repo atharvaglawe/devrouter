@@ -8,7 +8,7 @@ and retrieval paths.
 | Surface | When it runs | Compared against | Action on mismatch |
 |---------|--------------|------------------|--------------------|
 | Memory git-blob-hash drift | Every memory hit at retrieval time | The blob hash recorded at save time | Damp the entry's confidence ×0.6 and flag `stale: true` |
-| Codegraph index commit drift | `codegraph status` and at the top of every `analyze` | Repo's current `HEAD` commit vs `repo.meta.lastCommit` | Print `⚠️ stale (re-run codegraph analyze)`; full rebuild on `analyze` (with embedding cache reuse) |
+| Codegraph index recency | `./devrouter analyze` / `list` | Registry `indexedAt` timestamp vs your judgement of repo churn | Re-run `analyze` to rebuild the per-repo SQLite index (always a full, fast rebuild — no embedding pass) |
 | Release-branch scope diff | Every memory save | The configured release ref (`DEVROUTER_RELEASE_BRANCH`, default `origin/release`) for the referenced file(s) | Pin the new memory to the current branch (`scope=<branch>`) instead of `global` |
 
 ## Memory git-blob-hash drift — retrieve-time check
@@ -80,38 +80,25 @@ on `FlowMemory`), so flow staleness is currently unreachable. Flows
 *do* get correct branch scoping via the release-diff path below,
 which walks every file in the comma-separated list.
 
-## Codegraph index commit drift — analyze-time check
+## Codegraph index recency — analyze-time rebuild
 
-The codegraph CLI persists the indexed commit in `repo.meta.lastCommit`
-when `analyze` finishes successfully. `runFullAnalysis` short-circuits
-when the commit hasn't moved (`codegraph/src/core/run-analyze.ts:139`):
+> **Engine change (MIT codegraph migration).** The previous engine
+> persisted the indexed commit in `repo.meta.lastCommit` and
+> short-circuited `analyze` when the commit hadn't moved, with an ONNX
+> embedding-cache reuse to keep rebuilds cheap. The current MIT engine
+> does **not** track a commit or embeddings: `analyze` (which shells out
+> to the sidecar `index` command) always performs a **full** index of
+> the repo into `<repo>/.codegraph/codegraph.db` and records an
+> `indexedAt` timestamp in `~/.codegraph/registry.json`.
 
-```typescript
-if (existingMeta && !options.force && existingMeta.lastCommit === currentCommit) {
-  if (currentCommit !== '') {
-    return { …, alreadyUpToDate: true };
-  }
-}
-```
-
-`codegraph status` does the same comparison for human consumption
-(`codegraph/src/cli/status.ts:34`):
-
-```typescript
-const isUpToDate = currentCommit === repo.meta.lastCommit;
-```
-
-When commits diverge the rebuild is full (no per-file incremental
-graph merge yet), but two mitigations keep this cheap:
-
-- **Embedding cache reuse** — before tearing down the old DB,
-  `runFullAnalysis` snapshots `(nodeId, embedding)` pairs from
-  `CodeEmbedding`. Nodes whose IDs survive the rebuild reuse their
-  embedding, so the expensive ONNX pass only re-embeds renamed /
-  signature-changed symbols.
-- **Non-git repos rebuild every analyze** — with no commit to
-  compare, the early-return is skipped. Intentional, because we
-  can't safely detect "no changes" without a commit ref.
+A full re-index is fast because there's no embedding pass — parsing +
+SQLite write only (e.g. a ~7.4k-file Go monorepo indexes in ~70s; a
+mid-size repo in a few seconds). Re-run `./devrouter analyze
+/path/to/repo` after substantial changes (large refactors, package
+moves, new languages). There is no per-file incremental merge yet, and
+no commit-based "already up to date" early-return — every `analyze`
+rebuilds. The memory-side staleness checks below are independent of the
+codegraph index and continue to run on every save/retrieve.
 
 ## Release-branch scope diff — save-time check
 

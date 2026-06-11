@@ -160,14 +160,21 @@ For the architecture and dials, see
 
 ## How to reproduce
 
+> **Note.** The published figures below were measured on the previous
+> (GitNexus, semantic-capable) codegraph engine. DevRouter now vendors
+> the MIT engine, which is lexical (FTS5/BM25) + structural with no
+> symbol vector index — so re-running today exercises a different search
+> path and absolute numbers will shift. See
+> [`codegraph/MIGRATION.md`](../codegraph/MIGRATION.md).
+
 ```bash
 # 0. one-time setup
 make up                                              # Redis + embedder + codegraph
 
-# 1. index the three repos with embeddings on
-./devrouter analyze --embeddings /path/to/goserving
-./devrouter analyze --embeddings /path/to/mall
-./devrouter analyze --embeddings /path/to/airflow/airflow-core --skip-git
+# 1. index the three repos (lexical + structural; no embedding pass)
+./devrouter analyze /path/to/goserving
+./devrouter analyze /path/to/mall
+./devrouter analyze /path/to/airflow/airflow-core --skip-git
 
 # 2. run the bench (each takes 1–10 min depending on repo size)
 python3 bench/runner.py \

@@ -63,15 +63,15 @@ make all                                                # build ./devrouter + co
 make up                                                 # start Redis + embedder container + codegraph (idempotent)
 make status                                             # verify all services are PONG
 
-./devrouter analyze --embeddings /abs/path/to/your-repo # index each repo (required; re-run on major refactors)
+./devrouter analyze /abs/path/to/your-repo              # index each repo (required; re-run on major refactors)
 ```
 
-`--embeddings` builds a local HNSW vector index over symbol content
-for semantic fallback retrieval — adds ~2–5× to index time per file,
-no extra cost at query time, and worth keeping on for any repo larger
-than a few hundred files. It needs no API keys; embeddings are
-generated locally by the bundled ONNX runner. Drop the flag if you
-want BM25 + graph only.
+Indexing parses the repo with tree-sitter and builds a per-repo SQLite
+graph (`<repo>/.codegraph/codegraph.db`) with an FTS5 lexical index —
+no API keys, no embedding pass, fast to (re)build. Code search is
+FTS5/BM25 + graph traversal; the codegraph engine has no symbol vector
+index. (DevRouter still uses its own local embedder for *memory* and
+query-similarity — that's separate; see [`architecture.md`](docs/architecture.md).)
 
 ### 2. Wire it into your agent
 

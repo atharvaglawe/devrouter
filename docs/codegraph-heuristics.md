@@ -1,7 +1,7 @@
 # Codegraph heuristics — shaping raw index output into useful context
 
 `codegraph` returns three kinds of raw output: a list of search hits
-(BM25 / semantic / hybrid), a graph of symbols and edges, and a set of
+(lexical — FTS5/BM25), a graph of symbols and edges, and a set of
 file-content slices. None of that is useful to an agent on its own —
 the search returns 50 hits where you want 10, the graph fans out into
 hubs that dominate the response, and the file slices duplicate the
@@ -20,17 +20,26 @@ change here has a measured before/after.
 
 ## 1. Intent-aware search mode routing
 
-**Problem.** Codegraph exposes three search modes —
-[`bm25`](codegraph.md#search), `semantic` (HNSW vector), and `hybrid`
-(weighted combination). Hybrid is the safest default but it's not the
-best for every query intent. `trace` queries want call-chain neighbours
-that lexical BM25 misses; `refactor` queries want exact-symbol matches
-that semantic over-smooths.
+> **Engine change (MIT codegraph migration).** The current engine is
+> **lexical-only** (FTS5/BM25 + structural); it has no HNSW/vector index.
+> [`SearchModeForIntent`](../internal/codegraph/client.go) is kept for
+> source compatibility but now resolves every intent to a lexical search
+> (`semantic` remaps to `hybrid`). The intent→mode calibration below is
+> retained as **historical rationale** from the previous
+> (GitNexus, semantic-capable) engine; it no longer changes wire behaviour
+> and is the natural place to re-introduce vector routing if an embeddings
+> layer is later added to the sidecar.
 
-**Fix.** [`SearchModeForIntent`](../internal/codegraph/client.go) maps
-each of the five DevRouter intents to its best-on-bench mode:
+**Problem (historical).** The previous engine exposed three search modes —
+`bm25`, `semantic` (HNSW vector), and `hybrid` (weighted combination).
+Hybrid was the safest default but not best for every intent: `trace`
+queries want call-chain neighbours that lexical BM25 misses; `refactor`
+queries want exact-symbol matches that semantic over-smooths.
 
-| Intent | Best mode | Why |
+**Then-fix.** [`SearchModeForIntent`](../internal/codegraph/client.go)
+mapped each of the five DevRouter intents to its best-on-bench mode:
+
+| Intent | Best mode (historical) | Why |
 |---|---|---|
 | `debug` | hybrid | Tied with semantic; hybrid is safer fallback. |
 | `explore` | hybrid | Same. |
@@ -38,8 +47,9 @@ each of the five DevRouter intents to its best-on-bench mode:
 | `refactor` | bm25 | Already ~1.0 on hybrid; bm25 keeps it there and saves embedding cost. |
 | `trace` | semantic | +0.229 R@5 — call-chain questions benefit from cross-file semantic matches BM25 can't see. |
 
-Calibrated on the goserving 30-question bench (2026-05-14). Unknown
-intents fall back to `hybrid` — never the worst, never the best.
+Calibrated on the goserving 30-question bench (2026-05-14). With the
+lexical-only engine these all collapse to the same lexical search;
+unknown intents still fall back to `hybrid`.
 
 ## 2. File-path snippet deduplication
 
@@ -86,11 +96,11 @@ uses, so we don't over-prune on incidental substrings.
 ## 4. Anchor injection (static + bandit-learned)
 
 **Problem.** Some files are so universally relevant on certain query
-shapes that they should be retrieved even when neither BM25 nor
-semantic search puts them in the top K. Example: a question about
+shapes that they should be retrieved even when lexical (FTS5/BM25)
+search doesn't put them in the top K. Example: a question about
 "how is JWT validated" in a Spring Boot repo almost always wants the
 module's `application.yml` even though `.yml` rarely outranks `.java`
-on either lexical or vector match.
+on a term-overlap match.
 
 **Fix.** Two-tier anchor injection in
 [`injectQueryAnchors`](../internal/router/router.go#L2395):
@@ -137,22 +147,23 @@ queries concurrently. Used in three places in
 DevRouter p50 latency on goserving fell from 2,495 ms to 785 ms — a
 3.2× speedup with no recall trade-off.
 
-## 6. UpstreamChain replacement
+## 6. UpstreamChain
 
-**Problem.** The original
+**Problem (historical).** On the previous engine,
 [`UpstreamChain`](../internal/codegraph/client.go) was a single 2-hop
-Cypher query: *"find all callers of caller of seed"*. LadybugDB
-executed this as a serial join — ~380 ms per call, called once per
-traced symbol.
+Cypher query (*"find all callers of caller of seed"*) that LadybugDB
+executed as a serial join — ~380 ms per call, once per traced symbol.
+An interim DevRouter fix split it into two parallel 1-hop
+`CallersWithPath` batches.
 
-**Fix.** Replaced with two parallel 1-hop `CallersWithPath` calls:
-collect direct callers in batch 1, then run `CallersWithPath` against
-each unique parent in batch 2. Both batches use
-[`parallelDo`](../internal/router/parallel.go). See
-[router.go ~lines 746–795](../internal/router/router.go#L746).
+**Now.** With the MIT engine there is no Cypher; the 2-hop upstream
+traversal is a purpose-built sidecar endpoint,
+[`/api/graph/upstream`](../codegraph/lib/handlers.js), computed in SQL
+over the SQLite graph. `UpstreamChain` is a single call to it — the
+fan-out moved server-side, so the Go client stays one round-trip.
 
-**Impact.** ~380 ms → ~7 ms per call. The single biggest contributor
-to the p50 latency drop.
+**Impact.** Keeps the original ~380 ms → single-digit-ms win without the
+client-side batching machinery.
 
 ## 7. `include_source` for token honesty
 
@@ -174,36 +185,18 @@ this flag by default
 is now charged for *content actually opened*, not just *paths
 returned*.
 
-## 8. Vector-index reliability (codegraph side)
+## 8. Vector-index reliability (codegraph side) — *obsolete*
 
-**Problem.** Two silent-failure paths in
-[`codegraph/src/core/lbug/lbug-adapter.ts`](../codegraph/src/core/lbug/lbug-adapter.ts)
-and
-[`codegraph/src/core/embeddings/embedding-pipeline.ts`](../codegraph/src/core/embeddings/embedding-pipeline.ts):
-
-1. `loadVectorExtension` previously `console.error`'d on a genuine
-   `LOAD EXTENSION VECTOR` failure and fell through without throwing,
-   leaving every subsequent `CREATE_VECTOR_INDEX` and
-   `QUERY_VECTOR_INDEX` to silently no-op.
-2. The post-create verification probed `row['index name']` (with a
-   space) and `row.tableName` (camelCase). LadybugDB actually
-   returns `row.index_name` and `row.table_name` (snake_case). The
-   verify always failed to find the index — even when the index had
-   been created successfully — and the analyzer would shoot itself
-   with `"CREATE_VECTOR_INDEX returned without error but the index
-   was not registered"` on every run.
-
-**Fix.** `loadVectorExtension` now throws on non-benign load
-failures. The verify probes the correct snake_case column names with
-the older variants kept as fallbacks. Both branches preserve the
-"already loaded / already exists" benign path so re-indexes don't
-trip them.
-
-**Impact.** Without this, the airflow benchmark could not be run at
-all — every analyze attempt with `--embeddings` would fail. With it,
-mall, goserving, and airflow all index cleanly and the live
-[`SHOW_INDEXES()` snapshot](../bench/results/airflow-postfix-n30/report.md)
-shows the HNSW index registered on every repo.
+> **Removed with the MIT codegraph migration.** This section documented
+> fixes to the previous engine's LadybugDB vector extension and ONNX
+> embedding pipeline (`--embeddings`, HNSW symbol index). The current
+> MIT engine has **no vector index** — code search is FTS5/BM25 +
+> structural only — so those failure paths and the referenced source
+> files (`lbug-adapter.ts`, `embedding-pipeline.ts`) no longer exist.
+> Kept as a heading for section-number stability; see
+> [`codegraph/MIGRATION.md`](../codegraph/MIGRATION.md) for what changed.
+> (DevRouter's *memory* vector search via Redis + the local embedder is
+> unaffected — that's a separate subsystem.)
 
 ## Putting it together — the retrieval pipeline
 
