@@ -81,8 +81,11 @@ clean:
 # ── Codegraph (vendored Node subtree) ────────────────────────
 
 codegraph-install: require-node
-	cd $(CODEGRAPH_DIR) && $(NPM) install --no-audit --no-fund --legacy-peer-deps
+	cd $(CODEGRAPH_DIR) && $(NPM) install --no-audit --no-fund
 
+# Compile the vendored MIT engine (TypeScript -> dist/) and copy its WASM
+# grammars + schema. The thin sidecar (bin/ + lib/) is plain JS and imports
+# the compiled engine from dist/.
 codegraph-build: require-node
 	@if [ ! -d $(CODEGRAPH_DIR)/node_modules ]; then \
 		$(MAKE) codegraph-install; \
@@ -90,20 +93,23 @@ codegraph-build: require-node
 	cd $(CODEGRAPH_DIR) && $(NPM) run build
 
 codegraph-serve: codegraph-build
-	cd $(CODEGRAPH_DIR) && $(NODE) dist/cli/index.js serve --port $(CODEGRAPH_PORT)
+	cd $(CODEGRAPH_DIR) && $(NODE) bin/codegraph-sidecar.js serve --port $(CODEGRAPH_PORT)
 
 codegraph-analyze: codegraph-build
-	@if [ -z "$(REPO)" ]; then echo "Usage: make codegraph-analyze REPO=/path/to/repo"; exit 1; fi
-	cd $(CODEGRAPH_DIR) && $(NODE) dist/cli/index.js analyze $(REPO)
+	@if [ -z "$(REPO)" ]; then echo "Usage: make codegraph-analyze REPO=/path/to/repo [NAME=reponame]"; exit 1; fi
+	cd $(CODEGRAPH_DIR) && $(NODE) bin/codegraph-sidecar.js index $(REPO) $(if $(NAME),--name $(NAME),)
 
-# One-shot migration of legacy gitnexus on-disk paths -> codegraph names.
-# Safe to run repeatedly; skips already-migrated entries.
-codegraph-migrate: require-node
-	@if [ ! -f $(CODEGRAPH_DIR)/scripts/migrate-from-gitnexus.js ]; then \
-		echo "Migration script not found at $(CODEGRAPH_DIR)/scripts/migrate-from-gitnexus.js"; \
-		exit 1; \
-	fi
-	$(NODE) $(CODEGRAPH_DIR)/scripts/migrate-from-gitnexus.js
+# Migration from the old GitNexus (LadybugDB) engine to the MIT (SQLite)
+# engine is a re-index: the on-disk store format changed, so every repo must
+# be rebuilt. This target lists the registered repos so you can re-run
+# `make codegraph-analyze REPO=...` for each.
+codegraph-migrate: codegraph-build
+	@echo "The MIT codegraph engine uses a different on-disk store (SQLite, not"
+	@echo "LadybugDB). Repos indexed by the old engine must be re-indexed:"
+	@echo ""
+	@cd $(CODEGRAPH_DIR) && $(NODE) bin/codegraph-sidecar.js repos 2>/dev/null || echo "  (no registry yet)"
+	@echo ""
+	@echo "For each repo above run: make codegraph-analyze REPO=<path> NAME=<name>"
 
 # ── Start everything ────────────────────────────────────────
 up: deps
@@ -159,12 +165,12 @@ codegraph: require-node
 	@if curl -sf $(CODEGRAPH_URL)/api/repos >/dev/null 2>&1; then \
 		echo "Codegraph already running on $(CODEGRAPH_URL)"; \
 	else \
-		if [ ! -f $(CODEGRAPH_DIR)/dist/cli/index.js ]; then \
-			echo "Building in-tree codegraph..."; \
+		if [ ! -f $(CODEGRAPH_DIR)/dist/index.js ]; then \
+			echo "Building vendored codegraph engine..."; \
 			$(MAKE) codegraph-build; \
 		fi; \
-		echo "Starting in-tree codegraph on $(CODEGRAPH_URL) (node: $(NODE))..."; \
-		cd $(CODEGRAPH_DIR) && nohup $(NODE) dist/cli/index.js serve --port $(CODEGRAPH_PORT) >/tmp/devrouter-codegraph.log 2>&1 & \
+		echo "Starting codegraph sidecar on $(CODEGRAPH_URL) (node: $(NODE))..."; \
+		cd $(CODEGRAPH_DIR) && nohup $(NODE) bin/codegraph-sidecar.js serve --port $(CODEGRAPH_PORT) >/tmp/devrouter-codegraph.log 2>&1 & \
 		for i in 1 2 3 4 5 6 7 8 9 10; do \
 			curl -sf $(CODEGRAPH_URL)/api/repos >/dev/null 2>&1 && break; \
 			sleep 1; \
@@ -343,15 +349,15 @@ help:
 	@echo ""
 	@echo "Individual services:"
 	@echo "  make redis           Start Redis Stack only"
-	@echo "  make codegraph       Start the in-tree codegraph serve if not running"
+	@echo "  make codegraph       Start the codegraph sidecar if not running"
 	@echo "  make embedder-up     Start embedder container on port $(EMBEDDER_PORT)"
 	@echo "  make embedder-down   Stop embedder container"
 	@echo "  make embedder-logs   Follow embedder container logs"
 	@echo ""
 	@echo "Codegraph maintenance:"
-	@echo "  make codegraph-build                  Compile vendored codegraph (TS -> dist/)"
-	@echo "  make codegraph-analyze REPO=/path     Index a repo into the local LadybugDB"
-	@echo "  make codegraph-migrate                One-shot rename of legacy .gitnexus -> .codegraph"
+	@echo "  make codegraph-build                  Install the MIT codegraph engine (npm)"
+	@echo "  make codegraph-analyze REPO=/path     Index a repo into <repo>/.codegraph (SQLite)"
+	@echo "  make codegraph-migrate                List repos to re-index after the engine swap"
 	@echo ""
 	@echo "Embedder dev (host-side, no docker):"
 	@echo "  make embedder-build-local         Build the embedder Go binary on the host"

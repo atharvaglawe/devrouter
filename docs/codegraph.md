@@ -43,8 +43,16 @@ structural IMPLEMENTS detection), see
 ```
 
 devrouter speaks MCP to the agent and HTTP to codegraph. codegraph
-speaks tree-sitter and LadybugDB to the filesystem. The agent and
-your IDE never see codegraph.
+parses with tree-sitter (web-tree-sitter WASM grammars) and stores
+the graph in a per-repo SQLite database (with FTS5 for search). The
+agent and your IDE never see codegraph.
+
+> **Engine:** codegraph is the MIT-licensed
+> [`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph)
+> engine, vendored in-tree under `codegraph/src/` and fronted by a thin
+> Node HTTP sidecar (`codegraph/bin` + `codegraph/lib`). It replaced the
+> earlier GitNexus fork (PolyForm-Noncommercial). See
+> [`codegraph/MIGRATION.md`](../codegraph/MIGRATION.md).
 
 ## What gets indexed
 
@@ -64,10 +72,11 @@ Edges between symbols include:
 | `RETURNS` / `PARAM_TYPE` | Type-level relationships where the parser can resolve them |
 | Route attachment | Handler ↔ HTTP route / middleware chain |
 
-The pipeline runs in phases: structure → parsing → imports → calls →
-heritage → MRO → communities → processes. Each phase is a separate
-pass over the parsed ASTs, with progress reported to the analyze
-job.
+Indexing runs in two passes: **extraction** (tree-sitter parses each
+file into nodes + intra-file edges) followed by **resolution** (cross-file
+imports, calls, heritage, and structural synthesis — e.g. Go implicit
+`implements` edges by method-set matching). The result is written to the
+repo's SQLite store.
 
 ### Languages supported
 
@@ -83,101 +92,81 @@ ingester picks the right parser per file based on extension.
 
 | Path | Contents |
 |------|----------|
-| `<your-repo>/.codegraph/` | Per-repo index: LadybugDB graph file, parsed metadata, `meta.json` with timestamps and stats. |
+| `<your-repo>/.codegraph/` | Per-repo index: `codegraph.db` SQLite graph store (nodes, edges, FTS5 search index). |
 | `~/.codegraph/registry.json` | Global registry. Lists every indexed repo so the HTTP server can find them from any cwd. |
 | `~/.codegraph/` (root) | Override with `CODEGRAPH_HOME=/some/path`. Useful for shared dev boxes. |
 
-Storage cost: typical small-to-medium Go repo ≈ 50 – 200 MB on disk.
-A 1M-LOC monorepo ≈ 1 – 3 GB. The bulk is the graph + AST cache;
-embeddings (off by default) add another ~1.5× when enabled.
+Storage cost (SQLite `codegraph.db`): a mid-size repo is tens of MB; a
+large Go monorepo (~7k files) is on the order of ~150 MB. There is no
+embedding store — the bulk is nodes, edges, and the FTS5 index.
 
-The graph backend is **LadybugDB** — a local file-based graph store
-that holds an exclusive lock while open. That's why migration scripts
-refuse to run when the server is up.
+The graph backend is **SQLite** — one `codegraph.db` file per repo. The
+sidecar opens each repo's DB **read-only** and caches the connection, so
+serving and re-indexing don't fight over a lock the way the old
+file-graph backend did.
 
 ## The HTTP API
 
-codegraph runs as `node dist/cli/index.js serve` on port `:4747` by
-default. You can either let `make up` do this, or run it yourself.
+The sidecar runs as `node bin/codegraph-sidecar.js serve` on port `:4747`
+by default. You can either let `make up` do this, or run it yourself.
 
-devrouter consumes exactly **four** of these endpoints in steady
-state:
+Because the engine has no Cypher, the old single `/api/query` endpoint is
+replaced by **purpose-built endpoints** — one per graph question the Go
+client asks. Steady-state endpoints:
 
 | Endpoint | Used by | Purpose |
 |----------|---------|---------|
-| `POST /api/search` | `Client.Search` | Hybrid (BM25 + embedding) search across symbols |
-| `POST /api/query` | `Client.Cypher` | Read-only Cypher for callers / callees / impact / siblings |
-| `GET /api/file` | `Client.ReadFile` | Read source file content for snippet assembly |
-| `GET /api/repos` | `Client.ListRepos` | List indexed repos (used by `dev_context` to validate `repo`) |
+| `POST /api/search` | `Client.Search` | Hybrid (FTS5/BM25) search across symbols; optional source slicing |
+| `POST /api/graph/{callers,callees,upstream}` | `Client.Callers/Callees/Upstream` | Call-graph traversal |
+| `POST /api/graph/{importers,importers-by-package}` | `Client.Importers` | Import edges |
+| `POST /api/graph/{extends,methods,siblings}` | `Client.Extends/Methods/Siblings` | Heritage (incl. Go implicit impls), members, co-located symbols |
+| `POST /api/graph/{cross-wire,related-files,name-hits}` | route/relevance helpers | Route↔handler join, related files, name lookups |
+| `POST /api/{file,files,symbols}` | `Client.ReadFile`, memory auto-populate | Source content; file/symbol enumeration |
+| `POST /api/repos` | `Client.ListRepos` | List indexed repos (used by `dev_context` to validate `repo`) |
 
-Plus the analyze lifecycle endpoints, which `./devrouter analyze`
-uses under the hood:
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /api/analyze` | Start an analysis job |
-| `GET /api/analyze/:jobId` | Poll job status |
-| `GET /api/analyze/:jobId/progress` | SSE stream of progress events |
-| `DELETE /api/analyze/:jobId` | Cancel a running job |
-| `GET /api/heartbeat` | SSE liveness ping |
-| `GET /api/info` | Server metadata |
-
-Everything else (cypher write paths, web UI endpoints, MCP shim) was
-removed from the upstream fork. See
-[`codegraph/README.md`](../codegraph/README.md) for the full
-"what was kept / what was removed" list — that file is the
-maintainer-facing view.
+Indexing is **not** an HTTP job anymore — it's the `index` CLI command
+(`./devrouter analyze` shells out to it), which builds the SQLite store
+synchronously and registers the repo. There are no analyze-job /
+heartbeat / web-UI endpoints. See
+[`codegraph/README.md`](../codegraph/README.md) and
+[`codegraph/MIGRATION.md`](../codegraph/MIGRATION.md) for the full
+endpoint list and the data-model mapping.
 
 ## CLI
 
-The codegraph CLI (`codegraph` after `npm install`, or `node
-dist/cli/index.js` after build) has six commands. devrouter exposes
-the most common ones via its own binary so you don't have to drop
-into `cd codegraph`.
+The sidecar CLI is `node bin/codegraph-sidecar.js <serve|index|repos>`.
+devrouter exposes the common operations via its own binary so you don't
+have to drop into `cd codegraph`.
 
-| codegraph CLI | devrouter equivalent | Purpose |
-|---------------|----------------------|---------|
-| `codegraph analyze [path]` | `./devrouter analyze [path]` | Index a repo (full analysis). Required once per repo. |
-| `codegraph index [path...]` | (not exposed) | Register an existing `.codegraph/` folder into the global registry without re-analysing. Used when you copy a pre-built index across machines. |
-| `codegraph serve` | `make up` (started for you) | Run the HTTP server on `:4747`. |
-| `codegraph list` | `./devrouter list` | List all indexed repos. |
-| `codegraph status` | `./devrouter status` | Index status + health for the current repo. |
-| `codegraph clean` | (not exposed) | Delete the `.codegraph/` index for one repo, or `--all`. |
+| sidecar CLI | devrouter equivalent | Purpose |
+|-------------|----------------------|---------|
+| `codegraph-sidecar index [path] --name <n>` | `./devrouter analyze [path]` | Index a repo into SQLite + register it. Required once per repo. |
+| `codegraph-sidecar serve` | `make up` (started for you) | Run the HTTP sidecar on `:4747`. |
+| `codegraph-sidecar repos` | `./devrouter list` | List all indexed repos. |
 
-### Common `analyze` flags
+The vendored engine also ships its own full-featured CLI
+(`node dist/bin/codegraph.js`, the upstream `codegraph` binary) for
+direct use, but devrouter only relies on the sidecar wrapper above.
 
-```
---force               Re-index from scratch even if up to date
---embeddings          Generate symbol embeddings for semantic search (off by default)
---skills              Generate repo-specific skill files from detected communities
---skip-git            Index a folder that isn't a git repo
---skip-agents-md      Don't update the codegraph section of AGENTS.md / CLAUDE.md
---no-stats            Omit volatile counts from AGENTS.md / CLAUDE.md
--v, --verbose         Print ingestion warnings
-```
-
-Embeddings off by default because they cost time at index and disk
-at rest, and devrouter's search cascade gets most of the benefit
-from BM25 + structure alone. Turn them on with `--embeddings` when
-you want true semantic-only fallback (rule 5 of `retrieval-rules.md`
-covers when this kicks in).
+> **Search mode:** the engine is **FTS5/BM25 + structural** — there is no
+> built-in vector/embedding search in this version, so `SearchModeForIntent`
+> remaps a `semantic` intent to `hybrid`. The `CODEGRAPH_EMBEDDING_*`
+> settings below are inert until an embeddings layer is added to the
+> sidecar.
 
 ## Settings
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `CODEGRAPH_URL` | `http://localhost:4747` | Where devrouter expects codegraph to be reachable. Override for hosted setups. (`GITNEXUS_URL` is an accepted legacy alias.) |
-| `CODEGRAPH_HOME` | `~/.codegraph` | Global storage root. Move this when you want indices on a faster disk. |
-| `CODEGRAPH_NO_GITIGNORE` | unset | When set, skip `.gitignore` during analyze. Still reads `.codegraphignore`. |
-| `CODEGRAPH_VERBOSE` | unset | Verbose ingestion warnings. |
-| `CODEGRAPH_DEBUG` | unset | Extra diagnostics in the analyzer. |
-| `CODEGRAPH_EMBEDDING_URL` | unset | OpenAI-compatible embeddings endpoint. Required if `--embeddings` is on. |
-| `CODEGRAPH_EMBEDDING_MODEL` | unset | Embedding model id (e.g. `text-embedding-3-small`). |
-| `CODEGRAPH_EMBEDDING_DIMS` | unset | Vector dimensions, matched to the model. |
-| `CODEGRAPH_EMBEDDING_API_KEY` | unset | Bearer token for the embeddings endpoint. |
+| `CODEGRAPH_URL` | `http://localhost:4747` | Where devrouter expects the codegraph sidecar to be reachable. Override for hosted setups. (`GITNEXUS_URL` is an accepted legacy alias.) |
+| `CODEGRAPH_HOME` | `~/.codegraph` | Global storage root holding `registry.json`. Move this when you want the registry on a faster disk or to isolate environments. (`GITNEXUS_HOME` legacy alias honoured.) |
 
-Every `CODEGRAPH_*` var has a `GITNEXUS_*` legacy alias that still
-works; the new name wins when both are set.
+`CODEGRAPH_URL` and `CODEGRAPH_HOME` are the only settings devrouter +
+the sidecar consume. There are **no embedding settings** — the MIT
+engine has no vector search (the old `CODEGRAPH_EMBEDDING_*` /
+`--embeddings` knobs are gone). Indexing always reads `.gitignore`; the
+old `CODEGRAPH_NO_GITIGNORE` / `CODEGRAPH_VERBOSE` / `CODEGRAPH_DEBUG`
+analyze knobs were part of the previous engine and no longer apply.
 
 ## Re-indexing
 
@@ -204,9 +193,10 @@ keyed off the last commit hash recorded in `meta.json`.
 `make status` shows the codegraph health line. If it says `DOWN`:
 
 1. `tail /tmp/devrouter-codegraph.log` to see why it died.
-2. `make codegraph` to restart just the indexer.
-3. If LadybugDB complains about a lock file, kill any stale
-   `node dist/cli/index.js serve` process and try again.
+2. `make codegraph` to restart just the sidecar.
+3. If a repo won't open, kill any stale
+   `node bin/codegraph-sidecar.js serve` process and try again. The DBs
+   open read-only, so a crashed serve doesn't normally leave a lock.
 
 If `dev_context` returns no symbols for a repo you indexed:
 
@@ -222,42 +212,37 @@ If `dev_context` returns no symbols for a repo you indexed:
 See [`troubleshooting.md`](troubleshooting.md) for the symptom-to-fix
 table.
 
-## Migrating from `gitnexus/`
+## Migrating from the GitNexus engine
 
-If you were using devrouter before the gitnexus → codegraph rename,
-the on-disk paths used to be `~/.gitnexus/` and `<repo>/.gitnexus/`.
-Run once:
+The graph engine was replaced (GitNexus/LadybugDB →
+[`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph)/SQLite,
+MIT). The **on-disk store format changed**, so any `.codegraph/` (or legacy
+`.gitnexus/`) index built by the old engine must be rebuilt:
 
 ```bash
-make codegraph-migrate
+make codegraph-migrate   # prints what to do
+./devrouter analyze /abs/path/to/your-repo   # re-index, once per repo
 ```
 
-That script:
+`make codegraph-migrate` no longer does an in-place data migration — there
+is no automatic LadybugDB → SQLite converter; it just walks the registry
+and tells you which repos need a re-index.
 
-- Renames `~/.gitnexus/` → `~/.codegraph/` (or honours
-  `$GITNEXUS_HOME` / `$CODEGRAPH_HOME`).
-- Walks every repo in the global registry and renames its
-  `.gitnexus/` directory to `.codegraph/`.
-- Rewrites `storagePath` fields in `registry.json`.
-- Patches `.gitignore` files that pinned `.gitnexus`.
-
-Refuses to run while a server is listening on the codegraph port
-(LadybugDB lock). Stop with `make down` first.
-
-Backwards compat: if you can't migrate immediately, the runtime
-still recognises legacy `.gitnexus/` directories and `GITNEXUS_*`
-env vars, so existing checkouts keep working.
+Backwards compat: `CODEGRAPH_HOME` still honours the legacy `GITNEXUS_HOME`
+env var (and `CODEGRAPH_URL`/`GITNEXUS_URL`), and the sidecar still reads
+the existing `~/.codegraph/registry.json` layout, so paths and config carry
+over — only the per-repo graph data must be regenerated.
 
 ## Going deeper
 
 - [`codegraph/README.md`](../codegraph/README.md) — maintainer view:
-  what was forked from gitnexus, what was kept, what was removed,
-  the full HTTP endpoint list (including analyze lifecycle).
-- [`codegraph/CHANGELOG.md`](../codegraph/CHANGELOG.md) — release
-  history of the slim fork.
-- [`codegraph/src/`](../codegraph/src/) — TypeScript source. Start
-  at `src/cli/index.ts` for command wiring and
-  `src/core/ingestion/pipeline.ts` for the analyze pipeline.
+  sidecar layout, the full HTTP endpoint list, and build/run notes.
+- [`codegraph/MIGRATION.md`](../codegraph/MIGRATION.md) — engine
+  data-model mapping, spike findings, and graph-coverage validation.
+- [`codegraph/src/`](../codegraph/src/) — vendored MIT engine
+  (TypeScript). Extraction lives under `src/extraction/`, cross-file
+  resolution under `src/resolution/`. The sidecar wrapper is
+  `codegraph/bin/` + `codegraph/lib/`.
 - [`internal/codegraph/client.go`](../internal/codegraph/client.go)
   — devrouter's Go HTTP client. The four `Client.*` methods listed
   in the API table above are all defined here, with the exact

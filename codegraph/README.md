@@ -1,114 +1,72 @@
-# codegraph (devrouter slim graph engine)
+# codegraph (devrouter sidecar)
 
-This directory is a **vendored, slimmed-down fork** of the upstream
-[gitnexus](https://github.com/abhigyanpatwari/GitNexus) project, embedded
-inside devrouter and renamed to **codegraph** to reflect the much smaller
-scope. devrouter and codegraph are released as a single repo; the two no
-longer need to be installed separately.
+This directory is a thin **HTTP sidecar** that wraps the MIT-licensed
+[`@colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph)
+engine and re-exposes the small API devrouter's Go client
+(`internal/codegraph`) consumes on `:4747`.
 
-What was kept:
+It replaces the previous vendored fork of
+[GitNexus](https://github.com/abhigyanpatwari/GitNexus), which was licensed
+**PolyForm Noncommercial 1.0.0** and could not be deployed commercially.
 
-- Tree-sitter ingestion pipeline (`src/core/ingestion/`)
-- LadybugDB graph storage and adapter (`src/core/lbug/`)
-- Hybrid / BM25 / semantic search (`src/core/search/`, `src/core/embeddings/`)
-- Storage / repo registry (`src/storage/`)
-- A trimmed CLI (`analyze`, `index`, `serve`, `list`, `status`, `clean`)
-- A trimmed HTTP server (`src/server/api.ts`) exposing the four endpoints
-  devrouter actually consumes plus the `/api/analyze/*` job endpoints:
+The MIT engine source is **vendored in-tree** under `src/` (cloned from
+`colbymchenry/codegraph`, git history stripped) so it can be patched if a
+coverage gap ever shows up. It compiles to `dist/` via `npm run build`
+(`tsc` + WASM/schema copy); the sidecar (`bin/` + `lib/`) imports the
+compiled engine from `dist/`.
 
-  ```
-  GET  /api/heartbeat              SSE liveness
-  GET  /api/info                   server metadata
-  GET  /api/repos                  list registered repos
-  POST /api/query                  read-only Cypher
-  POST /api/search                 hybrid / bm25 / semantic search
-  GET  /api/file                   read source file
-  POST /api/analyze                start analysis job
-  GET  /api/analyze/:jobId         poll analysis job
-  GET  /api/analyze/:jobId/progress SSE progress
-  DELETE /api/analyze/:jobId       cancel analysis job
-  ```
+See [`MIGRATION.md`](MIGRATION.md) for the data-model mapping, spike findings,
+and graph-coverage validation.
 
-What was removed:
+## Layout
 
-- `gitnexus-web` (React/Vite SPA), `gitnexus-claude-plugin`,
-  `gitnexus-cursor-integration`, `eval/` (Python harness)
-- `core/wiki/`, `core/group/` (multi-repo), `core/augmentation/`
-- The MCP layer (`mcp/`, `mcp-http.ts`, the `gitnexus mcp` CLI command) —
-  devrouter is itself the MCP server
-- `setup` (would write an MCP config pointing at `gitnexus mcp`, which
-  no longer exists in this fork)
-- `query`, `context`, `impact`, `cypher`, `wiki`, `augment`, `eval-server`
-  CLI commands and the `LocalBackend`-driven `/api/processes`,
-  `/api/clusters`, `/api/grep`, `/api/graph`, `/api/embed`, `/api/repo`
-  HTTP endpoints — all UI-facing
-- `gitnexus-shared` is folded in here as `src/_shared/`
+```
+src/                       vendored MIT engine (TypeScript) — compiles to dist/
+LICENSE                    the engine's MIT license (retained)
+tsconfig.json              engine build config (tsc: src/ -> dist/)
+bin/codegraph-sidecar.js   sidecar CLI: serve | index | repos
+lib/server.js              HTTP server + route table (Node built-in http)
+lib/handlers.js            endpoint logic (QueryBuilder + raw SQL)
+lib/pool.js                per-repo DB connection cache (read-only)
+lib/registry.js            repo registry (~/.codegraph/registry.json)
+lib/indexer.js             index/refresh a repo + register it
+```
 
 ## Use
 
-From the devrouter repo root:
+You almost never call this directly — `make` manages it. Manually:
 
 ```bash
-make codegraph-install                  # one-time npm install
-make codegraph-build                    # compile TS -> dist/
-make codegraph-serve                    # serve on :4747
-make codegraph-analyze REPO=/abs/path   # ingest a repo into the local LadybugDB
+npm install        # engine deps (web-tree-sitter, tree-sitter-wasms, …)
+npm run build      # compile the vendored engine: src/ -> dist/
+node bin/codegraph-sidecar.js index /abs/path/to/repo --name myrepo
+node bin/codegraph-sidecar.js serve --port 4747
 ```
 
-Or directly:
+`index` builds (or refreshes) the repo's `<repo>/.codegraph/codegraph.db`
+via the engine and records it in the registry so the sidecar and devrouter's
+cross-repo loader can resolve it by name. `serve` starts the HTTP API.
 
-```bash
-cd codegraph
-node dist/cli/index.js --help
-```
+## HTTP API (consumed by `internal/codegraph`)
 
-The same commands are also available through the devrouter binary:
+- `GET  /api/repos` — registered repos `[{name, path, indexedAt}]`
+- `GET  /api/file?path=&repo=` — file content
+- `POST /api/search` — FTS/hybrid/bm25 search (`{query, repo, limit, include_source}`)
+- `POST /api/search-by-name` — plan-aware name search (must/exclude/context)
+- `POST /api/search-by-path` — symbols defined in a file
+- `POST /api/graph/{callers,callees,upstream}` — call graph
+- `POST /api/graph/{importers,importers-by-package,extends,methods}` — structural edges
+- `POST /api/graph/cross-wire` — route -> handler (best-effort)
+- `POST /api/graph/{siblings,related-files,name-hits}` — file/aggregate helpers
 
-```bash
-devrouter analyze /abs/path
-devrouter list
-devrouter status
-```
+## Requirements
 
-## Migrating from `gitnexus/`
+- Node `>=20 <25` (the engine bundles `web-tree-sitter` WASM grammars; the
+  sidecar uses Node's built-in `node:sqlite`).
 
-If you were using the older layout where this directory was called
-`gitnexus/` and per-repo data lived under `.gitnexus/`, run:
+## Backwards-compat
 
-```bash
-make codegraph-migrate
-```
-
-That script:
-
-- Renames `~/.gitnexus/` to `~/.codegraph/` (or honours `$GITNEXUS_HOME` /
-  `$CODEGRAPH_HOME` if set).
-- Walks every repo in the global registry and renames its `.gitnexus/`
-  directory to `.codegraph/`.
-- Rewrites `storagePath` fields in `registry.json` to point at the new
-  location.
-- Patches `.gitignore` files that pinned `.gitnexus` so the new name is
-  also ignored.
-
-It refuses to run while a server is listening on the codegraph port
-(LadybugDB holds an exclusive file lock). Stop the server with
-`make down` first.
-
-Backwards compat: if for any reason you can't migrate immediately, the
-runtime still recognises the legacy `.gitnexus/` directories and the
-`GITNEXUS_*` env vars, so existing checkouts keep working.
-
-## Backwards-compat env vars
-
-| Preferred | Deprecated | Effect |
-|-----------|------------|--------|
-| `CODEGRAPH_HOME` | `GITNEXUS_HOME` | Override the global storage root |
-| `CODEGRAPH_NO_GITIGNORE` | `GITNEXUS_NO_GITIGNORE` | Skip `.gitignore` parsing during analyze |
-| `CODEGRAPH_VERBOSE` | `GITNEXUS_VERBOSE` | Verbose ingestion warnings |
-| `CODEGRAPH_DEBUG` | `GITNEXUS_DEBUG` | Print extra diagnostics in the analyzer |
-| `CODEGRAPH_EMBEDDING_URL` | `GITNEXUS_EMBEDDING_URL` | OpenAI-compatible embeddings endpoint |
-| `CODEGRAPH_EMBEDDING_MODEL` | `GITNEXUS_EMBEDDING_MODEL` | Embedding model id |
-| `CODEGRAPH_EMBEDDING_DIMS` | `GITNEXUS_EMBEDDING_DIMS` | Vector dimensions |
-| `CODEGRAPH_EMBEDDING_API_KEY` | `GITNEXUS_EMBEDDING_API_KEY` | Embeddings API key |
-
-Both forms work; the new ones win when both are set.
+`CODEGRAPH_HOME` / `GITNEXUS_HOME` still resolve the registry root (same
+precedence as `internal/crossrepo`). Repos indexed by the old GitNexus engine
+must be **re-indexed** with `codegraph-sidecar index` — the on-disk store
+changed from LadybugDB to SQLite.

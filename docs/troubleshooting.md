@@ -43,5 +43,5 @@ If a query still misbehaves after the table above:
 ## Related
 
 - [`staleness.md`](staleness.md) — automated git-based staleness
-  detection (memory blob-hash drift, codegraph index commit drift,
+  detection (memory blob-hash drift, codegraph index recency,
   release-branch scope diff).

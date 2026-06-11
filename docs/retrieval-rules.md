@@ -22,7 +22,7 @@ churn.
                             │
    Section 4    intent              keyword-only, no LLM
                             │
-   Section 5    code search         cypher cascade, IDF-scored
+   Section 5    code search         lexical + name-search cascade, IDF-scored
                             │
    Section 6    memory recall       KNN → 4-stage relevance gate
                             │       (floor / must / FP / rerank)
@@ -151,9 +151,9 @@ plan before it touches retrieval:
 `MustTerms` is empty for any reason (no plan supplied, agent supplied
 an empty plan, or the agent's must_terms got sanitized away), the
 rarest non-stopword query token is promoted to `MustTerms`. "Rarest"
-= lowest non-zero `count(n) WHERE name CONTAINS` — one cypher per
-token via `Client.NameHitCount`. Guarantees a hard anchor with zero
-LLM involvement.
+= lowest non-zero name-hit count — one `Client.NameHitCount` call per
+token (the sidecar's `/api/graph/name-hits`, a `COUNT` over the
+`nodes` table). Guarantees a hard anchor with zero LLM involvement.
 
 Logged as `[router] auto-anchored must="fms" (hits=64)`. Surfaces in
 `PlanDebug.AutoAnchored = true` and as `plan.source = "auto"` in
@@ -206,22 +206,31 @@ Each step runs only if the previous one returned zero results.
 |---|------|--------|--------------|
 | 1 | File-path search | Section 2 | Hard-precision short circuit |
 | 2 | Package-path search | Section 2 | Same, looser |
-| 3 | Hybrid `/api/search` | `Client.Search` | codegraph FTS + embedding hybrid |
-| 4 | **Cypher name search** | `SearchByNameWithOpts` | IDF-ranked, plan-aware — the heart of the pipeline |
+| 3 | `/api/search` | `Client.Search` | codegraph lexical search (FTS5/BM25) |
+| 4 | **Name search** | `SearchByNameWithOpts` | IDF-ranked, plan-aware — the heart of the pipeline |
 | 5 | Path boost | `boostByPath` | Reorders results matching `pkgPath` |
 
 Step 4 deserves its own breakdown.
 
 ### Inside `SearchByNameWithOpts`
 
-Source:
-[`internal/codegraph/client.go`](../internal/codegraph/client.go).
+`SearchByNameWithOpts`
+([`internal/codegraph/client.go`](../internal/codegraph/client.go))
+posts to the sidecar's `/api/search-by-name`
+([`codegraph/lib/handlers.js`](../codegraph/lib/handlers.js)). The
+engine has no Cypher — the IDF + surface scoring described here was
+ported verbatim from the old Go/Cypher path into the sidecar, which
+runs it as `LIKE`/FTS5 lookups over the SQLite `nodes` table. The
+semantics below are unchanged; only the execution moved server-side.
 
-**Per-term name CONTAINS.** For every tokenized word:
+**Per-term name match.** For every tokenized word, find nodes whose
+lowercased `name` contains the word (with a `startLine`), capped at
+`limit*3`. Conceptually:
 
-```cypher
-MATCH (n) WHERE toLower(n.name) CONTAINS "<word>" AND n.startLine IS NOT NULL
-RETURN n.id, n.name, n.filePath, n.startLine, n.endLine, n.content
+```sql
+SELECT id, name, file_path, start_line, end_line
+FROM nodes
+WHERE lower(name) LIKE '%<word>%' AND start_line IS NOT NULL
 LIMIT <limit*3>
 ```
 
@@ -229,10 +238,10 @@ Each hit records its strongest matching surface (`name` > `filePath`
 > `content`). Per-term hit counts accumulate for IDF.
 
 **Content fallback for the rarest term.** If total hits across all
-terms < `limit`, run **one** extra cypher on `n.content CONTAINS
-"<rarest>"` (lowest hit count seen so far). Only the rarest, to keep
-it cheap — common terms like `error` would pull in thousands of
-irrelevant nodes.
+terms < `limit`, the sidecar runs **one** extra lookup matching the
+rarest term (lowest hit count seen so far) against file content. Only
+the rarest, to keep it cheap — common terms like `error` would pull in
+thousands of irrelevant nodes.
 
 **Exclude rules** (`ExcludeTerms`). For every exclude term, drop a
 result if any of these hold:
@@ -250,17 +259,18 @@ Targeted on purpose — substring CONTAINS would over-match.
 **Must-term anchor** (`MustTerms`). Build the union of files where
 ANY must term hits in `name`, `filePath`, or `content`:
 
-```cypher
-MATCH (n)
-WHERE (toLower(n.filePath) CONTAINS "<term>"
-       OR toLower(n.name)    CONTAINS "<term>"
-       OR toLower(n.content) CONTAINS "<term>")
-  AND n.filePath IS NOT NULL
-RETURN DISTINCT n.filePath LIMIT 500
+```sql
+SELECT DISTINCT file_path
+FROM nodes
+WHERE (lower(file_path) LIKE '%<term>%'
+       OR lower(name)    LIKE '%<term>%'
+       OR lower(content) LIKE '%<term>%')
+  AND file_path IS NOT NULL
+LIMIT 500
 ```
 
 Drop any result whose file isn't in that union. **Soft anchor, not
-hard fail**: if the cypher errors or returns zero, the filter is
+hard fail**: if the query errors or returns zero, the filter is
 skipped entirely so a bad must term never blackholes the query.
 
 **IDF + surface scoring**:
@@ -512,11 +522,15 @@ memory hints):
 
 ### Always-on related-files
 
-For every keyword (len ≥ 3), `RelatedFiles` runs:
+For every keyword (len ≥ 3), `RelatedFiles` calls the sidecar's
+`/api/graph/related-files`, which returns distinct file paths whose
+lowercased path contains the word (capped at 100):
 
-```cypher
-MATCH (n) WHERE toLower(n.filePath) CONTAINS "<word>" AND n.filePath IS NOT NULL
-RETURN DISTINCT n.filePath LIMIT 100
+```sql
+SELECT DISTINCT file_path
+FROM nodes
+WHERE lower(file_path) LIKE '%<word>%' AND file_path IS NOT NULL
+LIMIT 100
 ```
 
 Result feeds `Graph.Siblings` in the prompt.

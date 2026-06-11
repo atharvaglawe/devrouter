@@ -39,12 +39,12 @@ it's split this way. For the request pipeline rules in detail, see
    │  (Node)      │    │  + RediSearch  │    │                      │
    │              │    │                │    │  /api/embed          │
    │  /api/search │    │  memory:*      │    │  bundled ONNX        │
-   │  /api/query  │    │  mem:fp:*      │    │  nomic-embed-text-   │
+   │  /api/graph/*│    │  mem:fp:*      │    │  nomic-embed-text-   │
    │  /api/file   │    │  heuristics:*  │    │  v1.5 on :11435      │
    │  /api/repos  │    │  feedback:*    │    │  (any /api/embed-    │
    │              │    │  recent_*      │    │   compatible service │
    │  per-repo    │    │                │    │   works)             │
-   │  LadybugDB   │    │                │    │                      │
+   │  SQLite+FTS5 │    │                │    │                      │
    │  index       │    │                │    │                      │
    └──────┬───────┘    └────────────────┘    └──────────────────────┘
           │
@@ -65,7 +65,7 @@ the structured `plan` argument on `dev_context`.
 | Component | Process | State | Purpose |
 |-----------|---------|-------|---------|
 | **devrouter MCP server** | Go binary, one per agent connection (stdio sub-process) | In-memory LRU only | Owns the request pipeline, the relevance gate, the bandit, the FP loop. Is the only thing the agent ever talks to. |
-| **codegraph** | Long-running Node HTTP server on `:4747`, one per machine | Per-repo `.codegraph/` LadybugDB on disk | Parses your repo with tree-sitter, builds the symbol/call/import graph, answers `/api/search` (BM25 + embedding hybrid), `/api/query` (Cypher), `/api/file`, `/api/repos`. See [`codegraph.md`](codegraph.md). |
+| **codegraph** | Long-running Node HTTP sidecar on `:4747`, one per machine (vendored MIT engine + thin wrapper) | Per-repo `.codegraph/` SQLite store (`codegraph.db`, FTS5) on disk | Parses your repo with tree-sitter, builds the symbol/call/import graph, answers `/api/search` (FTS5/BM25), purpose-built `/api/graph/*` traversal (callers/callees/importers/extends/…), `/api/file`, `/api/repos`. See [`codegraph.md`](codegraph.md). |
 | **Redis Stack** | External, can be remote | All persistent shared state | Memory (vector-searchable), false-positive centroids, heuristic profiles, reward history, query traces, recent-query embeddings for repeat detection. |
 | **Embedder endpoint** | External, can be remote | Embedding model on disk | A 768-dim embedding endpoint (default: bundled ONNX `nomic-embed-text-v1.5` at `http://localhost:11435/api/embed` — see [`embedder/`](../embedder/README.md)) used for query/memory/FP embeddings. The embedder URL and model name are configurable — see [`configuration.md`](configuration.md). |
 | **agent's MCP host** | Cursor / Claude / etc. | n/a | Spawns the devrouter binary as a stdio subprocess per session. Produces the structured `plan` argument on every `dev_context` call. |
@@ -97,8 +97,8 @@ A single call from the agent. Numbered to match the dotted lines in
            caller didn't supply must_terms)
     (9)  4-stage relevance gate on memory hits             [in-process]
     (10) compute graph budget from memCount + intent       [in-process]
-    (11) per-symbol traversal: callers/callees/importers   [codegraph /api/query]
-    (12) related-files cypher                              [codegraph /api/query]
+    (11) per-symbol traversal: callers/callees/importers   [codegraph /api/graph/*]
+    (12) related-files                                     [codegraph /api/graph/related-files]
     (13) trim, assemble, derive honest signals             [in-process]
     (14) HSET feedback:trace:{query_id}  (decision side)   [Redis]
     (15) ZADD recent_queries:{repo} {ts} {query_emb}       [Redis]
@@ -166,13 +166,13 @@ by the devrouter binary itself — restart it any time, no state loss.
 | Store | Held by | Lifetime | What's in it |
 |-------|---------|----------|--------------|
 | **Redis** | Operator (local or hosted) | Mostly persistent (some TTLs) | Memory hashes (`memory:*`), memory vector index (`memidx`), FP centroids (`mem:fp:*`, 14-day TTL), heuristic profiles (`heuristics:current/default/history/reward`), per-query span (`feedback:trace:*`, 30-day TTL), recent-query sorted set (`recent_queries:{repo}`, 30-min window). |
-| **codegraph LadybugDB** | codegraph process, on disk | Survives process restarts; rebuilt by `analyze` | Per-repo symbol graph: nodes (files, packages, symbols, routes), edges (CALLS, IMPORTS, EXTENDS, HAS_METHOD, …), source content for snippet assembly, optional symbol embeddings (off by default). |
+| **codegraph SQLite** | codegraph sidecar, on disk | Survives process restarts; rebuilt by `analyze` | Per-repo symbol graph in `codegraph.db`: nodes (files, packages, symbols, routes), edges (CALLS, IMPORTS, EXTENDS, HAS_METHOD, IMPLEMENTS, …), plus an FTS5 index for lexical search. Source snippets are sliced from disk on demand. |
 | **devrouter in-process** | devrouter binary | Lives only as long as the MCP connection | Last-call LRU (`query_id` ↔ outcome, 16 entries, 10-min TTL — for `dev_feedback` fallback when the agent omits `query_id`). |
 
 The split is deliberate: anything multi-developer (memory,
 heuristics, FPs) lives in Redis so two engineers in the same repo
 share the same brain. Anything per-machine (a symbol graph parsed
-from local source) lives in codegraph's LadybugDB. Anything strictly
+from local source) lives in codegraph's SQLite store. Anything strictly
 per-session (the LRU) is in-process and disappears when the agent
 closes the connection.
 
@@ -189,16 +189,17 @@ shared service. The persistent state that *should* be shared
 service.
 
 **codegraph in a separate process.** The tree-sitter parser
-ecosystem is mature in Node and immature in Go. Forking codegraph
-from gitnexus and keeping it in TypeScript was cheaper than porting
+ecosystem is mature in Node and immature in Go. Vendoring the
+MIT-licensed `colbymchenry/codegraph` engine and keeping it in
+TypeScript (behind a thin HTTP sidecar) was cheaper than porting
 20+ language parsers, and the HTTP boundary lets us swap or upgrade
 the indexer without recompiling devrouter. The price is a
-process boundary on every search/cypher/file call — measured in
+process boundary on every search/graph/file call — measured in
 milliseconds, dwarfed by the embedder and Redis round-trips.
 
 **Memory in Redis, not in codegraph.** Memory is multi-developer
 shared knowledge ("FMS swallows unmarshal errors"). codegraph's
-LadybugDB is a per-machine local store rebuilt from source. Mixing
+SQLite store is a per-machine local index rebuilt from source. Mixing
 the two would either force every developer's machine to hold every
 other developer's notes, or fork the source-of-truth between
 machines. Redis with a vector index is a much better fit.
@@ -263,7 +264,7 @@ For each pipeline stage in the diagram, the canonical rule lives in
 |---------|---------|
 | Section 3 | Query planning (agent-supplied plan, auto-anchor fallback, sanitization caps) |
 | Section 4 | Intent detection (keyword-only, no LLM round-trip) |
-| Section 5 | Code search cascade (file/package/hybrid/cypher/path-boost) |
+| Section 5 | Code search cascade (file/package/hybrid/graph-traversal/path-boost) |
 | Section 6 | Vector recall → 4-stage relevance gate (floor / must / FP / rerank) |
 | Section 7 | Graph expansion budget per intent |
 | Section 8 | Trim caps per intent + memory shrink |
